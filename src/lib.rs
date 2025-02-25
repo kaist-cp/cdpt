@@ -21,7 +21,7 @@ impl<T> Deref for SkipTrait<T> {
     }
 }
 
-/// A root-count-protected atomic reference to the atomic managed object.
+/// A root-count-protected atomic reference to the managed object.
 /// It can be sent and atomic with other threads. Before dereferencing,
 /// you must create a `Local` reference to the same object by calling `load`.
 ///
@@ -34,7 +34,7 @@ pub struct Atomic<T: Send> {
 unsafe impl<T: Send + Sync> Sync for Atomic<T> {}
 unsafe impl<T: Send + Sync> Send for Atomic<T> {}
 
-impl<T: Send> Atomic<T> {
+impl<T: Send + Sync> Atomic<T> {
     pub fn new(item: T) -> Self {
         let ptr = AtomicRc::new(SkipTrait(item));
         Self { ptr }
@@ -111,7 +111,7 @@ impl<T: Send> Atomic<T> {
     }
 }
 
-impl<T: Send> Clone for Atomic<T> {
+impl<T: Send + Sync> Clone for Atomic<T> {
     fn clone(&self) -> Self {
         if let Some(local) = self.load() {
             local.atomic()
@@ -121,16 +121,16 @@ impl<T: Send> Clone for Atomic<T> {
     }
 }
 
-/// A hazard-pointer-protected thread-local reference to the atomic managed object.
+/// A hazard-pointer-protected thread-local reference to the managed object.
 /// To dereference, you must call `borrow` which creates an immuatable reference,
 /// and (if the compaction is enabled) pins the allocation.
-pub struct Local<T: Send> {
+pub struct Local<T: Send + Sync> {
     ptr: Rc<SkipTrait<T>>,
     // A marker to prevent an implicit `Send + Sync` implementation.
     _marker: PhantomData<*const ()>,
 }
 
-impl<T: Send> Local<T> {
+impl<T: Send + Sync> Local<T> {
     pub fn new(item: T) -> Self {
         Self {
             ptr: Rc::new(SkipTrait(item)),
@@ -162,7 +162,7 @@ impl<T: Send> Local<T> {
     }
 }
 
-impl<T: Send> Clone for Local<T> {
+impl<T: Send + Sync> Clone for Local<T> {
     fn clone(&self) -> Self {
         Self {
             ptr: self.ptr.clone(),
@@ -171,23 +171,23 @@ impl<T: Send> Clone for Local<T> {
     }
 }
 
-impl<T: Send + PartialEq> PartialEq for Local<T> {
+impl<T: Send + Sync + PartialEq> PartialEq for Local<T> {
     fn eq(&self, other: &Self) -> bool {
         self.borrow() == other.borrow()
     }
 }
 
-impl<T: Send + Eq> Eq for Local<T> {}
+impl<T: Send + Sync + Eq> Eq for Local<T> {}
 
 /// A variant of `Atomic` that supports pointer tagging.
-pub struct TaggedAtomic<T: Send> {
+pub struct TaggedAtomic<T: Send + Sync> {
     ptr: AtomicRc<SkipTrait<T>>,
 }
 
 unsafe impl<T: Send + Sync> Sync for TaggedAtomic<T> {}
 unsafe impl<T: Send + Sync> Send for TaggedAtomic<T> {}
 
-impl<T: Send> TaggedAtomic<T> {
+impl<T: Send + Sync> TaggedAtomic<T> {
     pub fn new(item: T) -> Self {
         let ptr = AtomicRc::new(SkipTrait(item));
         Self { ptr }
@@ -292,7 +292,7 @@ impl<T: Send> TaggedAtomic<T> {
     }
 }
 
-impl<T: Send> Clone for TaggedAtomic<T> {
+impl<T: Send + Sync> Clone for TaggedAtomic<T> {
     fn clone(&self) -> Self {
         let ptr = TaggedAtomic::null();
         if let (Some(local), tag) = self.load() {
