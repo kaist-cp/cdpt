@@ -1,4 +1,4 @@
-use gc_design::{Atomic, Local, TaggedAtomic};
+use gc_design::{Atomic, Local};
 use std::cmp::Ordering::*;
 
 struct Node<K, V>
@@ -6,7 +6,7 @@ where
     K: Send + Sync,
     V: Send + Sync,
 {
-    next: TaggedAtomic<Self>,
+    next: Atomic<Self>,
     key: K,
     value: V,
 }
@@ -28,7 +28,7 @@ where
     #[inline]
     fn new(key: K, value: V) -> Self {
         Self {
-            next: TaggedAtomic::null(),
+            next: Atomic::null(),
             key,
             value,
         }
@@ -38,7 +38,7 @@ where
     /// We never deref key and value of this head node.
     fn head() -> Self {
         Self {
-            next: TaggedAtomic::null(),
+            next: Atomic::null(),
             key: K::default(),
             value: V::default(),
         }
@@ -62,7 +62,7 @@ where
     /// Creates the head cursor.
     #[inline]
     pub fn head(head: &Atomic<Node<K, V>>) -> Cursor<K, V> {
-        let prev = head.load().unwrap();
+        let prev = head.load().0.unwrap();
         let (curr, _) = prev.borrow().next.load();
         Self { prev, curr }
     }

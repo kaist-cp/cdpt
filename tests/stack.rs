@@ -20,14 +20,20 @@ impl<T: Send + Sync> Stack<T> {
 
     fn pop(&self) -> Option<Local<T>> {
         loop {
-            let old = self.top.load();
+            let old = self.top.load().0;
             let new = if let Some(old) = old.as_ref() {
-                old.borrow().next.load()
+                old.borrow().next.load().0
             } else {
                 return None;
             };
-            if self.top.compare_exchange(old.as_ref(), new.as_ref()) {
-                return old.as_ref().map(|node| node.borrow().item.load()).unwrap();
+            if self
+                .top
+                .compare_exchange((old.as_ref(), 0), (new.as_ref(), 0))
+            {
+                return old
+                    .as_ref()
+                    .map(|node| node.borrow().item.load().0)
+                    .unwrap();
             }
         }
     }
@@ -39,9 +45,12 @@ impl<T: Send + Sync> Stack<T> {
         });
 
         loop {
-            let old = self.top.load();
-            new.borrow().next.store(old.as_ref());
-            if self.top.compare_exchange(old.as_ref(), Some(&new)) {
+            let old = self.top.load().0;
+            new.borrow().next.store(old.as_ref(), 0);
+            if self
+                .top
+                .compare_exchange((old.as_ref(), 0), (Some(&new), 0))
+            {
                 return;
             }
         }
