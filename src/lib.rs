@@ -21,20 +21,20 @@ impl<T> Deref for SkipTrait<T> {
     }
 }
 
-/// A root-count-protected atomic reference to the shared managed object.
-/// It can be sent and shared with other threads. Before dereferencing,
+/// A root-count-protected atomic reference to the atomic managed object.
+/// It can be sent and atomic with other threads. Before dereferencing,
 /// you must create a `Local` reference to the same object by calling `load`.
 ///
 /// It is interiorly-mutable, meaning that you can atomically update
-/// the underlying reference with `&Shared<T>`.
-pub struct Shared<T: Send> {
+/// the underlying reference with `&Atomic<T>`.
+pub struct Atomic<T: Send> {
     ptr: AtomicRc<SkipTrait<T>>,
 }
 
-unsafe impl<T: Send + Sync> Sync for Shared<T> {}
-unsafe impl<T: Send + Sync> Send for Shared<T> {}
+unsafe impl<T: Send + Sync> Sync for Atomic<T> {}
+unsafe impl<T: Send + Sync> Send for Atomic<T> {}
 
-impl<T: Send> Shared<T> {
+impl<T: Send> Atomic<T> {
     pub fn new(item: T) -> Self {
         let ptr = AtomicRc::new(SkipTrait(item));
         Self { ptr }
@@ -111,17 +111,17 @@ impl<T: Send> Shared<T> {
     }
 }
 
-impl<T: Send> Clone for Shared<T> {
+impl<T: Send> Clone for Atomic<T> {
     fn clone(&self) -> Self {
         if let Some(local) = self.load() {
-            local.shared()
+            local.atomic()
         } else {
-            Shared::null()
+            Atomic::null()
         }
     }
 }
 
-/// A hazard-pointer-protected thread-local reference to the shared managed object.
+/// A hazard-pointer-protected thread-local reference to the atomic managed object.
 /// To dereference, you must call `borrow` which creates an immuatable reference,
 /// and (if the compaction is enabled) pins the allocation.
 pub struct Local<T: Send> {
@@ -143,9 +143,21 @@ impl<T: Send> Local<T> {
         self.ptr.as_ref().unwrap()
     }
 
-    pub fn shared(&self) -> Shared<T> {
-        Shared {
+    pub fn atomic(&self) -> Atomic<T> {
+        Atomic {
             ptr: AtomicRc::from(&self.ptr),
+        }
+    }
+
+    pub fn ptr_eq(&self, other: &Self) -> bool {
+        self.ptr.ptr_eq(&other.ptr)
+    }
+
+    pub fn opt_ptr_eq(this: Option<&Self>, other: Option<&Self>) -> bool {
+        match (this, other) {
+            (None, None) => true,
+            (None, Some(_)) | (Some(_), None) => false,
+            (Some(x), Some(y)) => x.ptr_eq(y),
         }
     }
 }
@@ -159,15 +171,23 @@ impl<T: Send> Clone for Local<T> {
     }
 }
 
-/// A variant of `Shared` that supports pointer tagging.
-pub struct TaggedShared<T: Send> {
+impl<T: Send + PartialEq> PartialEq for Local<T> {
+    fn eq(&self, other: &Self) -> bool {
+        self.borrow() == other.borrow()
+    }
+}
+
+impl<T: Send + Eq> Eq for Local<T> {}
+
+/// A variant of `Atomic` that supports pointer tagging.
+pub struct TaggedAtomic<T: Send> {
     ptr: AtomicRc<SkipTrait<T>>,
 }
 
-unsafe impl<T: Send + Sync> Sync for TaggedShared<T> {}
-unsafe impl<T: Send + Sync> Send for TaggedShared<T> {}
+unsafe impl<T: Send + Sync> Sync for TaggedAtomic<T> {}
+unsafe impl<T: Send + Sync> Send for TaggedAtomic<T> {}
 
-impl<T: Send> TaggedShared<T> {
+impl<T: Send> TaggedAtomic<T> {
     pub fn new(item: T) -> Self {
         let ptr = AtomicRc::new(SkipTrait(item));
         Self { ptr }
@@ -254,11 +274,27 @@ impl<T: Send> TaggedShared<T> {
             .compare_exchange(current, new, Ordering::SeqCst, Ordering::SeqCst, guard)
             .is_ok()
     }
+
+    pub fn fetch_or_tag(&self, tag: usize) -> usize {
+        // Note: In the real implementation, probably it will be wait-free.
+        let guard = &cs();
+
+        loop {
+            let current = self.ptr.load(Ordering::SeqCst, guard);
+            if self
+                .ptr
+                .compare_exchange_tag(current, tag, Ordering::SeqCst, Ordering::SeqCst, guard)
+                .is_ok()
+            {
+                return current.tag();
+            }
+        }
+    }
 }
 
-impl<T: Send> Clone for TaggedShared<T> {
+impl<T: Send> Clone for TaggedAtomic<T> {
     fn clone(&self) -> Self {
-        let ptr = TaggedShared::null();
+        let ptr = TaggedAtomic::null();
         if let (Some(local), tag) = self.load() {
             ptr.store(Some(&local), tag);
         }

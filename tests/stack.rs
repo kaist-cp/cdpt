@@ -1,20 +1,20 @@
 use std::sync::atomic::AtomicBool;
 
-use gc_design::{Local, Shared};
+use gc_design::{Atomic, Local};
 
 struct Node<T: Send + Sync> {
-    item: Shared<T>,
-    next: Shared<Self>,
+    item: Atomic<T>,
+    next: Atomic<Self>,
 }
 
 struct Stack<T: Send + Sync> {
-    top: Shared<Node<T>>,
+    top: Atomic<Node<T>>,
 }
 
 impl<T: Send + Sync> Stack<T> {
     fn new() -> Self {
         Self {
-            top: Shared::null(),
+            top: Atomic::null(),
         }
     }
 
@@ -34,8 +34,8 @@ impl<T: Send + Sync> Stack<T> {
 
     fn push(&self, item: T) {
         let new = Local::new(Node {
-            item: Shared::new(item),
-            next: Shared::null(),
+            item: Atomic::new(item),
+            next: Atomic::null(),
         });
 
         loop {
