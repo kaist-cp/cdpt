@@ -18,16 +18,16 @@ impl<T: Send + Sync> Stack<T> {
         }
     }
 
-    fn pop(&self) -> Local<T> {
+    fn pop(&self) -> Option<Local<T>> {
         loop {
             let old = self.top.load();
             let new = if let Some(old) = old.as_ref() {
-                old.next.load()
+                old.borrow().next.load()
             } else {
-                return Local::null();
+                return None;
             };
-            if self.top.compare_exchange(&old, &new) {
-                return old.as_ref().map(|node| node.item.load()).unwrap();
+            if self.top.compare_exchange(old.as_ref(), new.as_ref()) {
+                return old.as_ref().map(|node| node.borrow().item.load()).unwrap();
             }
         }
     }
@@ -40,8 +40,8 @@ impl<T: Send + Sync> Stack<T> {
 
         loop {
             let old = self.top.load();
-            new.as_ref().unwrap().next.store(&old);
-            if self.top.compare_exchange(&old, &new) {
+            new.borrow().next.store(old.as_ref());
+            if self.top.compare_exchange(old.as_ref(), Some(&new)) {
                 return;
             }
         }
@@ -54,10 +54,10 @@ fn simple() {
     stack.push(1);
     stack.push(2);
     stack.push(3);
-    assert_eq!(3, *stack.pop().as_ref().unwrap());
-    assert_eq!(2, *stack.pop().as_ref().unwrap());
-    assert_eq!(1, *stack.pop().as_ref().unwrap());
-    assert!(stack.pop().is_null());
+    assert_eq!(Some(3), stack.pop().map(|entry| *entry.borrow()));
+    assert_eq!(Some(2), stack.pop().map(|entry| *entry.borrow()));
+    assert_eq!(Some(1), stack.pop().map(|entry| *entry.borrow()));
+    assert!(stack.pop().is_none());
 }
 
 #[test]
@@ -81,8 +81,8 @@ fn smoke() {
                 while popped < COUNT {
                     if let Some(item) = stack.pop().as_ref() {
                         popped += 1;
-                        assert!(!found[*item].load(Ordering::Acquire));
-                        found[*item].store(true, Ordering::Release);
+                        assert!(!found[*item.borrow()].load(Ordering::Acquire));
+                        found[*item.borrow()].store(true, Ordering::Release);
                     }
                 }
                 fence(Ordering::SeqCst);
