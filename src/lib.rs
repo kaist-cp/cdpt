@@ -1,3 +1,13 @@
+#[macro_use]
+extern crate cfg_if;
+
+mod collector;
+mod epoch;
+mod guard;
+mod internal;
+mod pointers;
+mod sync;
+
 use std::{marker::PhantomData, ops::Deref, sync::atomic::Ordering};
 
 // We use CIRC to quickly design the prototype API.
