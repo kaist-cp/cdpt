@@ -1,13 +1,12 @@
-use crate::collector::{Collector, LocalHandle};
-use crate::epoch::{AtomicEpoch, Epoch};
-use crate::guard::Guard;
+use crate::epoch::{AtomicEpoch, Epoch, Phase};
+use crate::guards::{Collector, Guard, Handle};
 use crate::sync::{Entry, IsElement, List, fence};
 use crossbeam::epoch::{Guard as EbrGuard, Owned, Shared as EbrShared, unprotected};
 use crossbeam::utils::CachePadded;
 use std::cell::{Cell, UnsafeCell};
 use std::mem::ManuallyDrop;
-use std::ptr;
-use std::sync::atomic::Ordering;
+use std::ptr::{self, NonNull};
+use std::sync::atomic::{AtomicPtr, Ordering};
 
 /// The global data for a garbage collector.
 pub(crate) struct Global {
@@ -46,13 +45,31 @@ pub(crate) struct Local {
     /// The number of active handles.
     handle_count: Cell<usize>,
 
+    /// The epoch that this local thread observed most recently.
+    last_observed: Cell<Epoch>,
+
+    /// A single-writer multiple-reader list of protected pointers.
+    ///
+    /// Note: It doesn't have to carray any type information, as what it should do
+    /// is just recording raw addresses that are currently protected, and the collector
+    /// still can trace their outgoing edges because the type information will be in
+    /// the collector's object lists.
+    ///
+    /// TODO: Make it resizable. We might need a dedicated SMR (e.g., EBR, HP).
+    hazards: [AtomicPtr<()>; 16],
+
+    /// A vector of available hazard indices.
+    ///
+    /// When all guards and handles get dropped, this vector is destroyed.
+    available_hids: UnsafeCell<ManuallyDrop<Vec<usize>>>,
+
     /// The local epoch.
     epoch: CachePadded<AtomicEpoch>,
 }
 
 impl Local {
     /// Registers a new `Local` in the provided `Global`.
-    pub(crate) fn register(collector: &Collector) -> LocalHandle {
+    pub(crate) fn register(collector: &Collector) -> Handle {
         unsafe {
             // Since we dereference no pointers in this block, it is safe to use `unprotected`.
 
@@ -61,12 +78,17 @@ impl Local {
                 collector: UnsafeCell::new(ManuallyDrop::new(collector.clone())),
                 guard_count: Cell::new(0),
                 handle_count: Cell::new(1),
+                last_observed: Cell::new(Epoch::starting()),
+                hazards: [const { AtomicPtr::new(ptr::null_mut()) }; 16],
+                available_hids: UnsafeCell::new(ManuallyDrop::new((0..16).collect())),
                 epoch: CachePadded::new(AtomicEpoch::new(Epoch::starting())),
             })
             .into_shared(unprotected());
+            // SAFETY: `Local` is being inserted at the head of the list, so we will not
+            // dereference any dangerous (e.g., retired) shared memory.
             collector.global.locals.insert(local, unprotected());
-            LocalHandle {
-                local: local.as_raw(),
+            Handle {
+                local: NonNull::new_unchecked(local.as_raw().cast_mut()),
             }
         }
     }
@@ -92,28 +114,44 @@ impl Local {
     /// Pins the `Local`.
     #[inline]
     pub(crate) fn pin(&self) -> Guard {
-        let guard = Guard { local: self };
+        let guard = Guard {
+            local: NonNull::from_ref(self),
+        };
 
         let guard_count = self.guard_count.get();
         self.guard_count.set(guard_count.checked_add(1).unwrap());
 
         if guard_count == 0 {
-            let mut curr_epoch = self.global().epoch.load(Ordering::Acquire);
-            loop {
-                // Now we must store `new_epoch` into `self.epoch` and execute a light fence.
-                self.epoch.store(curr_epoch.pinned(), Ordering::Release);
-                fence::light();
-
-                let new_epoch = self.global().epoch.load(Ordering::Acquire);
-                if curr_epoch != new_epoch {
-                    curr_epoch = new_epoch;
-                    continue;
-                }
-                break;
-            }
+            self.pin_freshly();
         }
 
         guard
+    }
+
+    #[inline]
+    fn pin_freshly(&self) {
+        let mut curr_epoch = self.global().epoch.load(Ordering::Acquire);
+        loop {
+            // Now we must store `new_epoch` into `self.epoch` and execute a light fence.
+            self.epoch.store(curr_epoch.pinned(), Ordering::Relaxed);
+            fence::light();
+
+            let new_epoch = self.global().epoch.load(Ordering::Acquire);
+            if curr_epoch == new_epoch {
+                break;
+            }
+            curr_epoch = new_epoch;
+        }
+
+        if self.last_observed.get().timestamp() != curr_epoch.timestamp()
+            && curr_epoch.phase() == Phase::RT
+        {
+            // TODO: Phase barrier: if we are in a root tracing phase and it’s the first time
+            // observing this phase, scan and mark (i.e., push to mark stack)
+            // objects that are protected by thread-local HPs.
+            todo!()
+        }
+        self.last_observed.set(curr_epoch);
     }
 
     /// Unpins the `Local`.
@@ -186,13 +224,13 @@ impl Local {
             // by a guard at this time, it's crucial that the reference is read before marking the
             // `Local` as deleted.
             let collector: Collector = ptr::read(&*(*self.collector.get()));
+            ManuallyDrop::drop(&mut *self.available_hids.get());
 
             // Mark this node in the linked list as deleted.
             self.entry.delete(unprotected());
 
             // Finally, drop the reference to the global. Note that this might be the last reference
-            // to the `Global`. If so, the global data will be destroyed and all deferred functions
-            // in its queue will be executed.
+            // to the `Global`.
             drop(collector);
         }
     }

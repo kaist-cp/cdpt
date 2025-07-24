@@ -1,12 +1,12 @@
 #[macro_use]
 extern crate cfg_if;
 
-mod collector;
 mod epoch;
-mod guard;
+mod guards;
 mod internal;
 mod pointers;
 mod sync;
+mod tls;
 
 use std::{marker::PhantomData, ops::Deref, sync::atomic::Ordering};
 

@@ -1,7 +1,10 @@
 //! Basic managed pointer types.
 
 use crate::epoch::Color;
-use std::{marker::PhantomData, sync::atomic::AtomicUsize};
+use std::{
+    marker::PhantomData,
+    sync::atomic::{AtomicPtr, AtomicUsize},
+};
 
 #[derive(Clone, Copy)]
 pub(crate) struct ObjMeta(usize);
@@ -20,11 +23,7 @@ impl From<usize> for ObjMeta {
 
 impl ObjMeta {
     pub fn marked(self) -> Color {
-        if self.0 & (1 << (usize::BITS - 1)) > 0 {
-            Color::C1
-        } else {
-            Color::C0
-        }
+        (self.0 & (1 << (usize::BITS - 1))).into()
     }
 
     pub fn root_count(self) -> usize {
@@ -57,7 +56,7 @@ pub(crate) enum PtrMeta {
 
 #[derive(Clone, Copy)]
 pub(crate) struct ManPtr<T> {
-    bits: usize,
+    ptr: *mut (),
     _marker: PhantomData<*mut ManObj<T>>,
 }
 
@@ -66,18 +65,137 @@ impl<T> ManPtr<T> {
     const META_BITS: usize = ((1 << Self::META_WIDTH) - 1) << (usize::BITS - Self::META_WIDTH);
 
     pub fn meta(self) -> PtrMeta {
-        if self.bits & (1 << (usize::BITS - 1)) > 0 {
+        let bits = self.ptr.addr();
+        if bits & (1 << (usize::BITS - 1)) > 0 {
             PtrMeta::Rooted
         } else {
-            PtrMeta::Unrooted(Color::from(self.bits & (1 << (usize::BITS - 2))))
+            PtrMeta::Unrooted(Color::from(bits & (1 << (usize::BITS - 2))))
         }
     }
 
-    pub fn addr(self) -> *mut ManObj<T> {
-        (self.bits & (!Self::META_BITS)) as _
+    pub fn as_ptr(self) -> *mut T {
+        let mo_ptr = decompose_tag::<ManObj<T>>(self.ptr).0.cast::<ManObj<T>>();
+        ((unsafe { &(*mo_ptr).item }) as *const T).cast_mut()
+    }
+
+    pub fn tag(self) -> usize {
+        decompose_tag::<ManObj<T>>(self.ptr).1
+    }
+
+    pub fn with_tag(self, tag: usize) -> Self {
+        Self {
+            ptr: compose_tag::<ManObj<T>>(self.as_ptr().cast(), tag),
+            _marker: PhantomData,
+        }
+    }
+
+    pub fn is_null(self) -> bool {
+        self.as_ptr().is_null()
     }
 
     pub unsafe fn deref<'l>(self) -> &'l T {
-        unsafe { &(*self.addr()).item }
+        unsafe { &*self.as_ptr() }
     }
+}
+
+pub trait TracePtr {}
+
+pub trait TraceObj {
+    fn scan_outgoings(&self);
+}
+
+pub struct EdgeScanner {}
+
+/// A root-count-protected atomic reference to the managed object.
+/// It can be sent and atomic with other threads. Before dereferencing,
+/// you must create a `Local` reference to the same object by calling `load`.
+///
+/// It is interiorly-mutable, meaning that you can atomically update
+/// the underlying reference.
+pub struct AtomicShared<T: Send + Sync> {
+    link: AtomicPtr<()>,
+    _marker: PhantomData<*mut ManObj<T>>,
+}
+
+/// A root-count-protected reference to the managed object.
+/// It can be sent and atomic with other threads.
+///
+/// It is immutable, meaning that you cannot update the underlying reference.
+pub struct Shared<T: Send + Sync> {
+    // Note: We just use `AtomicShared` to implement `Shared`, even though `Shared` is immutable
+    // from the user's perspective. The reason is that `Shared` is also a target of
+    // tracing and marking by collectors, so we must still use atomically mutable link.
+    //
+    // Therefore, we should still use atomic operations to access this pointer.
+    // But some optimizations using relaxed operations might be possible because
+    // the user is the only one who mutates the address.
+    inner: AtomicShared<T>,
+}
+
+pub trait Protector {
+    type Shield;
+
+    fn protect(&self, ptr: *mut ()) -> Self::Shield;
+}
+
+/// A thread-local reference to the managed object, protected by either a hazard pointer,
+/// To dereference, you must call `borrow` which creates an immuatable reference.
+pub struct Local<'g, G: Protector, T: Send + Sync> {
+    ptr: *mut (),
+    sh: G::Shield,
+    _marker: PhantomData<(&'g (), *mut ManObj<T>)>,
+}
+
+impl<'g, G: Protector, T: Send + Sync> Clone for Local<'g, G, T>
+where
+    G::Shield: Clone,
+{
+    fn clone(&self) -> Self {
+        Self {
+            ptr: self.ptr,
+            sh: self.sh.clone(),
+            _marker: PhantomData,
+        }
+    }
+}
+
+impl<'g, G: Protector, T: Send + Sync> Local<'g, G, T> {
+    pub fn protect_by<'h, H: Protector>(&self, prot: &'h H) -> Local<'h, H, T> {
+        Local {
+            ptr: self.ptr,
+            sh: prot.protect(self.ptr),
+            _marker: PhantomData,
+        }
+    }
+}
+
+impl<'g, G: Protector, T: Send + Sync> Copy for Local<'g, G, T> where G::Shield: Copy {}
+
+/// Returns a bitmask containing the unused least significant bits of an aligned pointer to `T`.
+#[inline]
+fn low_bits<T>() -> usize {
+    (1 << align_of::<T>().trailing_zeros()) - 1
+}
+
+/// Panics if the pointer is not properly unaligned.
+#[inline]
+fn ensure_aligned<T>(raw: *mut ()) {
+    assert_eq!(raw as usize & low_bits::<T>(), 0, "unaligned pointer");
+}
+
+/// Given a tagged pointer `data`, returns the same pointer, but tagged with `tag`.
+///
+/// `tag` is truncated to fit into the unused bits of the pointer to `T`.
+#[inline]
+fn compose_tag<T>(ptr: *mut (), tag: usize) -> *mut () {
+    ptr.map_addr(|a| (a & !low_bits::<T>()) | (tag & low_bits::<T>()))
+}
+
+/// Decomposes a tagged pointer `data` into the pointer and the tag.
+#[inline]
+fn decompose_tag<T>(ptr: *mut ()) -> (*mut (), usize) {
+    (
+        ptr.map_addr(|a| a & !low_bits::<T>()),
+        ptr as usize & low_bits::<T>(),
+    )
 }

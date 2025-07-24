@@ -16,16 +16,28 @@ pub(crate) struct Epoch {
     data: usize,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Phase {
     /// Normal phase.
-    N = 0,
+    N = 0b00,
     /// Root tracing phase.
-    RT = 1,
+    RT = 0b01,
     /// Completion tracing phase.
-    CT = 2,
+    CT = 0b10,
 }
 
-#[derive(Clone, Copy)]
+impl From<usize> for Phase {
+    fn from(value: usize) -> Self {
+        match value {
+            0b00 => Self::N,
+            0b01 => Self::RT,
+            0b10 => Self::CT,
+            _ => panic!("Invalid phase number"),
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Color {
     C0 = 0,
     C1 = 1,
@@ -38,6 +50,16 @@ impl From<usize> for Color {
 }
 
 impl Epoch {
+    const PINNED_POS: usize = 0;
+    const PHASE_NUMBER_POS: usize = Self::PINNED_POS + 1;
+    const COLOR_POS: usize = Self::PHASE_NUMBER_POS + 2;
+    const TIMESTAMP_POS: usize = Self::COLOR_POS + 1;
+
+    const PINNED_BIT: usize = 0b1 << Self::PINNED_POS;
+    const PHASE_NUMBER_BITS: usize = 0b11 << Self::PHASE_NUMBER_POS;
+    const COLOR_BIT: usize = 0b1 << Self::COLOR_POS;
+    const TIMESTAMP_BITS: usize = usize::MAX << Self::TIMESTAMP_POS;
+
     /// Returns the starting epoch in unpinned state.
     #[inline]
     pub(crate) fn starting() -> Self {
@@ -47,14 +69,14 @@ impl Epoch {
     /// Returns `true` if the epoch is marked as pinned.
     #[inline]
     pub(crate) fn is_pinned(self) -> bool {
-        (self.data & 1) == 1
+        (self.data & Self::PINNED_BIT) > 0
     }
 
     /// Returns the same epoch, but marked as pinned.
     #[inline]
     pub(crate) fn pinned(self) -> Self {
         Self {
-            data: self.data | 1,
+            data: self.data | Self::PINNED_BIT,
         }
     }
 
@@ -62,7 +84,44 @@ impl Epoch {
     #[inline]
     pub(crate) fn unpinned(self) -> Self {
         Self {
-            data: self.data & !1,
+            data: self.data & !Self::PINNED_BIT,
+        }
+    }
+
+    #[inline]
+    pub(crate) fn phase(self) -> Phase {
+        ((self.data & Self::PHASE_NUMBER_BITS) >> Self::PHASE_NUMBER_POS).into()
+    }
+
+    #[inline]
+    pub(crate) fn with_phase(self, phase: Phase) -> Self {
+        Self {
+            data: (self.data & !Self::PHASE_NUMBER_BITS)
+                | ((phase as usize) << Self::PHASE_NUMBER_POS),
+        }
+    }
+
+    #[inline]
+    pub(crate) fn color(self) -> Color {
+        ((self.data & Self::COLOR_BIT) >> Self::COLOR_POS).into()
+    }
+
+    #[inline]
+    pub(crate) fn with_color(self, color: Color) -> Self {
+        Self {
+            data: (self.data & !Self::COLOR_BIT) | ((color as usize) << Self::COLOR_POS),
+        }
+    }
+
+    #[inline]
+    pub(crate) fn timestamp(self) -> usize {
+        (self.data & Self::TIMESTAMP_BITS) >> Self::TIMESTAMP_POS
+    }
+
+    #[inline]
+    pub(crate) fn with_timestamp(self, value: usize) -> Self {
+        Self {
+            data: (self.data & !Self::TIMESTAMP_BITS) | (value << Self::TIMESTAMP_POS),
         }
     }
 }
