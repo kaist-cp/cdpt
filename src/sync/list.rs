@@ -152,7 +152,7 @@ impl Entry {
 
 impl<T, C: IsElement<T>> List<T, C> {
     /// Returns a new, empty linked list.
-    pub(crate) fn new() -> Self {
+    pub(crate) const fn new() -> Self {
         Self {
             head: Atomic::null(),
             _marker: PhantomData,

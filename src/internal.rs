@@ -1,12 +1,17 @@
 use crate::epoch::{AtomicEpoch, Epoch, Phase};
 use crate::guards::{Collector, Guard, Handle};
+use crate::pointers::TraceObj;
 use crate::sync::{Entry, IsElement, List, fence};
 use crossbeam::epoch::{Guard as EbrGuard, Owned, Shared as EbrShared, unprotected};
 use crossbeam::utils::CachePadded;
+use fastrand::Rng;
 use std::cell::{Cell, UnsafeCell};
 use std::mem::ManuallyDrop;
 use std::ptr::{self, NonNull};
 use std::sync::atomic::{AtomicPtr, Ordering};
+
+const OBJ_BATCHES_SHARD: usize = 8;
+const OBJ_BATCH_SIZE: usize = 64;
 
 /// The global data for a garbage collector.
 pub(crate) struct Global {
@@ -15,6 +20,23 @@ pub(crate) struct Global {
 
     /// The global epoch.
     pub(crate) epoch: CachePadded<AtomicEpoch>,
+
+    objs: [List<ObjBatch>; OBJ_BATCHES_SHARD],
+}
+
+#[repr(C)] // Note: `entry` must be the first field
+struct ObjBatch {
+    entry: Entry,
+    objs: [Option<Box<dyn TraceObj>>; OBJ_BATCH_SIZE],
+}
+
+impl Default for ObjBatch {
+    fn default() -> Self {
+        Self {
+            entry: Entry::default(),
+            objs: [const { None }; OBJ_BATCH_SIZE],
+        }
+    }
 }
 
 impl Global {
@@ -24,6 +46,7 @@ impl Global {
         Self {
             locals: List::new(),
             epoch: CachePadded::new(AtomicEpoch::new(Epoch::starting())),
+            objs: [const { List::new() }; OBJ_BATCHES_SHARD],
         }
     }
 }
@@ -63,6 +86,9 @@ pub(crate) struct Local {
     /// When all guards and handles get dropped, this vector is destroyed.
     available_hids: UnsafeCell<ManuallyDrop<Vec<usize>>>,
 
+    /// A local random number generater to select a shard.
+    rng: UnsafeCell<ManuallyDrop<Rng>>,
+
     /// The local epoch.
     epoch: CachePadded<AtomicEpoch>,
 }
@@ -81,6 +107,7 @@ impl Local {
                 last_observed: Cell::new(Epoch::starting()),
                 hazards: [const { AtomicPtr::new(ptr::null_mut()) }; 16],
                 available_hids: UnsafeCell::new(ManuallyDrop::new((0..16).collect())),
+                rng: UnsafeCell::new(ManuallyDrop::new(Rng::new())),
                 epoch: CachePadded::new(AtomicEpoch::new(Epoch::starting())),
             })
             .into_shared(unprotected());
@@ -213,6 +240,19 @@ impl Local {
         }
     }
 
+    #[inline]
+    pub(crate) fn acquire_hp(&self) -> usize {
+        let Some(hid) = (unsafe { (**self.available_hids.get()).pop() }) else {
+            unimplemented!("implement growable HP");
+        };
+        hid
+    }
+
+    #[inline]
+    pub(crate) fn release_hp(&self, hid: usize) {
+        unsafe { (**self.available_hids.get()).push(hid) };
+    }
+
     /// Removes the `Local` from the global linked list.
     #[cold]
     fn finalize(&self) {
@@ -224,7 +264,9 @@ impl Local {
             // by a guard at this time, it's crucial that the reference is read before marking the
             // `Local` as deleted.
             let collector: Collector = ptr::read(&*(*self.collector.get()));
+
             ManuallyDrop::drop(&mut *self.available_hids.get());
+            ManuallyDrop::drop(&mut *self.rng.get());
 
             // Mark this node in the linked list as deleted.
             self.entry.delete(unprotected());
@@ -233,6 +275,62 @@ impl Local {
             // to the `Global`.
             drop(collector);
         }
+    }
+}
+
+pub(crate) struct HazardPointer {
+    hid: usize,
+    local: NonNull<Local>,
+}
+
+impl HazardPointer {
+    pub(crate) fn new(local: &Local) -> Self {
+        let hid = local.acquire_hp();
+        Self {
+            hid,
+            local: NonNull::from_ref(local),
+        }
+    }
+
+    pub(crate) fn protect_addr(&self, addr: *mut ()) {
+        unsafe {
+            self.local
+                .as_ref()
+                .hazards
+                .get_unchecked(self.hid)
+                .store(addr, Ordering::Release)
+        };
+    }
+}
+
+impl Drop for HazardPointer {
+    fn drop(&mut self) {
+        unsafe {
+            self.protect_addr(ptr::null_mut());
+            self.local.as_ref().release_hp(self.hid);
+        }
+    }
+}
+
+impl IsElement<Self> for ObjBatch {
+    fn entry_of(batch: &Self) -> &Entry {
+        // SAFETY: `Local` is `repr(C)` and `entry` is the first field of it.
+        unsafe {
+            let entry_ptr = (batch as *const Self).cast::<Entry>();
+            &*entry_ptr
+        }
+    }
+
+    unsafe fn element_of(entry: &Entry) -> &Self {
+        // SAFETY: `Local` is `repr(C)` and `entry` is the first field of it.
+        unsafe {
+            let batch_ptr = (entry as *const Entry).cast::<Self>();
+            &*batch_ptr
+        }
+    }
+
+    unsafe fn finalize(entry: &Entry, guard: &EbrGuard) {
+        unsafe { guard.defer_destroy(EbrShared::from(Self::element_of(entry) as *const _)) }
     }
 }
 

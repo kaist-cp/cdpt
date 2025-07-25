@@ -1,6 +1,10 @@
 //! Basic managed pointer types.
 
-use crate::epoch::Color;
+use crate::{
+    epoch::Color,
+    guards::{Guard, Handle},
+    internal::HazardPointer,
+};
 use std::{
     marker::PhantomData,
     sync::atomic::{AtomicPtr, AtomicUsize},
@@ -117,6 +121,23 @@ pub struct AtomicShared<T: Send + Sync> {
     _marker: PhantomData<*mut ManObj<T>>,
 }
 
+unsafe impl<T: Send + Sync> Sync for AtomicShared<T> {}
+unsafe impl<T: Send + Sync> Send for AtomicShared<T> {}
+
+impl<T: Send + Sync> AtomicShared<T> {
+    pub fn new(item: T) -> Self {
+        todo!()
+    }
+
+    pub fn null() -> Self {
+        todo!()
+    }
+
+    pub fn load<'g>(&self, guard: &'g Guard) -> Local<'g, Guard, T> {
+        todo!()
+    }
+}
+
 /// A root-count-protected reference to the managed object.
 /// It can be sent and atomic with other threads.
 ///
@@ -132,10 +153,28 @@ pub struct Shared<T: Send + Sync> {
     inner: AtomicShared<T>,
 }
 
-pub trait Protector {
+pub(crate) trait Protector {
     type Shield;
 
     fn protect(&self, ptr: *mut ()) -> Self::Shield;
+}
+
+impl Protector for Handle {
+    type Shield = HazardPointer;
+
+    fn protect(&self, ptr: *mut ()) -> Self::Shield {
+        let hp = HazardPointer::new(unsafe { self.local.as_ref() });
+        hp.protect_addr(ptr);
+        hp
+    }
+}
+
+impl Protector for Guard {
+    type Shield = ();
+
+    fn protect(&self, _: *mut ()) -> Self::Shield {
+        ()
+    }
 }
 
 /// A thread-local reference to the managed object, protected by either a hazard pointer,
