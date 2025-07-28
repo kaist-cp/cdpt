@@ -1,6 +1,6 @@
 use std::sync::OnceLock;
 
-use crate::guards::{Collector, Handle};
+use crate::guards::{Collector, Guard, Handle};
 
 fn collector() -> &'static Collector {
     /// The global data for the default garbage collector.
@@ -16,4 +16,8 @@ thread_local! {
 /// Acquire a local handle for the garbage collector.
 pub fn handle() -> Handle {
     HANDLE.with(|primary| primary.clone())
+}
+
+pub fn pin() -> Guard {
+    HANDLE.with(|primary| primary.pin())
 }

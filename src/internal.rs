@@ -276,6 +276,13 @@ impl Local {
             drop(collector);
         }
     }
+
+    #[inline]
+    pub(crate) fn pinned_epoch(&self) -> Epoch {
+        // Safety: there cannot be any interleaving writes because this local thread has
+        // an exclusive write permission for this `Local` record.
+        unsafe { self.epoch.load_non_atomic() }
+    }
 }
 
 pub(crate) struct HazardPointer {

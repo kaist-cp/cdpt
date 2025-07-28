@@ -1,3 +1,5 @@
+#![feature(likely_unlikely)]
+#![feature(strict_provenance_atomic_ptr)]
 #[macro_use]
 extern crate cfg_if;
 

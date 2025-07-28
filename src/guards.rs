@@ -1,7 +1,14 @@
 //! RAII-style guards for users.
 
-use crate::internal::{Global, Local};
-use std::{ptr::NonNull, sync::Arc};
+use crate::{
+    epoch::{Color, Phase},
+    internal::{Global, Local},
+    sync::fence,
+};
+use std::{
+    ptr::NonNull,
+    sync::{Arc, atomic::Ordering},
+};
 
 /// A global garbage collector.
 pub struct Collector {
@@ -111,6 +118,35 @@ impl Guard {
     /// a data structure come from the same collector.
     pub fn collector(&self) -> &Collector {
         unsafe { self.local.as_ref().collector() }
+    }
+
+    pub(crate) fn phase(&self) -> Phase {
+        unsafe { self.local.as_ref() }.pinned_epoch().phase()
+    }
+
+    pub(crate) fn white_color(&self) -> Color {
+        unsafe { self.local.as_ref() }.pinned_epoch().color()
+    }
+
+    pub(crate) fn black_color(&self) -> Color {
+        self.white_color().flip()
+    }
+
+    pub(crate) fn alloc_color(&self) -> Color {
+        // TODO: We may want to relax this (e.g., white for `Local` even during tracing).
+        match self.phase() {
+            Phase::N => self.white_color(),
+            _ => self.black_color(),
+        }
+    }
+
+    pub(crate) fn global_phase(&self) -> Phase {
+        fence::light();
+        unsafe { self.local.as_ref() }
+            .global()
+            .epoch
+            .load(Ordering::Acquire)
+            .phase()
     }
 }
 

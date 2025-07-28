@@ -49,6 +49,15 @@ impl From<usize> for Color {
     }
 }
 
+impl Color {
+    pub fn flip(self) -> Self {
+        match self {
+            Color::C0 => Color::C1,
+            Color::C1 => Color::C0,
+        }
+    }
+}
+
 impl Epoch {
     const PINNED_POS: usize = 0;
     const PHASE_NUMBER_POS: usize = Self::PINNED_POS + 1;
@@ -183,6 +192,21 @@ impl AtomicEpoch {
         {
             Ok(data) => Ok(Epoch { data }),
             Err(data) => Err(Epoch { data }),
+        }
+    }
+
+    /// Loads a value "non-atomically" from the atomic epoch.
+    ///
+    /// # Safety
+    ///
+    /// There must be no interleaving writes on this variable.
+    ///
+    /// Note that read-read races, where one access is atomic and one is not, are not UB.
+    /// * https://doc.rust-lang.org/nightly/std/sync/atomic/index.html#memory-model-for-atomic-accesses
+    #[inline]
+    pub(crate) unsafe fn load_non_atomic(&self) -> Epoch {
+        Epoch {
+            data: unsafe { *self.data.as_ptr() },
         }
     }
 }
