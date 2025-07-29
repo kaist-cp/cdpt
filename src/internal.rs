@@ -1,7 +1,11 @@
 use crate::epoch::{AtomicEpoch, Epoch, Phase};
 use crate::guards::{Collector, Guard, Handle};
-use crate::pointers::TraceObj;
+use crate::pin;
+use crate::pointers::{ManObj, ManPtr, TraceObj};
 use crate::sync::{Entry, IsElement, List, fence};
+use crate::task::Task;
+use arrayvec::ArrayVec;
+use crossbeam::deque::{Stealer, Worker};
 use crossbeam::epoch::{Guard as EbrGuard, Owned, Shared as EbrShared, unprotected};
 use crossbeam::utils::CachePadded;
 use fastrand::Rng;
@@ -12,6 +16,8 @@ use std::sync::atomic::{AtomicPtr, Ordering};
 
 const OBJ_BATCHES_SHARD: usize = 8;
 const OBJ_BATCH_SIZE: usize = 64;
+/// TODO: Make it resizable. We might need a dedicated SMR (e.g., EBR, HP).
+const HAZARDS_COUNT: usize = 8;
 
 /// The global data for a garbage collector.
 pub(crate) struct Global {
@@ -27,14 +33,14 @@ pub(crate) struct Global {
 #[repr(C)] // Note: `entry` must be the first field
 struct ObjBatch {
     entry: Entry,
-    objs: [Option<Box<dyn TraceObj>>; OBJ_BATCH_SIZE],
+    objs: ArrayVec<Box<dyn TraceObj>, OBJ_BATCH_SIZE>,
 }
 
 impl Default for ObjBatch {
     fn default() -> Self {
         Self {
             entry: Entry::default(),
-            objs: [const { None }; OBJ_BATCH_SIZE],
+            objs: ArrayVec::default(),
         }
     }
 }
@@ -72,14 +78,10 @@ pub(crate) struct Local {
     last_observed: Cell<Epoch>,
 
     /// A single-writer multiple-reader list of protected pointers.
-    ///
-    /// Note: It doesn't have to carray any type information, as what it should do
-    /// is just recording raw addresses that are currently protected, and the collector
-    /// still can trace their outgoing edges because the type information will be in
-    /// the collector's object lists.
-    ///
-    /// TODO: Make it resizable. We might need a dedicated SMR (e.g., EBR, HP).
-    hazards: [AtomicPtr<()>; 8],
+    hazards: [AtomicPtr<()>; HAZARDS_COUNT],
+
+    /// The function pointers to mark each HP-protected object.
+    hazards_marker: [Cell<Option<unsafe fn(*mut ())>>; HAZARDS_COUNT],
 
     /// A vector of available hazard indices.
     ///
@@ -89,6 +91,15 @@ pub(crate) struct Local {
     /// A local random number generater to select a shard.
     rng: UnsafeCell<ManuallyDrop<Rng>>,
 
+    /// A local batch of newly allocated objects.
+    objs: UnsafeCell<ManuallyDrop<ObjBatch>>,
+
+    /// A local mark queue.
+    mark_jobs: UnsafeCell<ManuallyDrop<Worker<Task>>>,
+
+    /// A stealer handle for `mark_jobs`.
+    mark_jobs_stealer: Stealer<Task>,
+
     /// The local epoch.
     epoch: CachePadded<AtomicEpoch>,
 }
@@ -97,17 +108,22 @@ impl Local {
     /// Registers a new `Local` in the provided `Global`.
     pub(crate) fn register(collector: &Collector) -> Handle {
         unsafe {
+            let mark_jobs = Worker::new_fifo();
+            let stealer = mark_jobs.stealer();
             // Since we dereference no pointers in this block, it is safe to use `unprotected`.
-
             let local = Owned::new(Self {
                 entry: Entry::default(),
                 collector: UnsafeCell::new(ManuallyDrop::new(collector.clone())),
                 guard_count: Cell::new(0),
                 handle_count: Cell::new(1),
                 last_observed: Cell::new(Epoch::starting()),
-                hazards: [const { AtomicPtr::new(ptr::null_mut()) }; 8],
-                available_hids: UnsafeCell::new(ManuallyDrop::new((0..8).collect())),
+                hazards: [const { AtomicPtr::new(ptr::null_mut()) }; HAZARDS_COUNT],
+                hazards_marker: [const { Cell::new(None) }; HAZARDS_COUNT],
+                available_hids: UnsafeCell::new(ManuallyDrop::new((0..HAZARDS_COUNT).collect())),
                 rng: UnsafeCell::new(ManuallyDrop::new(Rng::new())),
+                objs: UnsafeCell::new(ManuallyDrop::new(ObjBatch::default())),
+                mark_jobs: UnsafeCell::new(ManuallyDrop::new(mark_jobs)),
+                mark_jobs_stealer: stealer,
                 epoch: CachePadded::new(AtomicEpoch::new(Epoch::starting())),
             })
             .into_shared(unprotected());
@@ -144,15 +160,18 @@ impl Local {
         let guard = Guard {
             local: NonNull::from_ref(self),
         };
+        self.pin_inner();
+        guard
+    }
 
+    #[inline]
+    pub(crate) fn pin_inner(&self) {
         let guard_count = self.guard_count.get();
         self.guard_count.set(guard_count.checked_add(1).unwrap());
 
         if guard_count == 0 {
             self.pin_freshly();
         }
-
-        guard
     }
 
     #[inline]
@@ -173,17 +192,24 @@ impl Local {
         if self.last_observed.get().timestamp() != curr_epoch.timestamp()
             && curr_epoch.phase() == Phase::RT
         {
-            // TODO: Phase barrier: if we are in a root tracing phase and it’s the first time
+            // Phase barrier: if we are in a root tracing phase and it’s the first time
             // observing this phase, scan and mark (i.e., push to mark stack)
             // objects that are protected by thread-local HPs.
-            todo!()
+            for (hp, mark) in self.hazards.iter().zip(self.hazards_marker.iter()) {
+                let ptr = hp.load(Ordering::Relaxed);
+                if ptr.is_null() {
+                    continue;
+                }
+                let mark = mark.get().unwrap();
+                unsafe { mark(ptr) };
+            }
         }
         self.last_observed.set(curr_epoch);
     }
 
     /// Unpins the `Local`.
     #[inline]
-    pub(crate) fn unpin(&self) {
+    pub(crate) fn unpin_inner(&self) {
         let guard_count = self.guard_count.get();
         self.guard_count.set(guard_count - 1);
 
@@ -199,24 +225,8 @@ impl Local {
     /// Unpins and then pins the `Local`.
     #[inline]
     pub(crate) fn repin(&self) {
-        let guard_count = self.guard_count.get();
-
-        // Update the local epoch only if there's only one guard.
-        if guard_count == 1 {
-            let epoch = self.epoch.load(Ordering::Relaxed);
-            let global_epoch = self.global().epoch.load(Ordering::Relaxed).pinned();
-
-            // Update the local epoch only if the global epoch is greater than the local epoch.
-            if epoch != global_epoch {
-                // We store the new epoch with `Release` because we need to ensure any memory
-                // accesses from the previous epoch do not leak into the new one.
-                self.epoch.store(global_epoch, Ordering::Release);
-
-                // However, we don't need a following `SeqCst` fence, because it is safe for memory
-                // accesses from the new epoch to be executed before updating the local epoch. At
-                // worse, other threads will see the new epoch late and delay GC slightly.
-            }
-        }
+        self.unpin_inner();
+        self.pin_inner();
     }
 
     /// Increments the handle count.
@@ -253,6 +263,48 @@ impl Local {
         unsafe { (**self.available_hids.get()).push(hid) };
     }
 
+    #[inline]
+    pub(crate) fn alloc<T: 'static + TraceObj>(&self, obj: ManObj<T>) -> *mut ManObj<T> {
+        let b = Box::new(obj);
+        let ptr = ((&*b) as *const ManObj<T>).cast_mut();
+        let mut b_dyn: Box<dyn TraceObj> = b;
+
+        loop {
+            match unsafe { &mut *self.objs.get() }.objs.try_push(b_dyn) {
+                Ok(_) => break,
+                Err(e) => {
+                    b_dyn = e.element();
+                    self.flush_objs();
+                }
+            }
+        }
+        ptr
+    }
+
+    #[inline]
+    pub(crate) fn select_obj_shard(&self) -> usize {
+        unsafe { &mut *self.rng.get() }.usize(0..OBJ_BATCHES_SHARD)
+    }
+
+    #[inline]
+    pub(crate) fn flush_objs(&self) {
+        unsafe {
+            let batch =
+                ManuallyDrop::into_inner(ptr::replace(self.objs.get(), ManuallyDrop::default()));
+            let guard = unprotected();
+            self.global()
+                .objs
+                .get_unchecked(self.select_obj_shard())
+                .insert(Owned::new(batch).into_shared(guard), guard);
+        }
+    }
+
+    #[inline]
+    pub(crate) fn schedule_mark<T: 'static + TraceObj>(&self, obj: &ManObj<T>) {
+        let task = Task::new(|| obj.mark(&pin()));
+        unsafe { &mut *self.mark_jobs.get() }.push(task);
+    }
+
     /// Removes the `Local` from the global linked list.
     #[cold]
     fn finalize(&self) {
@@ -265,8 +317,11 @@ impl Local {
             // `Local` as deleted.
             let collector: Collector = ptr::read(&*(*self.collector.get()));
 
+            // TODO: flush mark jobs
+            self.flush_objs();
             ManuallyDrop::drop(&mut *self.available_hids.get());
             ManuallyDrop::drop(&mut *self.rng.get());
+            ManuallyDrop::drop(&mut *self.objs.get());
 
             // Mark this node in the linked list as deleted.
             self.entry.delete(unprotected());
@@ -299,21 +354,46 @@ impl HazardPointer {
         }
     }
 
-    pub(crate) fn protect_addr(&self, addr: *mut ()) {
+    pub(crate) fn protect<T: 'static + TraceObj>(&self, addr: ManPtr<T>) {
+        unsafe fn mark<T: 'static + TraceObj>(ptr: *mut ()) {
+            let ptr = ManPtr::<T>::from(ptr);
+            unsafe {
+                ptr.deref().mark(&pin());
+            }
+        }
+
         unsafe {
-            self.local
-                .as_ref()
+            let local = self.local.as_ref();
+            local
                 .hazards
                 .get_unchecked(self.hid)
-                .store(addr, Ordering::Release)
-        };
+                .store(addr.as_ptr().cast(), Ordering::Release);
+
+            let marker_ref = local.hazards_marker.get_unchecked(self.hid);
+            if addr.is_null() {
+                marker_ref.set(None);
+            } else {
+                marker_ref.set(Some(mark::<T>));
+            };
+        }
+    }
+
+    pub(crate) fn clear(&self) {
+        unsafe {
+            let local = self.local.as_ref();
+            local
+                .hazards
+                .get_unchecked(self.hid)
+                .store(ptr::null_mut(), Ordering::Release);
+            local.hazards_marker.get_unchecked(self.hid).set(None);
+        }
     }
 }
 
 impl Drop for HazardPointer {
     fn drop(&mut self) {
         unsafe {
-            self.protect_addr(ptr::null_mut());
+            self.clear();
             self.local.as_ref().release_hp(self.hid);
         }
     }

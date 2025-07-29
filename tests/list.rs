@@ -5,8 +5,8 @@ use std::sync::atomic::Ordering;
 
 struct Node<K, V>
 where
-    K: Send + Sync,
-    V: Send + Sync,
+    K: 'static + Send + Sync,
+    V: 'static + Send + Sync,
 {
     next: AtomicShared<Self>,
     key: K,
@@ -21,12 +21,16 @@ where
     fn unroot_outgoings(&self, guard: &Guard) {
         self.next.unroot(guard);
     }
+
+    fn shade_outgoings(&self, guard: &Guard) {
+        self.next.shade(guard);
+    }
 }
 
 struct List<K, V>
 where
-    K: Send + Sync,
-    V: Send + Sync,
+    K: 'static + Send + Sync,
+    V: 'static + Send + Sync,
 {
     head: AtomicShared<Node<K, V>>,
 }
@@ -59,8 +63,8 @@ where
 
 struct Cursor<'g, K, V>
 where
-    K: Send + Sync,
-    V: Send + Sync,
+    K: 'static + Send + Sync,
+    V: 'static + Send + Sync,
 {
     prev: Local<'g, Guard, Node<K, V>>,
     curr: Local<'g, Guard, Node<K, V>>,
@@ -82,8 +86,8 @@ where
 
 pub struct VHolder<'h, K, V>
 where
-    K: Send + Sync,
-    V: Send + Sync,
+    K: 'static + Send + Sync,
+    V: 'static + Send + Sync,
 {
     node: Local<'h, Handle, Node<K, V>>,
 }
@@ -277,8 +281,8 @@ where
 
 pub struct HList<K, V>
 where
-    K: Send + Sync,
-    V: Send + Sync,
+    K: 'static + Send + Sync,
+    V: 'static + Send + Sync,
 {
     inner: List<K, V>,
 }
@@ -308,10 +312,9 @@ where
 
 #[cfg(test)]
 mod tests {
-    extern crate rand;
     use super::*;
+    use fastrand::shuffle;
     use gc_design::handle;
-    use rand::prelude::SliceRandom;
     use std::thread::scope;
 
     const THREADS: i32 = 30;
@@ -324,10 +327,9 @@ mod tests {
             for t in 0..THREADS {
                 s.spawn(move || {
                     let handle = handle();
-                    let mut rng = rand::rng();
                     let mut keys: Vec<i32> =
                         (0..ELEMENTS_PER_THREADS).map(|k| k * THREADS + t).collect();
-                    keys.shuffle(&mut rng);
+                    shuffle(&mut keys);
                     for i in keys {
                         assert!(map.insert(i, i.to_string(), &handle));
                     }
@@ -339,10 +341,9 @@ mod tests {
             for t in 0..(THREADS / 2) {
                 s.spawn(move || {
                     let handle = handle();
-                    let mut rng = rand::rng();
                     let mut keys: Vec<i32> =
                         (0..ELEMENTS_PER_THREADS).map(|k| k * THREADS + t).collect();
-                    keys.shuffle(&mut rng);
+                    shuffle(&mut keys);
                     for i in keys {
                         assert_eq!(
                             Some(&i.to_string()),
@@ -357,10 +358,9 @@ mod tests {
             for t in (THREADS / 2)..THREADS {
                 s.spawn(move || {
                     let handle = handle();
-                    let mut rng = rand::rng();
                     let mut keys: Vec<i32> =
                         (0..ELEMENTS_PER_THREADS).map(|k| k * THREADS + t).collect();
-                    keys.shuffle(&mut rng);
+                    shuffle(&mut keys);
                     for i in keys {
                         assert_eq!(
                             Some(&i.to_string()),

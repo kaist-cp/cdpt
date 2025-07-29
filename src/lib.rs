@@ -8,6 +8,7 @@ mod guards;
 mod internal;
 mod pointers;
 mod sync;
+mod task;
 mod tls;
 
 pub use guards::{Collector, Guard, Handle};

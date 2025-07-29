@@ -2,7 +2,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use gc_design::{AtomicShared, Guard, Handle, Local, TraceObj, TracePtr, handle};
 
-struct Node<T: Send + Sync> {
+struct Node<T: 'static + Send + Sync> {
     item: T,
     next: AtomicShared<Self>,
 }
@@ -11,9 +11,13 @@ unsafe impl<T: Send + Sync> TraceObj for Node<T> {
     fn unroot_outgoings(&self, guard: &Guard) {
         self.next.unroot(guard);
     }
+
+    fn shade_outgoings(&self, guard: &Guard) {
+        self.next.shade(guard);
+    }
 }
 
-pub struct ItemRef<'h, T: Send + Sync> {
+pub struct ItemRef<'h, T: 'static + Send + Sync> {
     node: Local<'h, Handle, Node<T>>,
 }
 
@@ -29,7 +33,7 @@ impl<'h, T: Send + Sync> ItemRef<'h, T> {
     }
 }
 
-struct Stack<T: Send + Sync> {
+struct Stack<T: 'static + Send + Sync> {
     top: AtomicShared<Node<T>>,
 }
 

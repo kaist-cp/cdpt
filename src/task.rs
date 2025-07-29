@@ -1,0 +1,72 @@
+use core::marker::PhantomData;
+use core::mem::{self, MaybeUninit};
+use core::ptr;
+
+/// Number of words a piece of `Data` can hold.
+const DATA_WORDS: usize = 1;
+
+/// Some space to keep a `FnOnce()` object on the stack.
+type Data = [usize; DATA_WORDS];
+
+/// A `FnOnce()` that is stored inline if small, or otherwise boxed on the heap.
+///
+/// This is a handy way of keeping an unsized `FnOnce()` within a sized structure.
+pub(crate) struct Task {
+    call: unsafe fn(*mut u8),
+    data: MaybeUninit<Data>,
+    _marker: PhantomData<*mut ()>, // !Send + !Sync
+}
+
+impl Task {
+    /// Constructs a new `Task` from a `FnOnce()`.
+    pub(crate) fn new<F: FnOnce()>(f: F) -> Self {
+        let size = mem::size_of::<F>();
+        let align = mem::align_of::<F>();
+
+        assert!(
+            size <= mem::size_of::<Data>() && align <= mem::align_of::<Data>(),
+            "Increase `DATA_WORDS`"
+        );
+        unsafe {
+            let mut data = MaybeUninit::<Data>::uninit();
+            ptr::write(data.as_mut_ptr().cast::<F>(), f);
+
+            unsafe fn call<F: FnOnce()>(raw: *mut u8) {
+                let f: F = unsafe { ptr::read(raw.cast::<F>()) };
+                f();
+            }
+
+            Self {
+                call: call::<F>,
+                data,
+                _marker: PhantomData,
+            }
+        }
+    }
+
+    /// Calls the function.
+    #[inline]
+    pub(crate) fn call(mut self) {
+        let call = self.call;
+        unsafe { call(self.data.as_mut_ptr().cast::<u8>()) };
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Task;
+    use std::cell::Cell;
+
+    #[test]
+    fn single_word_data() {
+        let fired = &Cell::new(false);
+
+        let d = Task::new(move || {
+            fired.set(true);
+        });
+
+        assert!(!fired.get());
+        d.call();
+        assert!(fired.get());
+    }
+}

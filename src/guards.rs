@@ -1,8 +1,10 @@
 //! RAII-style guards for users.
 
 use crate::{
+    TraceObj,
     epoch::{Color, Phase},
     internal::{Global, Local},
+    pointers::ManObj,
     sync::fence,
 };
 use std::{
@@ -146,11 +148,19 @@ impl Guard {
             .load(Ordering::Acquire)
             .phase()
     }
+
+    pub(crate) fn alloc<T: 'static + TraceObj>(&self, obj: ManObj<T>) -> *mut ManObj<T> {
+        unsafe { self.local.as_ref() }.alloc(obj)
+    }
+
+    pub(crate) fn schedule_mark<T: 'static + TraceObj>(&self, obj: &ManObj<T>) {
+        unsafe { self.local.as_ref() }.schedule_mark(obj);
+    }
 }
 
 impl Drop for Guard {
     #[inline]
     fn drop(&mut self) {
-        unsafe { self.local.as_ref() }.unpin();
+        unsafe { self.local.as_ref() }.unpin_inner();
     }
 }
