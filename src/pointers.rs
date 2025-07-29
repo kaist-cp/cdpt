@@ -34,7 +34,7 @@ impl ObjMeta {
 
     pub fn new(marked: Color, root_count: usize) -> Self {
         debug_assert!(root_count < (1 << (usize::BITS - 1)));
-        let bits = ((marked as usize) << (1 << (usize::BITS - 1))) | root_count;
+        let bits = ((marked as usize) << (usize::BITS - 1)) | root_count;
         Self(bits)
     }
 
@@ -257,13 +257,8 @@ pub trait TracePtr {
 }
 
 pub unsafe trait TraceObj {
-    fn scan_outgoings(&self) -> &[&dyn TracePtr];
-
-    fn unroot_outgoings(&self, guard: &Guard) {
-        for src in self.scan_outgoings() {
-            src.unroot(guard);
-        }
-    }
+    /// Calls `unroot` for all outgoing `AtomicShared` and `Shared`.
+    fn unroot_outgoings(&self, guard: &Guard);
 }
 
 /// A root-count-protected atomic reference to the managed object.
@@ -559,6 +554,11 @@ impl<T: Send + Sync + TraceObj> Shared<T> {
     pub fn as_local<'g>(&self, guard: &'g Guard) -> Local<'g, Guard, T> {
         Local::from_raw(self.as_man_ptr(), guard)
     }
+
+    /// Returns `true` if the two `Shared`s point to the same allocation with the same tag.
+    pub fn ptr_eq(this: &Self, other: &Self) -> bool {
+        this.as_man_ptr().without_meta() == other.as_man_ptr().without_meta()
+    }
 }
 
 impl<T: Send + Sync + TraceObj> TracePtr for Shared<T> {
@@ -567,7 +567,7 @@ impl<T: Send + Sync + TraceObj> TracePtr for Shared<T> {
     }
 }
 
-pub(crate) trait Protector {
+pub trait Protector {
     type Shield;
 
     fn protect(&self, ptr: *mut ()) -> Self::Shield;
@@ -601,7 +601,9 @@ pub struct Local<'g, G: Protector, T: Send + Sync + TraceObj> {
 
 impl<'g, T: Send + Sync + TraceObj> Local<'g, Guard, T> {
     pub fn new(item: T, guard: &'g Guard) -> Self {
-        let ptr = ManPtr::alloc_unrooted(item, guard.alloc_color());
+        // `without_meta`: The object should have a right color, but the pointer should not,
+        // because this is `Local` pointer.
+        let ptr = ManPtr::alloc_unrooted(item, guard.alloc_color()).without_meta();
         // Safety: `ptr` is freshly allocated.
         unsafe { &ptr.deref().item }.unroot_outgoings(guard);
         Self {
@@ -625,6 +627,7 @@ impl<'g, G: Protector, T: Send + Sync + TraceObj> Local<'g, G, T> {
         }
     }
 
+    /// TODO: refactor as a method of `Guard` and `Handle`
     pub fn protect<'h, H: Protector>(&self, prot: &'h H) -> Local<'h, H, T> {
         Local {
             ptr: self.ptr,
@@ -661,6 +664,24 @@ impl<'g, G: Protector, T: Send + Sync + TraceObj> Local<'g, G, T> {
         Shared {
             inner: self.as_atomic_shared(),
         }
+    }
+
+    pub fn tag(&self) -> usize {
+        self.as_man_ptr().tag()
+    }
+
+    pub fn with_tag(self, tag: usize) -> Self {
+        Self {
+            ptr: self.as_man_ptr().with_tag(tag).data,
+            sh: self.sh,
+            _marker: PhantomData,
+        }
+    }
+
+    /// Returns `true` if the two `Local`s point to the same allocation with the same tag.
+    /// This function ignores the underlying protection guards.
+    pub fn ptr_eq<'h, H: Protector>(this: &Self, other: &Local<'h, H, T>) -> bool {
+        this.ptr == other.ptr
     }
 }
 

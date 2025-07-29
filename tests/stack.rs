@@ -1,55 +1,83 @@
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, Ordering};
 
-use gc_design::{Atomic, Local};
+use gc_design::{AtomicShared, Guard, Handle, Local, TraceObj, TracePtr, handle};
 
 struct Node<T: Send + Sync> {
-    item: Atomic<T>,
-    next: Atomic<Self>,
+    item: T,
+    next: AtomicShared<Self>,
+}
+
+unsafe impl<T: Send + Sync> TraceObj for Node<T> {
+    fn unroot_outgoings(&self, guard: &Guard) {
+        self.next.unroot(guard);
+    }
+}
+
+pub struct ItemRef<'h, T: Send + Sync> {
+    node: Local<'h, Handle, Node<T>>,
+}
+
+impl<'h, T: Send + Sync> ItemRef<'h, T> {
+    fn new<'g>(node: Local<'g, Guard, Node<T>>, handle: &'h Handle) -> Self {
+        Self {
+            node: node.protect(handle),
+        }
+    }
+
+    pub fn borrow(&self) -> &T {
+        self.node.as_ref().map(|node| &node.item).unwrap()
+    }
 }
 
 struct Stack<T: Send + Sync> {
-    top: Atomic<Node<T>>,
+    top: AtomicShared<Node<T>>,
 }
 
 impl<T: Send + Sync> Stack<T> {
     fn new() -> Self {
         Self {
-            top: Atomic::null(),
+            top: AtomicShared::null(),
         }
     }
 
-    fn pop(&self) -> Option<Local<T>> {
+    fn pop<'h>(&self, handle: &'h Handle) -> Option<ItemRef<'h, T>> {
+        let guard = handle.pin();
         loop {
-            let old = self.top.load().0;
+            let old = self.top.load(Ordering::Acquire, &guard);
             let new = if let Some(old) = old.as_ref() {
-                old.borrow().next.load().0
+                old.next.load(Ordering::Acquire, &guard)
             } else {
                 return None;
             };
             if self
                 .top
-                .compare_exchange((old.as_ref(), 0), (new.as_ref(), 0))
+                .compare_exchange(&old, &new, Ordering::AcqRel, Ordering::Relaxed, &guard)
+                .is_ok()
             {
-                return old
-                    .as_ref()
-                    .map(|node| node.borrow().item.load().0)
-                    .unwrap();
+                return Some(ItemRef::new(old, handle));
             }
         }
     }
 
-    fn push(&self, item: T) {
-        let new = Local::new(Node {
-            item: Atomic::new(item),
-            next: Atomic::null(),
-        });
+    fn push(&self, item: T, handle: &Handle) {
+        let guard = handle.pin();
+        let new = Local::new(
+            Node {
+                item,
+                next: AtomicShared::null(),
+            },
+            &guard,
+        );
 
         loop {
-            let old = self.top.load().0;
-            new.borrow().next.store(old.as_ref(), 0);
+            let old = self.top.load(Ordering::Acquire, &guard);
+            unsafe { new.deref() }
+                .next
+                .store(&old, Ordering::Relaxed, &guard);
             if self
                 .top
-                .compare_exchange((old.as_ref(), 0), (Some(&new), 0))
+                .compare_exchange(&old, &new, Ordering::AcqRel, Ordering::Relaxed, &guard)
+                .is_ok()
             {
                 return;
             }
@@ -59,14 +87,15 @@ impl<T: Send + Sync> Stack<T> {
 
 #[test]
 fn simple() {
+    let handle = handle();
     let stack = Stack::new();
-    stack.push(1);
-    stack.push(2);
-    stack.push(3);
-    assert_eq!(Some(3), stack.pop().map(|entry| *entry.borrow()));
-    assert_eq!(Some(2), stack.pop().map(|entry| *entry.borrow()));
-    assert_eq!(Some(1), stack.pop().map(|entry| *entry.borrow()));
-    assert!(stack.pop().is_none());
+    stack.push(1, &handle);
+    stack.push(2, &handle);
+    stack.push(3, &handle);
+    assert_eq!(Some(3), stack.pop(&handle).map(|entry| *entry.borrow()));
+    assert_eq!(Some(2), stack.pop(&handle).map(|entry| *entry.borrow()));
+    assert_eq!(Some(1), stack.pop(&handle).map(|entry| *entry.borrow()));
+    assert!(stack.pop(&handle).is_none());
 }
 
 #[test]
@@ -83,12 +112,13 @@ fn smoke() {
     scope(|s| {
         for t in 0..THREADS {
             s.spawn(move || {
+                let handle = handle();
                 for v in (t * COUNT)..((t + 1) * COUNT) {
-                    stack.push(v);
+                    stack.push(v, &handle);
                 }
                 let mut popped = 0;
                 while popped < COUNT {
-                    if let Some(item) = stack.pop().as_ref() {
+                    if let Some(item) = stack.pop(&handle).as_ref() {
                         popped += 1;
                         assert!(!found[*item.borrow()].load(Ordering::Acquire));
                         found[*item.borrow()].store(true, Ordering::Release);

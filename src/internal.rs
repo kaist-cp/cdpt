@@ -79,7 +79,7 @@ pub(crate) struct Local {
     /// the collector's object lists.
     ///
     /// TODO: Make it resizable. We might need a dedicated SMR (e.g., EBR, HP).
-    hazards: [AtomicPtr<()>; 16],
+    hazards: [AtomicPtr<()>; 8],
 
     /// A vector of available hazard indices.
     ///
@@ -105,8 +105,8 @@ impl Local {
                 guard_count: Cell::new(0),
                 handle_count: Cell::new(1),
                 last_observed: Cell::new(Epoch::starting()),
-                hazards: [const { AtomicPtr::new(ptr::null_mut()) }; 16],
-                available_hids: UnsafeCell::new(ManuallyDrop::new((0..16).collect())),
+                hazards: [const { AtomicPtr::new(ptr::null_mut()) }; 8],
+                available_hids: UnsafeCell::new(ManuallyDrop::new((0..8).collect())),
                 rng: UnsafeCell::new(ManuallyDrop::new(Rng::new())),
                 epoch: CachePadded::new(AtomicEpoch::new(Epoch::starting())),
             })
@@ -285,7 +285,7 @@ impl Local {
     }
 }
 
-pub(crate) struct HazardPointer {
+pub struct HazardPointer {
     hid: usize,
     local: NonNull<Local>,
 }

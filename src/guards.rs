@@ -96,8 +96,6 @@ impl Drop for Handle {
 }
 
 pub struct Guard {
-    // TODO: We do not have `unprotected` guard anymore, so it cannot be null.
-    // Refactor it (and other all related things) as `NonNull`.
     pub(crate) local: NonNull<Local>,
 }
 
