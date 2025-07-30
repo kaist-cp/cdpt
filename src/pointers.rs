@@ -411,7 +411,7 @@ impl<T: 'static + Send + Sync + TraceObj> AtomicShared<T> {
             return Err(Local::from_raw(old, guard));
         }
 
-        // First loop to handle the `Rooted` case.
+        // First block to handle the `Rooted` case.
         if unlikely(old.meta() == PtrMeta::Rooted) {
             // If the source is rooted, we increment the root count before trying update.
             let new_rooted = new.as_shared();
@@ -493,7 +493,7 @@ impl<T: 'static + Send + Sync + TraceObj> AtomicShared<T> {
             .map(|current| ManPtr::from(current))
             .map_err(|current| ManPtr::from(current));
 
-        if result.is_ok() && old_color == guard.white_color() {
+        if result.is_ok() && old_color == guard.white_color() && guard.global_phase() != Phase::N {
             // Yuasa-style deletion barrier.
             old.mark_pointee(guard);
         }
@@ -711,14 +711,6 @@ impl<'g, G: Protector, T: 'static + Send + Sync + TraceObj> Local<'g, G, T> {
         ManPtr::from(self.ptr)
     }
 
-    pub fn as_ref(&self) -> Option<&'g T> {
-        unsafe { self.as_man_ptr().as_ref() }.map(|obj| &obj.item)
-    }
-
-    pub unsafe fn deref(&self) -> &'g T {
-        unsafe { &self.as_man_ptr().deref().item }
-    }
-
     pub fn as_atomic_shared(&self) -> AtomicShared<T> {
         let ptr = self.as_man_ptr();
         if ptr.is_null() {
@@ -752,6 +744,26 @@ impl<'g, G: Protector, T: 'static + Send + Sync + TraceObj> Local<'g, G, T> {
     /// This function ignores the underlying protection guards.
     pub fn ptr_eq<'h, H: Protector>(this: &Self, other: &Local<'h, H, T>) -> bool {
         this.ptr == other.ptr
+    }
+}
+
+impl<'g, T: 'static + Send + Sync + TraceObj> Local<'g, Guard, T> {
+    pub fn as_ref(&self) -> Option<&'g T> {
+        unsafe { self.as_man_ptr().as_ref() }.map(|obj| &obj.item)
+    }
+
+    pub unsafe fn deref(&self) -> &'g T {
+        unsafe { &self.as_man_ptr().deref().item }
+    }
+}
+
+impl<'g, T: 'static + Send + Sync + TraceObj> Local<'g, Handle, T> {
+    pub fn as_ref(&self) -> Option<&T> {
+        unsafe { self.as_man_ptr().as_ref() }.map(|obj| &obj.item)
+    }
+
+    pub unsafe fn deref(&self) -> &T {
+        unsafe { &self.as_man_ptr().deref().item }
     }
 }
 
