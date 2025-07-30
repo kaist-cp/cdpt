@@ -145,16 +145,16 @@ impl Guard {
         unsafe { self.local.as_ref() }
             .global()
             .epoch
-            .load(Ordering::Acquire)
+            .load(Ordering::Relaxed)
             .phase()
     }
 
     pub(crate) fn alloc<T: 'static + TraceObj>(&self, obj: ManObj<T>) -> *mut ManObj<T> {
-        unsafe { self.local.as_ref() }.alloc(obj)
+        unsafe { self.local.as_ref().alloc(obj) }
     }
 
     pub(crate) fn schedule_mark<T: 'static + TraceObj>(&self, obj: &ManObj<T>) {
-        unsafe { self.local.as_ref() }.schedule_mark(obj);
+        unsafe { self.local.as_ref().schedule_mark(obj) };
     }
 }
 
