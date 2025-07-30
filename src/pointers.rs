@@ -692,7 +692,7 @@ impl<'g, G: Protector, T: 'static + Send + Sync + TraceObj> Local<'g, G, T> {
 
     pub(crate) fn from_raw(ptr: ManPtr<T>, prot: &G) -> Self {
         Self {
-            ptr: ptr.without_meta().as_ptr().cast(),
+            ptr: ptr.without_meta().data.cast(),
             sh: prot.protect(ptr),
             _marker: PhantomData,
         }
