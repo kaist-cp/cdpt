@@ -33,7 +33,7 @@ impl ObjMeta {
     const ROOT_COUNT_BITS: usize = ((1 << (usize::BITS - 1)) - 1);
 
     pub fn new(marked: Color, root_count: usize) -> Self {
-        debug_assert!(root_count < (1 << (usize::BITS - 1)));
+        debug_assert!(root_count <= Self::ROOT_COUNT_BITS);
         let bits = ((marked as usize) << (usize::BITS - 1)) | root_count;
         Self(bits)
     }
@@ -102,8 +102,9 @@ impl From<ObjMeta> for AtomicObjMeta {
     }
 }
 
+#[repr(C)] // HACK: `header` must be the first field
 pub(crate) struct ManObj<T: TraceObj> {
-    header: AtomicObjMeta,
+    pub(crate) header: AtomicObjMeta,
     item: T,
 }
 
@@ -180,7 +181,7 @@ impl<T: TraceObj> From<*mut ()> for ManPtr<T> {
 impl<T: 'static + TraceObj> ManPtr<T> {
     const META_WIDTH: u32 = 2;
     const META_BITS: usize = ((1 << Self::META_WIDTH) - 1) << (usize::BITS - Self::META_WIDTH);
-    const LOW_BITS: usize = (1 << align_of::<T>().trailing_zeros()) - 1;
+    const LOW_BITS: usize = (1 << align_of::<ManObj<T>>().trailing_zeros()) - 1;
     const ADDR_BITS: usize = usize::MAX & !Self::META_BITS & !Self::LOW_BITS;
 
     pub(crate) fn alloc_rooted(item: T, color: Color, root_count: usize, guard: &Guard) -> Self {
@@ -272,20 +273,26 @@ impl<T: 'static + TraceObj> ManPtr<T> {
         unsafe { &*self.as_ptr() }
     }
 
+    pub(crate) unsafe fn deref_mut<'l>(self) -> &'l mut ManObj<T> {
+        unsafe { &mut *self.as_ptr() }
+    }
+
     pub(crate) unsafe fn as_ref<'l>(self) -> Option<&'l ManObj<T>> {
         unsafe { self.as_ptr().as_ref() }
     }
 
-    pub(crate) fn mark_pointee(self, guard: &Guard) {
+    /// Returns `true` if it scheduled a task.
+    pub(crate) fn shade_pointee(self, guard: &Guard) -> bool {
         let Some(mobj) = (unsafe { self.as_ref() }) else {
             // The pointer is null.
-            return;
+            return false;
         };
         if mobj.header.load(Ordering::Acquire).marked() == guard.black_color() {
             // It is already marked and traced.
-            return;
+            return false;
         }
         guard.schedule_mark(mobj);
+        return true;
     }
 }
 
@@ -305,6 +312,35 @@ pub unsafe trait TraceObj {
     fn shade_outgoings(&self, guard: &Guard);
 }
 
+/// An internal trait for marking and tracing the object.
+pub(crate) trait MarkObj: TraceObj {
+    fn mark(&self, guard: &Guard);
+    fn color(&self) -> Color;
+    fn root_count(&self) -> usize;
+    fn address(&self) -> *mut ();
+}
+
+impl<T: TraceObj> MarkObj for ManObj<T> {
+    fn mark(&self, guard: &Guard) {
+        self.shade_outgoings(guard);
+        self.header.mark(guard);
+    }
+
+    fn color(&self) -> Color {
+        self.header.load(Ordering::Relaxed).marked()
+    }
+
+    fn root_count(&self) -> usize {
+        self.header.load(Ordering::Relaxed).root_count()
+    }
+
+    fn address(&self) -> *mut () {
+        // HACK: `header` is always the first field of `ManObj`, so its address must be
+        // equal to the address of the `ManObj`.
+        ((&self.header) as *const _ as *const ()).cast_mut()
+    }
+}
+
 /// A root-count-protected atomic reference to the managed object.
 /// It can be sent and atomic with other threads. Before dereferencing,
 /// you must create a `Local` reference to the same object by calling `load`.
@@ -318,6 +354,16 @@ pub struct AtomicShared<T: 'static + Send + Sync + TraceObj> {
 
 unsafe impl<T: Send + Sync + TraceObj> Sync for AtomicShared<T> {}
 unsafe impl<T: Send + Sync + TraceObj> Send for AtomicShared<T> {}
+
+impl<'g, G, T> From<Local<'g, G, T>> for AtomicShared<T>
+where
+    G: Protector,
+    T: 'static + Send + Sync + TraceObj,
+{
+    fn from(value: Local<'g, G, T>) -> Self {
+        value.as_atomic_shared()
+    }
+}
 
 impl<T: 'static + Send + Sync + TraceObj> AtomicShared<T> {
     pub fn new<'g>(item: T, guard: &'g Guard) -> Self {
@@ -406,7 +452,7 @@ impl<T: 'static + Send + Sync + TraceObj> AtomicShared<T> {
     {
         let mut old = ManPtr::<T>::from(self.link.load(Ordering::Relaxed));
 
-        if old.without_meta() != current.as_man_ptr().without_meta() {
+        if old.without_meta() != current.as_man_ptr() {
             // Trivial failure case of CAS.
             return Err(Local::from_raw(old, guard));
         }
@@ -462,7 +508,7 @@ impl<T: 'static + Send + Sync + TraceObj> AtomicShared<T> {
                     && guard.global_phase() != Phase::N
                 {
                     // Root-count deletion barrier.
-                    old.mark_pointee(guard);
+                    old.shade_pointee(guard);
                 }
                 Ok(old)
             }
@@ -472,35 +518,49 @@ impl<T: 'static + Send + Sync + TraceObj> AtomicShared<T> {
 
     fn internal_cmpxchg_unrooted(
         &self,
-        old: ManPtr<T>,
+        mut old: ManPtr<T>,
         new: ManPtr<T>,
         success: Ordering,
         failure: Ordering,
         guard: &Guard,
     ) -> Result<ManPtr<T>, ManPtr<T>> {
-        let PtrMeta::Unrooted(old_color) = old.meta() else {
-            unreachable!("An unrooted pointer is never re-rooted.");
-        };
-        if old_color == guard.black_color() && guard.phase() != Phase::N {
-            // Dijkstra-style insertion barrier.
-            new.mark_pointee(guard);
-        }
-        let new = new.with_meta(PtrMeta::Unrooted(old_color));
+        loop {
+            let PtrMeta::Unrooted(old_color) = old.meta() else {
+                unreachable!("An unrooted pointer is never re-rooted.");
+            };
+            if old_color == guard.black_color() {
+                // Dijkstra-style insertion barrier.
+                new.shade_pointee(guard);
+            }
+            let new = new.with_meta(PtrMeta::Unrooted(old_color));
 
-        let result = self
-            .link
-            .compare_exchange(old.data, new.data, success, failure)
-            .map(|current| ManPtr::from(current))
-            .map_err(|current| ManPtr::from(current));
+            let result = self
+                .link
+                .compare_exchange(old.data, new.data, success, failure)
+                .map(|current| ManPtr::from(current))
+                .map_err(|current| ManPtr::from(current));
 
-        if result.is_ok() && old_color == guard.white_color() && guard.global_phase() != Phase::N {
-            // Yuasa-style deletion barrier.
-            old.mark_pointee(guard);
+            match result {
+                Ok(_) => {
+                    if old_color == guard.white_color() && guard.global_phase() != Phase::N {
+                        // Yuasa-style deletion barrier.
+                        old.shade_pointee(guard);
+                    }
+                }
+                Err(current) => {
+                    if current.without_meta() == old.without_meta() {
+                        // if the only metadata (i.e., color) is changed, let's retry.
+                        old = current;
+                        continue;
+                    }
+                }
+            }
+
+            return result;
         }
-        result
     }
 
-    pub fn fetch_or_tag<'g>(
+    pub fn fetch_tag_or<'g>(
         &self,
         tag: usize,
         order: Ordering,
@@ -533,7 +593,7 @@ impl<T: 'static + Send + Sync + TraceObj> Drop for AtomicShared<T> {
             && guard.global_phase() != Phase::N
         {
             // Root-count deletion barrier.
-            ptr.mark_pointee(&guard);
+            ptr.shade_pointee(&guard);
         }
     }
 }
@@ -560,7 +620,7 @@ impl<T: Send + Sync + TraceObj> TracePtr for AtomicShared<T> {
                 // Already shaded by others. Let's skip.
                 break;
             }
-            ptr.mark_pointee(guard);
+            ptr.shade_pointee(guard);
             let black = ptr.with_meta(PtrMeta::Unrooted(guard.black_color()));
             match self.link.compare_exchange(
                 ptr.data,
@@ -625,6 +685,10 @@ impl<T: Send + Sync + TraceObj> Shared<T> {
     /// Returns `true` if the two `Shared`s point to the same allocation with the same tag.
     pub fn ptr_eq(this: &Self, other: &Self) -> bool {
         this.as_man_ptr().without_meta() == other.as_man_ptr().without_meta()
+    }
+
+    pub fn is_null(&self) -> bool {
+        self.as_man_ptr().is_null()
     }
 }
 
@@ -745,7 +809,16 @@ impl<'g, G: Protector, T: 'static + Send + Sync + TraceObj> Local<'g, G, T> {
     pub fn ptr_eq<'h, H: Protector>(this: &Self, other: &Local<'h, H, T>) -> bool {
         this.ptr == other.ptr
     }
+
+    pub fn is_null(&self) -> bool {
+        self.as_man_ptr().is_null()
+    }
 }
+
+// Difference between deref functions of Local<'g, Guard, T> and Local<'g, Handle, T>:
+// The lifetime of the returned reference is different.
+// * `Local<'g, Guard, T>`: The pointer is protected by the phase consensus (i.e., 'g).
+// * `Local<'g, Handle, T>`: The pointer if protected by the inner hazard pointer (i.e., self).
 
 impl<'g, T: 'static + Send + Sync + TraceObj> Local<'g, Guard, T> {
     pub fn as_ref(&self) -> Option<&'g T> {
@@ -754,6 +827,10 @@ impl<'g, T: 'static + Send + Sync + TraceObj> Local<'g, Guard, T> {
 
     pub unsafe fn deref(&self) -> &'g T {
         unsafe { &self.as_man_ptr().deref().item }
+    }
+
+    pub unsafe fn deref_mut(&mut self) -> &'g mut T {
+        unsafe { &mut self.as_man_ptr().deref_mut().item }
     }
 }
 

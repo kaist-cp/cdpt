@@ -1,16 +1,17 @@
 use std::sync::OnceLock;
 
-use crate::guards::{Collector, Guard, Handle};
+use crate::guards::{Guard, Handle};
+use crate::internal::{Global, Local};
 
-fn collector() -> &'static Collector {
+pub fn global() -> &'static Global {
     /// The global data for the default garbage collector.
-    static COLLECTOR: OnceLock<Collector> = OnceLock::new();
-    COLLECTOR.get_or_init(Collector::new)
+    static GLOBAL: OnceLock<Global> = OnceLock::new();
+    GLOBAL.get_or_init(Global::new)
 }
 
 thread_local! {
     /// The per-thread participant for the default garbage collector.
-    static HANDLE: Handle = collector().register();
+    static HANDLE: Handle = Local::register();
 }
 
 /// Acquire a local handle for the garbage collector.

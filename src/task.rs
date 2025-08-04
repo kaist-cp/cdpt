@@ -1,6 +1,7 @@
 use core::marker::PhantomData;
 use core::mem::{self, MaybeUninit};
 use core::ptr;
+use std::mem::forget;
 
 /// Number of words a piece of `Data` can hold.
 const DATA_WORDS: usize = 1;
@@ -16,6 +17,8 @@ pub(crate) struct Task {
     data: MaybeUninit<Data>,
     _marker: PhantomData<*mut ()>, // !Send + !Sync
 }
+
+unsafe impl Send for Task {}
 
 impl Task {
     /// Constructs a new `Task` from a `FnOnce()`.
@@ -49,6 +52,13 @@ impl Task {
     pub(crate) fn call(mut self) {
         let call = self.call;
         unsafe { call(self.data.as_mut_ptr().cast::<u8>()) };
+        forget(self);
+    }
+}
+
+impl Drop for Task {
+    fn drop(&mut self) {
+        panic!("`Task` is dropped without being executed");
     }
 }
 

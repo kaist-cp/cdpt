@@ -145,6 +145,7 @@ impl Entry {
     /// The entry should be a member of a linked list, and it should not have been deleted.
     /// It should be safe to call `C::finalize` on the entry after the `guard` is dropped, where `C`
     /// is the associated helper for the linked list.
+    #[allow(unused)]
     pub(crate) unsafe fn delete(&self, guard: &Guard) {
         self.next.fetch_or(1, Release, guard);
     }

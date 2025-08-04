@@ -1,43 +1,51 @@
-use crate::epoch::{AtomicEpoch, Epoch, Phase};
-use crate::guards::{Collector, Guard, Handle};
-use crate::pin;
-use crate::pointers::{ManObj, ManPtr, TraceObj};
-use crate::sync::{Entry, IsElement, List, fence};
+use crate::collector::collector_loop;
+use crate::epoch::{AtomicEpoch, Color, Epoch, Phase};
+use crate::guards::{Guard, Handle};
+use crate::pointers::{ManObj, ManPtr, MarkObj, TraceObj};
+use crate::sync::{Entry, IsElement, List, Pile, fence};
 use crate::task::Task;
+use crate::{global, pin};
 use arrayvec::ArrayVec;
 use crossbeam::deque::{Injector, Stealer, Worker};
 use crossbeam::epoch::{Guard as EbrGuard, Owned, Shared as EbrShared, unprotected};
 use crossbeam::utils::CachePadded;
 use fastrand::Rng;
 use std::cell::{Cell, UnsafeCell};
-use std::mem::ManuallyDrop;
+use std::mem::{ManuallyDrop, forget};
 use std::ptr::{self, NonNull};
-use std::sync::atomic::{AtomicPtr, Ordering};
+use std::sync::atomic::{self, AtomicBool, AtomicPtr, AtomicUsize, Ordering};
+use std::thread::spawn;
 
 const OBJ_BATCHES_SHARD: usize = 8;
-const OBJ_BATCH_SIZE: usize = 64;
+pub(crate) const OBJ_BATCH_SIZE: usize = 64;
 /// TODO: Make it resizable. We might need a dedicated SMR (e.g., EBR, HP).
 const HAZARDS_COUNT: usize = 8;
 
 /// The global data for a garbage collector.
-pub(crate) struct Global {
+pub struct Global {
     /// The intrusive linked list of `Local`s.
-    locals: CachePadded<List<Local>>,
+    pub(crate) locals: CachePadded<List<Local>>,
 
     /// The global epoch.
     pub(crate) epoch: CachePadded<AtomicEpoch>,
 
     /// The global sharded object lists.
-    objs: [CachePadded<List<ObjBatch>>; OBJ_BATCHES_SHARD],
+    pub(crate) objs: [CachePadded<Pile<ObjBatch>>; OBJ_BATCHES_SHARD],
 
     /// The global marking tasks.
-    mark_tasks: Injector<Task>,
+    pub(crate) mark_tasks: Injector<Task>,
+
+    /// The global flag indicating whether the collector is online.
+    collector_init: CachePadded<AtomicBool>,
 }
 
+unsafe impl Sync for Global {}
+unsafe impl Send for Global {}
+
 #[repr(C)] // Note: `entry` must be the first field
-struct ObjBatch {
+pub(crate) struct ObjBatch {
     entry: Entry,
-    objs: ArrayVec<Box<dyn TraceObj>, OBJ_BATCH_SIZE>,
+    pub(crate) objs: ArrayVec<Box<dyn MarkObj>, OBJ_BATCH_SIZE>,
 }
 
 impl Default for ObjBatch {
@@ -56,8 +64,33 @@ impl Global {
         Self {
             locals: CachePadded::new(List::new()),
             epoch: CachePadded::new(AtomicEpoch::new(Epoch::starting())),
-            objs: [const { CachePadded::new(List::new()) }; OBJ_BATCHES_SHARD],
+            objs: [const { CachePadded::new(Pile::new()) }; OBJ_BATCHES_SHARD],
             mark_tasks: Injector::new(),
+            collector_init: CachePadded::new(AtomicBool::new(false)),
+        }
+    }
+
+    /// Freshly loads the global epoch value. It does not execute any fences.
+    #[inline]
+    pub(crate) fn load_epoch(&self) -> Epoch {
+        self.epoch.load(Ordering::Relaxed)
+    }
+
+    #[inline]
+    fn initialize_if_necessary(&self) {
+        if !self.collector_init.load(Ordering::Relaxed) {
+            self.try_deploy_collector();
+        }
+    }
+
+    #[cold]
+    fn try_deploy_collector(&self) {
+        if self
+            .collector_init
+            .compare_exchange(false, true, Ordering::Relaxed, Ordering::Relaxed)
+            .is_ok()
+        {
+            spawn(collector_loop);
         }
     }
 }
@@ -78,22 +111,22 @@ pub(crate) struct Local {
     last_observed: Cell<Epoch>,
 
     /// A single-writer multiple-reader list of protected pointers.
-    hazards: [AtomicPtr<()>; HAZARDS_COUNT],
+    pub(crate) hazards: [AtomicPtr<()>; HAZARDS_COUNT],
 
     /// The function pointers to mark each HP-protected object.
     hazards_marker: [Cell<Option<unsafe fn(*mut ())>>; HAZARDS_COUNT],
 
     /// A stealer handle for `mark_tasks`.
-    mark_tasks_stealer: Stealer<Task>,
+    pub(crate) mark_tasks_stealer: Stealer<Task>,
 
     /// The local epoch.
-    epoch: CachePadded<AtomicEpoch>,
+    pub(crate) epoch: CachePadded<AtomicEpoch>,
+
+    /// The last timestamp when this thread modified the local mark queue.
+    pub(crate) mt_modified_ts: CachePadded<AtomicUsize>,
 
     // All resources below with `UnsafeCell`s will be destroyed
     // when all guards and handles get dropped.
-    /// A reference to the global data.
-    collector: UnsafeCell<ManuallyDrop<Collector>>,
-
     /// A vector of available hazard indices.
     available_hids: UnsafeCell<ManuallyDrop<Vec<usize>>>,
 
@@ -101,15 +134,22 @@ pub(crate) struct Local {
     rng: UnsafeCell<ManuallyDrop<Rng>>,
 
     /// A local batch of newly allocated objects.
-    objs: UnsafeCell<ManuallyDrop<ObjBatch>>,
+    ///
+    /// It is sharded by the allocation color. That is, the thread push the allocated object
+    /// reference to the index 0 if `guard.alloc_color() == C0`. In this way, the collector
+    /// can take the object list of the previous normal phase without breaking lock-freedom of
+    /// mutators, because the mutator can still modify its black object list during RT & CT phase
+    /// while the collector accesses the white object list, which is from the previous N phase.
+    pub(crate) objs: [UnsafeCell<ManuallyDrop<ObjBatch>>; 2],
 
     /// A local mark queue.
-    mark_tasks: UnsafeCell<ManuallyDrop<Worker<Task>>>,
+    pub(crate) mark_tasks: UnsafeCell<ManuallyDrop<Worker<Task>>>,
 }
 
 impl Local {
     /// Registers a new `Local` in the provided `Global`.
-    pub(crate) fn register(collector: &Collector) -> Handle {
+    pub(crate) fn register() -> Handle {
+        global().initialize_if_necessary();
         unsafe {
             let mark_tasks = Worker::new_fifo();
             let stealer = mark_tasks.stealer();
@@ -123,32 +163,23 @@ impl Local {
                 hazards_marker: [const { Cell::new(None) }; HAZARDS_COUNT],
                 mark_tasks_stealer: stealer,
                 epoch: CachePadded::new(AtomicEpoch::new(Epoch::starting())),
-                collector: UnsafeCell::new(ManuallyDrop::new(collector.clone())),
+                mt_modified_ts: CachePadded::new(AtomicUsize::new(0)),
                 available_hids: UnsafeCell::new(ManuallyDrop::new((0..HAZARDS_COUNT).collect())),
                 rng: UnsafeCell::new(ManuallyDrop::new(Rng::new())),
-                objs: UnsafeCell::new(ManuallyDrop::new(ObjBatch::default())),
+                objs: [
+                    UnsafeCell::new(ManuallyDrop::new(ObjBatch::default())),
+                    UnsafeCell::new(ManuallyDrop::new(ObjBatch::default())),
+                ],
                 mark_tasks: UnsafeCell::new(ManuallyDrop::new(mark_tasks)),
             })
             .into_shared(unprotected());
             // SAFETY: `Local` is being inserted at the head of the list, so we will not
             // dereference any dangerous (e.g., retired) shared memory.
-            collector.global.locals.insert(local, unprotected());
+            global().locals.insert(local, unprotected());
             Handle {
                 local: NonNull::new_unchecked(local.as_raw().cast_mut()),
             }
         }
-    }
-
-    /// Returns a reference to the `Global` in which this `Local` resides.
-    #[inline]
-    pub(crate) fn global(&self) -> &Global {
-        &self.collector().global
-    }
-
-    /// Returns a reference to the `Collector` in which this `Local` resides.
-    #[inline]
-    pub(crate) fn collector(&self) -> &Collector {
-        unsafe { &**self.collector.get() }
     }
 
     /// Returns `true` if the current participant is pinned.
@@ -179,13 +210,13 @@ impl Local {
 
     #[inline]
     fn pin_freshly(&self) {
-        let mut curr_epoch = self.global().epoch.load(Ordering::Acquire);
+        let mut curr_epoch = global().load_epoch();
         loop {
             // Now we must store `new_epoch` into `self.epoch` and execute a light fence.
             self.epoch.store(curr_epoch.pinned(), Ordering::Relaxed);
             fence::light();
 
-            let new_epoch = self.global().epoch.load(Ordering::Acquire);
+            let new_epoch = global().load_epoch();
             if curr_epoch == new_epoch {
                 break;
             }
@@ -196,7 +227,7 @@ impl Local {
             && curr_epoch.phase() == Phase::RT
         {
             // If we are in a root tracing phase and it’s the first time
-            // observing this phase, scan and mark (i.e., push to mark stack)
+            // observing this phase, scan and shade (i.e., push to mark stack)
             // objects that are protected by thread-local HPs.
             self.phase_barrier();
         }
@@ -211,16 +242,6 @@ impl Local {
 
         if guard_count == 1 {
             // This is the last guard. This thread will be unpinned.
-
-            fence::light();
-            let global_epoch = self.global().epoch.load(Ordering::Relaxed);
-            if self.last_observed.get().phase() == Phase::N && global_epoch.phase() == Phase::RT {
-                // If the global epoch is RT while we are in N, the collector must be waiting us
-                // to unpin before starting the tracing work. Let's flush the local object list
-                // to help collectors precisly identify the list of objects from the last N.
-                // Safety: The thread is not yet unpinned.
-                unsafe { self.flush_objs() };
-            }
 
             let handle_count = self.handle_count.get();
             if handle_count == 0 {
@@ -303,13 +324,30 @@ impl Local {
     ///
     /// The thread must be properly pinned.
     #[inline]
+    pub(crate) unsafe fn pinned_alloc_color(&self) -> Color {
+        let temp_guard = Guard {
+            local: NonNull::from_ref(self),
+        };
+        let color = temp_guard.alloc_color();
+        forget(temp_guard);
+        color
+    }
+
+    /// # Safety
+    ///
+    /// The thread must be properly pinned.
+    #[inline]
     pub(crate) unsafe fn alloc<T: 'static + TraceObj>(&self, obj: ManObj<T>) -> *mut ManObj<T> {
         let b = Box::new(obj);
         let ptr = ((&*b) as *const ManObj<T>).cast_mut();
-        let mut b_dyn: Box<dyn TraceObj> = b;
+        let mut b_dyn: Box<dyn MarkObj> = b;
+        let objs_index = unsafe { self.pinned_alloc_color() } as usize;
 
         loop {
-            match unsafe { &mut *self.objs.get() }.objs.try_push(b_dyn) {
+            match unsafe { &mut *self.objs[objs_index].get() }
+                .objs
+                .try_push(b_dyn)
+            {
                 Ok(_) => break,
                 Err(e) => {
                     b_dyn = e.element();
@@ -327,52 +365,105 @@ impl Local {
 
     /// # Safety
     ///
+    /// The caller must have exclusive write permission for the object batch of the given index.
+    ///
+    /// For example,
+    /// 1. A pinned thread has an exclusive write permission for the current `alloc_color` index.
+    /// 2. The collector during RT phase has exclusive write permissions for the current
+    ///    `white_color` index, for every mutator's allocation list.
+    #[inline]
+    pub(crate) unsafe fn take_obj_batch(&self, index: usize) -> Option<ObjBatch> {
+        let batch = unsafe {
+            if (&*self.objs[index].get()).objs.is_empty() {
+                return None;
+            }
+            ManuallyDrop::into_inner(ptr::replace(
+                self.objs[index].get(),
+                ManuallyDrop::default(),
+            ))
+        };
+        Some(batch)
+    }
+
+    /// # Safety
+    ///
     /// The thread must be properly pinned.
     #[inline]
     pub(crate) unsafe fn flush_objs(&self) {
+        let index = unsafe { self.pinned_alloc_color() } as usize;
+        let Some(batch) = (unsafe { self.take_obj_batch(index) }) else {
+            return;
+        };
         unsafe {
-            if (&*self.objs.get()).objs.is_empty() {
-                return;
-            }
-            let batch =
-                ManuallyDrop::into_inner(ptr::replace(self.objs.get(), ManuallyDrop::default()));
-            let guard = unprotected();
-            self.global()
+            global()
                 .objs
                 .get_unchecked(self.select_obj_shard())
-                .insert(Owned::new(batch).into_shared(guard), guard);
+                .push(batch);
         }
     }
 
     /// # Safety
     ///
-    /// The thread must be properly pinned.
+    /// * The thread must be properly pinned.
+    /// * There must not be any interleaving writes.
+    ///   (i.e., this local thread must have a write permission for this `Local` record.)
+    #[inline]
+    unsafe fn record_mt_modification(&self) {
+        let epoch = unsafe { self.pinned_epoch() };
+        // Safety: there will be no interleaving writes.
+        let last_modified = unsafe { *(*self.mt_modified_ts).as_ptr() };
+        if last_modified == epoch.timestamp() {
+            return;
+        }
+        self.mt_modified_ts
+            .store(epoch.timestamp(), Ordering::Relaxed);
+        if unsafe { self.pinned_epoch() }.phase() == Phase::CT {
+            atomic::fence(Ordering::SeqCst); // Sync with the collector in CT phase.
+        }
+    }
+
+    /// # Safety
+    ///
+    /// * The thread must be properly pinned.
+    /// * There must not be any interleaving writes.
+    ///   (i.e., this local thread must have a write permission for this `Local` record.)
     #[inline]
     pub(crate) unsafe fn flush_mark_tasks(&self) {
         unsafe {
+            self.record_mt_modification();
             let tasks = &mut *self.mark_tasks.get();
             while let Some(task) = tasks.pop() {
-                self.global().mark_tasks.push(task);
+                global().mark_tasks.push(task);
             }
         }
     }
 
     /// # Safety
     ///
-    /// The thread must be properly pinned.
+    /// * The thread must be properly pinned.
+    /// * There must not be any interleaving writes.
+    ///   (i.e., this local thread must have a write permission for this `Local` record.)
     #[inline]
     pub(crate) unsafe fn schedule_mark<T: 'static + TraceObj>(&self, obj: &ManObj<T>) {
         let task = Task::new(|| obj.mark(&pin()));
-        unsafe { &mut *self.mark_tasks.get() }.push(task);
+        unsafe {
+            self.record_mt_modification();
+            (&mut *self.mark_tasks.get()).push(task);
+        }
     }
 
     /// # Safety
     ///
-    /// The thread must be properly pinned.
+    /// * The thread must be properly pinned.
+    /// * There must not be any interleaving writes.
+    ///   (i.e., this local thread must have a write permission for this `Local` record.)
     #[inline]
     pub(crate) unsafe fn flush_before_finalization(&self) {
         unsafe {
-            self.flush_objs();
+            // TODO: objs should be safe to dereference by the collector, even after finalization.
+            // for i in 0..self.objs.len() {
+            //     self.flush_objs(i);
+            // }
             self.flush_mark_tasks();
         }
     }
@@ -383,32 +474,31 @@ impl Local {
         debug_assert_eq!(self.guard_count.get(), 0);
         debug_assert_eq!(self.handle_count.get(), 0);
         debug_assert!(unsafe { (&*self.mark_tasks.get()).is_empty() });
-        debug_assert!(unsafe { (&*self.objs.get()).objs.is_empty() });
+        // TODO: objs should be safe to dereference by the collector, even after finalization.
+        // debug_assert!(unsafe { (0..self.objs.len()).all(|i| (&*self.objs[i].get()).objs.is_empty()) });
 
         unsafe {
-            // Take the reference to the `Global` out of this `Local`. Since we're not protected
-            // by a guard at this time, it's crucial that the reference is read before marking the
-            // `Local` as deleted.
-            let collector: Collector = ptr::read(&*(*self.collector.get()));
-
             // The rest of `UnsafeCell`s are good to be dropped.
             ManuallyDrop::drop(&mut *self.available_hids.get());
             ManuallyDrop::drop(&mut *self.rng.get());
-            ManuallyDrop::drop(&mut *self.objs.get());
             ManuallyDrop::drop(&mut *self.mark_tasks.get());
+            // TODO: objs should be safe to dereference by the collector, even after finalization.
+            // for i in 0..self.objs.len() {
+            //     ManuallyDrop::drop(&mut *self.objs[i].get());
+            // }
 
+            // TODO: use grow-only, recyclable registration list.
             // Mark this node in the linked list as deleted.
-            self.entry.delete(unprotected());
-
-            // Finally, drop the reference to the global.
-            drop(collector);
+            // self.entry.delete(unprotected());
         }
     }
 
+    /// # Safety
+    ///
+    /// There must not be any interleaving writes.
+    /// (i.e., this local thread must have a write permission for this `Local` record.)
     #[inline]
-    pub(crate) fn pinned_epoch(&self) -> Epoch {
-        // Safety: there cannot be any interleaving writes because this local thread has
-        // an exclusive write permission for this `Local` record.
+    pub(crate) unsafe fn pinned_epoch(&self) -> Epoch {
         unsafe { self.epoch.load_non_atomic() }
     }
 }
@@ -430,9 +520,7 @@ impl HazardPointer {
     pub(crate) fn protect<T: 'static + TraceObj>(&self, addr: ManPtr<T>) {
         unsafe fn mark<T: 'static + TraceObj>(ptr: *mut ()) {
             let ptr = ManPtr::<T>::from(ptr);
-            unsafe {
-                ptr.deref().mark(&pin());
-            }
+            unsafe { ptr.deref().mark(&pin()) };
         }
 
         unsafe {

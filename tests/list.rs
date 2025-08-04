@@ -235,7 +235,7 @@ where
             }
 
             let curr_node = unsafe { cursor.curr.deref() };
-            let next = curr_node.next.fetch_or_tag(1, Ordering::AcqRel, &guard);
+            let next = curr_node.next.fetch_tag_or(1, Ordering::AcqRel, &guard);
             if next.tag() == 1 {
                 continue;
             }

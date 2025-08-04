@@ -16,7 +16,7 @@ pub(crate) struct Epoch {
     data: usize,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum Phase {
     /// Normal phase.
     N = 0b00,
@@ -45,7 +45,7 @@ pub(crate) enum Color {
 
 impl From<usize> for Color {
     fn from(value: usize) -> Self {
-        if value > 0 { Self::C0 } else { Self::C1 }
+        if value == 0 { Self::C0 } else { Self::C1 }
     }
 }
 
@@ -91,6 +91,7 @@ impl Epoch {
 
     /// Returns the same epoch, but marked as unpinned.
     #[inline]
+    #[allow(unused)]
     pub(crate) fn unpinned(self) -> Self {
         Self {
             data: self.data & !Self::PINNED_BIT,
@@ -179,6 +180,7 @@ impl AtomicEpoch {
     /// `Relaxed`. The failure ordering can only be `SeqCst`, `Acquire` or `Relaxed`
     /// and must be equivalent to or weaker than the success ordering.
     #[inline]
+    #[allow(unused)]
     pub(crate) fn compare_exchange(
         &self,
         current: Epoch,
