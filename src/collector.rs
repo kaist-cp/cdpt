@@ -15,24 +15,27 @@ use crate::{
     tls::handle,
 };
 
+use log::Logger;
+
 /// A function body for the primary collector thread.
 pub(crate) fn collector_loop() {
     let handle = handle();
+    let logger = Logger::new();
 
     loop {
         while !is_collection_necessary() {
             sleep(Duration::from_millis(1));
         }
-        let objs = root_tracing(&handle);
-        while !completion_tracing(&handle) {}
-        next_normal(objs, &handle);
+        let objs = logger.measure("RT", || root_tracing(&handle, &logger));
+        while logger.measure("CT", || !completion_tracing(&handle, &logger)) {}
+        logger.measure("N", || next_normal(objs, &handle, &logger));
     }
 }
 
 #[must_use]
-fn root_tracing(handle: &Handle) -> Vec<ObjBatch> {
+fn root_tracing(handle: &Handle, logger: &Logger) -> Vec<Box<ObjBatch>> {
     debug_assert!(global().load_epoch().phase() == Phase::N);
-    phase_trans(Phase::RT);
+    logger.measure("transition", || phase_trans(Phase::RT));
 
     // Before scanning:
     // * All mutators are unpinned from the normal phase.
@@ -43,7 +46,7 @@ fn root_tracing(handle: &Handle) -> Vec<ObjBatch> {
 
         // It would be good to create an iterator for allocated objects as soon as
         // the completion of phase transition, to scan less objects.
-        let obj_taken =
+        let obj_taken = logger.measure("take objects", || {
             global()
                 .objs
                 .iter()
@@ -51,21 +54,26 @@ fn root_tracing(handle: &Handle) -> Vec<ObjBatch> {
                 .chain(iter_locals(&ebr_pin()).flat_map(|local| unsafe {
                     local.take_obj_batch(guard.white_color() as usize)
                 }))
-                .collect::<Vec<_>>();
+                .collect::<Vec<_>>()
+        });
 
         // Scan HPs first. And they will be marked during the RC scan.
-        let hazards = iter_locals(&ebr_pin())
-            .flat_map(|local| local.hazards.iter().map(|hp| hp.load(Ordering::Relaxed)))
-            .collect::<FxHashSet<_>>();
+        let hazards = logger.measure("scan HP", || {
+            iter_locals(&ebr_pin())
+                .flat_map(|local| local.hazards.iter().map(|hp| hp.load(Ordering::Relaxed)))
+                .collect::<FxHashSet<_>>()
+        });
 
         // TODO: parallelize if it helps (profiling should be necessary).
-        for batch in &obj_taken {
-            for obj in &batch.objs {
-                if obj.root_count() > 0 || hazards.contains(&obj.address()) {
-                    obj.mark(&guard);
+        logger.measure("mark", || {
+            for batch in &obj_taken {
+                for obj in &batch.objs {
+                    if obj.root_count() > 0 || hazards.contains(&obj.address()) {
+                        obj.mark(&guard);
+                    }
                 }
             }
-        }
+        });
         obj_taken
     };
     // After scanning:
@@ -79,21 +87,21 @@ fn root_tracing(handle: &Handle) -> Vec<ObjBatch> {
     // * For RCs, deletion barriers by mutators and scanning by the
     //   collectors guarantee that no live objects are missed.
 
-    drain_mark_tasks(handle);
+    logger.measure("drain", || drain_mark_tasks(handle));
     obj_batches
 }
 
-fn completion_tracing(handle: &Handle) -> bool {
+fn completion_tracing(handle: &Handle, logger: &Logger) -> bool {
     debug_assert!({
         let curr = global().epoch.load(Ordering::Acquire).phase();
         curr == Phase::RT || curr == Phase::CT
     });
-    phase_trans(Phase::CT);
+    logger.measure("transition", || phase_trans(Phase::CT));
 
-    if try_confirm_completion() {
+    if logger.measure("confirm", try_confirm_completion) {
         return true;
     }
-    drain_mark_tasks(handle);
+    logger.measure("drain", || drain_mark_tasks(handle));
     return false;
 }
 
@@ -165,7 +173,7 @@ fn phase_trans(new: Phase) {
     wait_all_mutators_unpin(new_epoch.timestamp());
 }
 
-fn next_normal(obj_batches: Vec<ObjBatch>, handle: &Handle) {
+fn next_normal(obj_batches: Vec<Box<ObjBatch>>, handle: &Handle, logger: &Logger) {
     let prev_epoch = global().load_epoch();
     debug_assert!(prev_epoch.phase() == Phase::CT);
     debug_assert!(find_task(handle).is_none());
@@ -178,13 +186,13 @@ fn next_normal(obj_batches: Vec<ObjBatch>, handle: &Handle) {
     fence::heavy();
 
     // Reclaim unmarked objects from the previous cycle.
-    sweep(obj_batches, prev_epoch.color(), &handle);
+    logger.measure("sweep", || sweep(obj_batches, prev_epoch.color(), &handle));
     // For the case of very fast execution of `sweep`, we need to check and wait
     // the unpinning of all mutators.
-    wait_all_mutators_unpin(new_epoch.timestamp());
+    logger.measure("unpin", || wait_all_mutators_unpin(new_epoch.timestamp()));
 }
 
-fn sweep(obj_batches: Vec<ObjBatch>, prev_white: Color, handle: &Handle) {
+fn sweep(obj_batches: Vec<Box<ObjBatch>>, prev_white: Color, handle: &Handle) {
     let survived = obj_batches
         .into_iter()
         .flat_map(|batch| batch.objs.into_iter())
@@ -198,11 +206,11 @@ fn sweep(obj_batches: Vec<ObjBatch>, prev_white: Color, handle: &Handle) {
         .collect::<Vec<_>>();
 
     let batch_count = survived.len().div_ceil(OBJ_BATCH_SIZE);
-    let mut batches = Vec::with_capacity(batch_count);
-    batches.push(ObjBatch::default());
+    let mut batches: Vec<Box<ObjBatch>> = Vec::with_capacity(batch_count);
+    batches.push(Box::default());
     for obj in survived {
         if let Err(e) = batches.last_mut().unwrap().objs.try_push(obj) {
-            batches.push(ObjBatch::default());
+            batches.push(Box::default());
             batches.last_mut().unwrap().objs.push(e.element());
         }
     }
@@ -231,4 +239,69 @@ fn is_collection_necessary() -> bool {
 
 fn iter_locals(guard: &EbrGuard) -> impl Iterator<Item = &'_ Local> {
     global().locals.iter(guard).map(|r| r.unwrap())
+}
+
+#[cfg(feature = "logging")]
+mod log {
+    use std::cell::Cell;
+    use std::time::Instant;
+
+    pub struct Logger {
+        birth: Instant,
+        depth: Cell<usize>,
+        at_new_line: Cell<bool>,
+    }
+
+    impl Logger {
+        pub fn new() -> Self {
+            Self {
+                birth: Instant::now(),
+                depth: Cell::new(0),
+                at_new_line: Cell::new(true),
+            }
+        }
+
+        fn log(&self, text: &str) {
+            eprint!("[{:05}ms] {text}", self.birth.elapsed().as_millis());
+        }
+
+        pub fn measure<R>(&self, name: &str, f: impl FnOnce() -> R) -> R {
+            let depth = self.depth.get();
+            self.depth.set(depth + 1);
+            if !self.at_new_line.get() {
+                eprintln!();
+            }
+            self.log(&format!("{}{}", "  ".repeat(depth), name));
+            self.at_new_line.set(false);
+
+            let start = Instant::now();
+            let result = f();
+            let end = Instant::now();
+
+            let time_str = format!("- {}ms", (end - start).as_millis());
+            if self.at_new_line.get() {
+                self.log(&(time_str + "\n"));
+            } else {
+                eprintln!("{time_str}");
+            }
+            self.at_new_line.set(true);
+            self.depth.set(depth);
+            result
+        }
+    }
+}
+
+#[cfg(not(feature = "logging"))]
+mod log {
+    pub struct Logger;
+
+    impl Logger {
+        pub fn new() -> Self {
+            Logger
+        }
+
+        pub fn measure<R>(&self, _: &str, f: impl FnOnce() -> R) -> R {
+            f()
+        }
+    }
 }
