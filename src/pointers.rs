@@ -491,6 +491,7 @@ impl<T: 'static + Send + Sync + TraceObj> AtomicShared<T> {
         failure: Ordering,
         guard: &Guard,
     ) -> Result<ManPtr<T>, (ManPtr<T>, Shared<T>)> {
+        // TODO: if the only change is the tag, we may optimize it further.
         match self
             .link
             .compare_exchange(old.data, new_rooted.as_man_ptr().data, success, failure)
@@ -528,7 +529,7 @@ impl<T: 'static + Send + Sync + TraceObj> AtomicShared<T> {
             let PtrMeta::Unrooted(old_color) = old.meta() else {
                 unreachable!("An unrooted pointer is never re-rooted.");
             };
-            if old_color == guard.black_color() {
+            if old.as_ptr() != new.as_ptr() && old_color == guard.black_color() {
                 // Dijkstra-style insertion barrier.
                 new.shade_pointee(guard);
             }
@@ -542,7 +543,10 @@ impl<T: 'static + Send + Sync + TraceObj> AtomicShared<T> {
 
             match result {
                 Ok(_) => {
-                    if old_color == guard.white_color() && guard.global_phase() != Phase::N {
+                    if old.as_ptr() != new.as_ptr()
+                        && old_color == guard.white_color()
+                        && guard.global_phase() != Phase::N
+                    {
                         // Yuasa-style deletion barrier.
                         old.shade_pointee(guard);
                     }
