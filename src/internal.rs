@@ -30,7 +30,7 @@ pub struct Global {
     pub(crate) epoch: CachePadded<AtomicEpoch>,
 
     /// The global sharded object lists.
-    pub(crate) objs: [CachePadded<Pile<ObjBatch>>; OBJ_BATCHES_SHARD],
+    pub(crate) objs: [CachePadded<Pile<Box<ObjBatch>>>; OBJ_BATCHES_SHARD],
 
     /// The global marking tasks.
     pub(crate) mark_tasks: Injector<Task>,
@@ -44,14 +44,12 @@ unsafe impl Send for Global {}
 
 #[repr(C)] // Note: `entry` must be the first field
 pub(crate) struct ObjBatch {
-    entry: Entry,
     pub(crate) objs: ArrayVec<Box<dyn MarkObj>, OBJ_BATCH_SIZE>,
 }
 
 impl Default for ObjBatch {
     fn default() -> Self {
         Self {
-            entry: Entry::default(),
             objs: ArrayVec::default(),
         }
     }
@@ -140,7 +138,7 @@ pub(crate) struct Local {
     /// can take the object list of the previous normal phase without breaking lock-freedom of
     /// mutators, because the mutator can still modify its black object list during RT & CT phase
     /// while the collector accesses the white object list, which is from the previous N phase.
-    pub(crate) objs: [UnsafeCell<ManuallyDrop<ObjBatch>>; 2],
+    pub(crate) objs: [UnsafeCell<ManuallyDrop<Box<ObjBatch>>>; 2],
 
     /// A local mark queue.
     pub(crate) mark_tasks: UnsafeCell<ManuallyDrop<Worker<Task>>>,
@@ -166,10 +164,7 @@ impl Local {
                 mt_modified_ts: CachePadded::new(AtomicUsize::new(0)),
                 available_hids: UnsafeCell::new(ManuallyDrop::new((0..HAZARDS_COUNT).collect())),
                 rng: UnsafeCell::new(ManuallyDrop::new(Rng::new())),
-                objs: [
-                    UnsafeCell::new(ManuallyDrop::new(ObjBatch::default())),
-                    UnsafeCell::new(ManuallyDrop::new(ObjBatch::default())),
-                ],
+                objs: [UnsafeCell::default(), UnsafeCell::default()],
                 mark_tasks: UnsafeCell::new(ManuallyDrop::new(mark_tasks)),
             })
             .into_shared(unprotected());
@@ -372,7 +367,7 @@ impl Local {
     /// 2. The collector during RT phase has exclusive write permissions for the current
     ///    `white_color` index, for every mutator's allocation list.
     #[inline]
-    pub(crate) unsafe fn take_obj_batch(&self, index: usize) -> Option<ObjBatch> {
+    pub(crate) unsafe fn take_obj_batch(&self, index: usize) -> Option<Box<ObjBatch>> {
         let batch = unsafe {
             if (&*self.objs[index].get()).objs.is_empty() {
                 return None;
