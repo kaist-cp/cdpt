@@ -5,7 +5,6 @@ use crate::pointers::{ManObj, ManPtr, MarkObj, TraceObj};
 use crate::sync::{Entry, IsElement, List, Pile, fence};
 use crate::task::Task;
 use crate::{global, pin};
-use arrayvec::ArrayVec;
 use crossbeam::deque::{Injector, Stealer, Worker};
 use crossbeam::epoch::{Guard as EbrGuard, Owned, Shared as EbrShared, unprotected};
 use crossbeam::utils::CachePadded;
@@ -42,16 +41,17 @@ pub struct Global {
 unsafe impl Sync for Global {}
 unsafe impl Send for Global {}
 
-#[repr(C)] // Note: `entry` must be the first field
-pub(crate) struct ObjBatch {
-    pub(crate) objs: ArrayVec<Box<dyn MarkObj>, OBJ_BATCH_SIZE>,
-}
+pub(crate) struct ObjBatch(pub Vec<Box<dyn MarkObj>>);
 
 impl Default for ObjBatch {
     fn default() -> Self {
-        Self {
-            objs: ArrayVec::default(),
-        }
+        Self::with_capacity(OBJ_BATCH_SIZE)
+    }
+}
+
+impl ObjBatch {
+    pub fn with_capacity(capacity: usize) -> Self {
+        Self(Vec::with_capacity(capacity))
     }
 }
 
@@ -340,12 +340,12 @@ impl Local {
 
         loop {
             match unsafe { &mut *self.objs[objs_index].get() }
-                .objs
-                .try_push(b_dyn)
+                .0
+                .push_within_capacity(b_dyn)
             {
                 Ok(_) => break,
                 Err(e) => {
-                    b_dyn = e.element();
+                    b_dyn = e;
                     unsafe { self.flush_objs() };
                 }
             }
@@ -369,7 +369,7 @@ impl Local {
     #[inline]
     pub(crate) unsafe fn take_obj_batch(&self, index: usize) -> Option<Box<ObjBatch>> {
         let batch = unsafe {
-            if (&*self.objs[index].get()).objs.is_empty() {
+            if (&*self.objs[index].get()).0.is_empty() {
                 return None;
             }
             ManuallyDrop::into_inner(ptr::replace(
@@ -495,6 +495,23 @@ impl Local {
     #[inline]
     pub(crate) unsafe fn pinned_epoch(&self) -> Epoch {
         unsafe { self.epoch.load_non_atomic() }
+    }
+
+    /// # Safety
+    ///
+    /// * The thread must be properly pinned.
+    /// * There must not be any interleaving writes.
+    ///   (i.e., this local thread must have a write permission for this `Local` record.)
+    #[inline]
+    pub(crate) fn try_pop_mark_task(&self) -> Option<Task> {
+        unsafe {
+            let tasks = &mut *self.mark_tasks.get();
+            if let Some(task) = tasks.pop() {
+                self.record_mt_modification();
+                return Some(task);
+            }
+        }
+        None
     }
 }
 

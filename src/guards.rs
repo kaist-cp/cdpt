@@ -6,9 +6,12 @@ use crate::{
     internal::Local,
     pointers::ManObj,
     sync::fence,
+    task::Task,
     tls::global,
 };
 use std::ptr::NonNull;
+
+const HELP_MARK_THRESHOLD: usize = 32;
 
 /// A handle to a garbage collector.
 pub struct Handle {
@@ -31,6 +34,23 @@ impl Handle {
     #[inline]
     pub fn is_pinned(&self) -> bool {
         self.local().is_pinned()
+    }
+
+    /// Helps the ongoing collection works if it seems necessary.
+    #[inline]
+    pub fn help_collect(&self) {
+        let mt_len = unsafe { &*self.local.as_ref().mark_tasks.get() }.len();
+        if mt_len < HELP_MARK_THRESHOLD {
+            return;
+        }
+        let guard = self.pin();
+        for _ in 0..(mt_len / 2) {
+            if let Some(task) = guard.try_pop_mark_task() {
+                task.call();
+                continue;
+            }
+            break;
+        }
     }
 }
 
@@ -94,6 +114,10 @@ impl Guard {
 
     pub(crate) fn schedule_mark<T: 'static + TraceObj>(&self, obj: &ManObj<T>) {
         unsafe { self.local.as_ref().schedule_mark(obj) };
+    }
+
+    pub(crate) fn try_pop_mark_task(&self) -> Option<Task> {
+        unsafe { self.local.as_ref().try_pop_mark_task() }
     }
 }
 

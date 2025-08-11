@@ -67,7 +67,7 @@ fn root_tracing(handle: &Handle, logger: &Logger) -> Vec<Box<ObjBatch>> {
         // TODO: parallelize if it helps (profiling should be necessary).
         logger.measure("mark", || {
             for batch in &obj_taken {
-                for obj in &batch.objs {
+                for obj in &batch.0 {
                     if obj.root_count() > 0 || hazards.contains(&obj.address()) {
                         obj.mark(&guard);
                     }
@@ -186,35 +186,43 @@ fn next_normal(obj_batches: Vec<Box<ObjBatch>>, handle: &Handle, logger: &Logger
     fence::heavy();
 
     // Reclaim unmarked objects from the previous cycle.
-    logger.measure("sweep", || sweep(obj_batches, prev_epoch.color(), &handle));
+    logger.measure("sweep", || {
+        sweep(obj_batches, prev_epoch.color(), &handle, logger)
+    });
     // For the case of very fast execution of `sweep`, we need to check and wait
     // the unpinning of all mutators.
     logger.measure("unpin", || wait_all_mutators_unpin(new_epoch.timestamp()));
 }
 
-fn sweep(obj_batches: Vec<Box<ObjBatch>>, prev_white: Color, handle: &Handle) {
-    let survived = obj_batches
-        .into_iter()
-        .flat_map(|batch| batch.objs.into_iter())
-        .filter_map(|obj| {
-            if prev_white == obj.color() {
-                None // `drop(obj)` is called implicitly.
-            } else {
-                Some(obj)
-            }
-        })
-        .collect::<Vec<_>>();
+fn sweep(obj_batches: Vec<Box<ObjBatch>>, prev_white: Color, handle: &Handle, logger: &Logger) {
+    let survived = logger.measure("sweep and free", || {
+        obj_batches
+            .into_iter()
+            .flat_map(|batch| batch.0.into_iter())
+            .filter_map(|obj| {
+                if prev_white == obj.color() {
+                    None // `drop(obj)` is called implicitly.
+                } else {
+                    Some(obj)
+                }
+            })
+            .collect::<Vec<_>>()
+    });
 
     let batch_count = survived.len().div_ceil(OBJ_BATCH_SIZE);
     let mut batches: Vec<Box<ObjBatch>> = Vec::with_capacity(batch_count);
     batches.push(Box::default());
-    for obj in survived {
-        if let Err(e) = batches.last_mut().unwrap().objs.try_push(obj) {
-            batches.push(Box::default());
-            batches.last_mut().unwrap().objs.push(e.element());
+    logger.measure("pack", || {
+        for obj in survived {
+            if let Err(e) = batches.last_mut().unwrap().0.push_within_capacity(obj) {
+                batches.push(Box::default());
+                batches.last_mut().unwrap().0.push(e);
+            }
         }
-    }
-    global().objs[handle.local().select_obj_shard()].push_batch(batches.into_iter());
+    });
+    logger.measure("push batch", || {
+        global().objs[handle.local().select_obj_shard()].push_batch(batches.into_iter())
+    });
 }
 
 fn wait_all_mutators_unpin(new_ts: usize) {
@@ -280,7 +288,7 @@ mod log {
 
             let time_str = format!("- {}ms", (end - start).as_millis());
             if self.at_new_line.get() {
-                self.log(&(time_str + "\n"));
+                self.log(&format!("{}{}\n", "  ".repeat(depth), time_str));
             } else {
                 eprintln!("{time_str}");
             }
