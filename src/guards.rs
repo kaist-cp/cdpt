@@ -2,16 +2,18 @@
 
 use crate::{
     TraceObj,
-    epoch::{Color, Phase},
-    internal::Local,
+    epoch::{Color, Epoch, Phase},
+    internal::{Local, OBJ_BATCH_SIZE},
     pointers::ManObj,
     sync::fence,
     task::Task,
     tls::global,
 };
-use std::ptr::NonNull;
+use crossbeam::epoch::pin as ebr_pin;
+use std::{cell::LazyCell, ptr::NonNull, sync::atomic::Ordering};
 
-const HELP_MARK_THRESHOLD: usize = 32;
+const HELP_NORMAL_MAX_TRIAL: usize = 2;
+const HELP_TRACING_MAX_TRIAL: usize = 2;
 
 /// A handle to a garbage collector.
 pub struct Handle {
@@ -36,21 +38,10 @@ impl Handle {
         self.local().is_pinned()
     }
 
-    /// Helps the ongoing collection works if it seems necessary.
+    /// Helps the ongoing collection works if possible.
     #[inline]
     pub fn help_collect(&self) {
-        let mt_len = unsafe { &*self.local.as_ref().mark_tasks.get() }.len();
-        if mt_len < HELP_MARK_THRESHOLD {
-            return;
-        }
-        let guard = self.pin();
-        for _ in 0..(mt_len / 2) {
-            if let Some(task) = guard.try_pop_mark_task() {
-                task.call();
-                continue;
-            }
-            break;
-        }
+        self.pin().help_collect();
     }
 }
 
@@ -80,15 +71,23 @@ impl Guard {
     /// the call (the latter is enforced by `&mut self`). The thread will only be repinned if this
     /// is the only active guard for the current thread.
     pub fn repin(&mut self) {
-        unsafe { self.local.as_ref() }.repin();
+        self.local().repin();
+    }
+
+    pub(crate) fn local(&self) -> &Local {
+        unsafe { self.local.as_ref() }
+    }
+
+    pub(crate) fn local_epoch(&self) -> Epoch {
+        unsafe { self.local().pinned_epoch() }
     }
 
     pub(crate) fn phase(&self) -> Phase {
-        unsafe { self.local.as_ref().pinned_epoch() }.phase()
+        self.local_epoch().phase()
     }
 
     pub(crate) fn white_color(&self) -> Color {
-        unsafe { self.local.as_ref().pinned_epoch() }.color()
+        self.local_epoch().color()
     }
 
     pub(crate) fn black_color(&self) -> Color {
@@ -109,21 +108,107 @@ impl Guard {
     }
 
     pub(crate) fn alloc<T: 'static + TraceObj>(&self, obj: ManObj<T>) -> *mut ManObj<T> {
-        unsafe { self.local.as_ref().alloc(obj) }
+        self.local().alloc(obj, self)
     }
 
     pub(crate) fn schedule_mark<T: 'static + TraceObj>(&self, obj: &ManObj<T>) {
-        unsafe { self.local.as_ref().schedule_mark(obj) };
+        unsafe { self.local().schedule_mark(obj) };
     }
 
     pub(crate) fn try_pop_mark_task(&self) -> Option<Task> {
-        unsafe { self.local.as_ref().try_pop_mark_task() }
+        self.local().try_pop_mark_task()
+    }
+
+    /// Helps the ongoing collection works if possible.
+    pub fn help_collect(&self) {
+        match self.phase() {
+            Phase::N => self.help_normal(),
+            Phase::RT | Phase::CT => self.help_tracing(),
+        }
+    }
+
+    /// Helps sweeping works for the current Normal phase.
+    #[inline]
+    fn help_normal(&self) {
+        let ebr_guard = &ebr_pin();
+        let mut trial_count = 0;
+
+        for q_idx in self.local().generate_shard_permut() {
+            let prev_white = self.local_epoch().color().flip();
+            let marked_q = &global().marked_objs[prev_white as usize][q_idx];
+
+            loop {
+                if let Some(batch) = marked_q.try_pop(ebr_guard) {
+                    for obj in batch.0 {
+                        if prev_white == obj.color() {
+                            drop(obj);
+                            continue;
+                        }
+                        unsafe { self.local().push_mark_obj(obj) };
+                    }
+                }
+
+                trial_count += 1;
+                if trial_count >= HELP_NORMAL_MAX_TRIAL {
+                    return;
+                }
+            }
+        }
+    }
+
+    /// Helps root marking and tracing works for the current RT or CT phase.
+    #[inline]
+    fn help_tracing(&self) {
+        let mt_len = unsafe { &*self.local().mark_tasks.get() }.len();
+        for _ in 0..(mt_len.min(OBJ_BATCH_SIZE / 2)) {
+            if let Some(task) = self.try_pop_mark_task() {
+                task.call();
+                continue;
+            }
+            break;
+        }
+
+        if self.local_epoch().phase() != Phase::RT {
+            return;
+        }
+
+        let ebr_guard = &ebr_pin();
+        let synced = global().iter_locals(ebr_guard).all(|local| {
+            self.local_epoch().timestamp() <= local.epoch.load(Ordering::Relaxed).timestamp()
+        });
+        if !synced {
+            return;
+        }
+
+        let hazards = LazyCell::new(|| global().collect_hps(ebr_guard));
+        let mut trial_count = 0;
+
+        for q_idx in self.local().generate_shard_permut() {
+            let fresh_q = &global().fresh_objs[self.white_color() as usize][q_idx];
+            loop {
+                if let Some(batch) = fresh_q.try_pop(ebr_guard) {
+                    for obj in &batch.0 {
+                        if obj.root_count() > 0 || hazards.contains(&obj.address()) {
+                            obj.mark(self);
+                        }
+                    }
+                    let marked_q_idx = self.local().select_obj_shard();
+                    let marked_q = &global().marked_objs[self.white_color() as usize][marked_q_idx];
+                    marked_q.push(batch, ebr_guard);
+                }
+
+                trial_count += 1;
+                if trial_count >= HELP_TRACING_MAX_TRIAL {
+                    return;
+                }
+            }
+        }
     }
 }
 
 impl Drop for Guard {
     #[inline]
     fn drop(&mut self) {
-        unsafe { self.local.as_ref() }.unpin_inner();
+        self.local().unpin_inner();
     }
 }

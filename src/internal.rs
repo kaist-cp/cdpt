@@ -2,13 +2,17 @@ use crate::collector::collector_loop;
 use crate::epoch::{AtomicEpoch, Color, Epoch, Phase};
 use crate::guards::{Guard, Handle};
 use crate::pointers::{ManObj, ManPtr, MarkObj, TraceObj};
-use crate::sync::{Entry, IsElement, List, Pile, fence};
+use crate::sync::{Entry, IsElement, List, Queue, fence};
 use crate::task::Task;
 use crate::{global, pin};
 use crossbeam::deque::{Injector, Stealer, Worker};
-use crossbeam::epoch::{Guard as EbrGuard, Owned, Shared as EbrShared, unprotected};
+use crossbeam::epoch::{
+    Guard as EbrGuard, Owned, Shared as EbrShared, pin as ebr_pin, unprotected,
+};
 use crossbeam::utils::CachePadded;
 use fastrand::Rng;
+use rustc_hash::FxHashSet;
+use std::array::from_fn;
 use std::cell::{Cell, UnsafeCell};
 use std::mem::{ManuallyDrop, forget};
 use std::ptr::{self, NonNull};
@@ -19,6 +23,7 @@ const OBJ_BATCHES_SHARD: usize = 8;
 pub(crate) const OBJ_BATCH_SIZE: usize = 64;
 /// TODO: Make it resizable. We might need a dedicated SMR (e.g., EBR, HP).
 const HAZARDS_COUNT: usize = 8;
+const ALLOC_HELPING_PERIOD: usize = 64;
 
 /// The global data for a garbage collector.
 pub struct Global {
@@ -28,8 +33,11 @@ pub struct Global {
     /// The global epoch.
     pub(crate) epoch: CachePadded<AtomicEpoch>,
 
-    /// The global sharded object lists.
-    pub(crate) objs: [CachePadded<Pile<Box<ObjBatch>>>; OBJ_BATCHES_SHARD],
+    /// `fresh_objs` and `marked_objs`: the global sharded object lists.
+    ///
+    /// The first index represents the allocation color when the object is allocated.
+    pub(crate) fresh_objs: [[Queue<ObjBatch>; OBJ_BATCHES_SHARD]; 2],
+    pub(crate) marked_objs: [[Queue<ObjBatch>; OBJ_BATCHES_SHARD]; 2],
 
     /// The global marking tasks.
     pub(crate) mark_tasks: Injector<Task>,
@@ -62,7 +70,8 @@ impl Global {
         Self {
             locals: CachePadded::new(List::new()),
             epoch: CachePadded::new(AtomicEpoch::new(Epoch::starting())),
-            objs: [const { CachePadded::new(Pile::new()) }; OBJ_BATCHES_SHARD],
+            fresh_objs: from_fn(|_| from_fn(|_| Queue::new())),
+            marked_objs: from_fn(|_| from_fn(|_| Queue::new())),
             mark_tasks: Injector::new(),
             collector_init: CachePadded::new(AtomicBool::new(false)),
         }
@@ -91,6 +100,19 @@ impl Global {
             spawn(collector_loop);
         }
     }
+
+    pub(crate) fn iter_locals<'g>(
+        &'g self,
+        guard: &'g EbrGuard,
+    ) -> impl Iterator<Item = &'g Local> {
+        self.locals.iter(guard).map(|r| r.unwrap())
+    }
+
+    pub(crate) fn collect_hps(&self, guard: &EbrGuard) -> FxHashSet<*mut ()> {
+        self.iter_locals(guard)
+            .flat_map(|local| local.hazards.iter().map(|hp| hp.load(Ordering::Relaxed)))
+            .collect::<_>()
+    }
 }
 
 /// Participant for garbage collection.
@@ -107,6 +129,9 @@ pub(crate) struct Local {
 
     /// The epoch that this local thread observed most recently.
     last_observed: Cell<Epoch>,
+
+    /// An allocation counter to periodically trigger helping collection.
+    alloc_count: Cell<usize>,
 
     /// A single-writer multiple-reader list of protected pointers.
     pub(crate) hazards: [AtomicPtr<()>; HAZARDS_COUNT],
@@ -138,7 +163,7 @@ pub(crate) struct Local {
     /// can take the object list of the previous normal phase without breaking lock-freedom of
     /// mutators, because the mutator can still modify its black object list during RT & CT phase
     /// while the collector accesses the white object list, which is from the previous N phase.
-    pub(crate) objs: [UnsafeCell<ManuallyDrop<Box<ObjBatch>>>; 2],
+    pub(crate) objs: [UnsafeCell<ManuallyDrop<ObjBatch>>; 2],
 
     /// A local mark queue.
     pub(crate) mark_tasks: UnsafeCell<ManuallyDrop<Worker<Task>>>,
@@ -157,6 +182,7 @@ impl Local {
                 guard_count: Cell::new(0),
                 handle_count: Cell::new(1),
                 last_observed: Cell::new(Epoch::starting()),
+                alloc_count: Cell::new(0),
                 hazards: [const { AtomicPtr::new(ptr::null_mut()) }; HAZARDS_COUNT],
                 hazards_marker: [const { Cell::new(None) }; HAZARDS_COUNT],
                 mark_tasks_stealer: stealer,
@@ -328,34 +354,56 @@ impl Local {
         color
     }
 
+    #[inline]
+    pub(crate) fn alloc<T: 'static + TraceObj>(
+        &self,
+        obj: ManObj<T>,
+        guard: &Guard,
+    ) -> *mut ManObj<T> {
+        let b = Box::new(obj);
+        let ptr = ((&*b) as *const ManObj<T>).cast_mut();
+        let b_dyn: Box<dyn MarkObj> = b;
+        unsafe { self.push_mark_obj(b_dyn) };
+
+        let alloc_count = self.alloc_count.get() + 1;
+        self.alloc_count.set(alloc_count);
+        if alloc_count % ALLOC_HELPING_PERIOD == 0 {
+            guard.help_collect();
+        }
+
+        ptr
+    }
+
     /// # Safety
     ///
     /// The thread must be properly pinned.
     #[inline]
-    pub(crate) unsafe fn alloc<T: 'static + TraceObj>(&self, obj: ManObj<T>) -> *mut ManObj<T> {
-        let b = Box::new(obj);
-        let ptr = ((&*b) as *const ManObj<T>).cast_mut();
-        let mut b_dyn: Box<dyn MarkObj> = b;
+    pub(crate) unsafe fn push_mark_obj(&self, mut obj: Box<dyn MarkObj>) {
         let objs_index = unsafe { self.pinned_alloc_color() } as usize;
-
         loop {
             match unsafe { &mut *self.objs[objs_index].get() }
                 .0
-                .push_within_capacity(b_dyn)
+                .push_within_capacity(obj)
             {
                 Ok(_) => break,
                 Err(e) => {
-                    b_dyn = e;
+                    obj = e;
                     unsafe { self.flush_objs() };
                 }
             }
         }
-        ptr
     }
 
     #[inline]
     pub(crate) fn select_obj_shard(&self) -> usize {
         unsafe { &mut *self.rng.get() }.usize(0..OBJ_BATCHES_SHARD)
+    }
+
+    #[inline]
+    pub(crate) fn generate_shard_permut(&self) -> [usize; OBJ_BATCHES_SHARD] {
+        let mut result = [0, 1, 2, 3, 4, 5, 6, 7];
+        unsafe { &mut *self.rng.get() }.shuffle(&mut result);
+        result
     }
 
     /// # Safety
@@ -367,7 +415,7 @@ impl Local {
     /// 2. The collector during RT phase has exclusive write permissions for the current
     ///    `white_color` index, for every mutator's allocation list.
     #[inline]
-    pub(crate) unsafe fn take_obj_batch(&self, index: usize) -> Option<Box<ObjBatch>> {
+    pub(crate) unsafe fn take_obj_batch(&self, index: usize) -> Option<ObjBatch> {
         let batch = unsafe {
             if (&*self.objs[index].get()).0.is_empty() {
                 return None;
@@ -391,9 +439,10 @@ impl Local {
         };
         unsafe {
             global()
-                .objs
+                .fresh_objs
+                .get_unchecked(index)
                 .get_unchecked(self.select_obj_shard())
-                .push(batch);
+                .push(batch, &ebr_pin());
         }
     }
 

@@ -1,15 +1,11 @@
-use crossbeam::{
-    epoch::{Guard as EbrGuard, pin as ebr_pin},
-    utils::Backoff,
-};
-use rustc_hash::FxHashSet;
-use std::{iter::repeat_with, sync::atomic::Ordering, thread::sleep, time::Duration};
+use crossbeam::{epoch::pin as ebr_pin, utils::Backoff};
+use std::{iter::repeat_with, mem::take, sync::atomic::Ordering, thread::sleep, time::Duration};
 
 use crate::{
     Handle,
     epoch::{Color, Phase},
     global,
-    internal::{Local, OBJ_BATCH_SIZE, ObjBatch},
+    internal::ObjBatch,
     sync::fence,
     task::Task,
     tls::handle,
@@ -26,14 +22,14 @@ pub(crate) fn collector_loop() {
         while !is_collection_necessary() {
             sleep(Duration::from_millis(1));
         }
-        let objs = logger.measure("RT", || root_tracing(&handle, &logger));
+        logger.measure("RT", || root_tracing(&handle, &logger));
         while logger.measure("CT", || !completion_tracing(&handle, &logger)) {}
-        logger.measure("N", || next_normal(objs, &handle, &logger));
+        logger.measure("N", || next_normal(&handle, &logger));
     }
 }
 
 #[must_use]
-fn root_tracing(handle: &Handle, logger: &Logger) -> Vec<Box<ObjBatch>> {
+fn root_tracing(handle: &Handle, logger: &Logger) {
     debug_assert!(global().load_epoch().phase() == Phase::N);
     logger.measure("transition", || phase_trans(Phase::RT));
 
@@ -41,41 +37,7 @@ fn root_tracing(handle: &Handle, logger: &Logger) -> Vec<Box<ObjBatch>> {
     // * All mutators are unpinned from the normal phase.
     // * Some of them may have already observed this tracing phase, scanning their own local
     //   hazard pointers (phase barrier).
-    let obj_batches = {
-        let guard = handle.pin();
-
-        // It would be good to create an iterator for allocated objects as soon as
-        // the completion of phase transition, to scan less objects.
-        let obj_taken = logger.measure("take objects", || {
-            global()
-                .objs
-                .iter()
-                .flat_map(|list| list.take())
-                .chain(iter_locals(&ebr_pin()).flat_map(|local| unsafe {
-                    local.take_obj_batch(guard.white_color() as usize)
-                }))
-                .collect::<Vec<_>>()
-        });
-
-        // Scan HPs first. And they will be marked during the RC scan.
-        let hazards = logger.measure("scan HP", || {
-            iter_locals(&ebr_pin())
-                .flat_map(|local| local.hazards.iter().map(|hp| hp.load(Ordering::Relaxed)))
-                .collect::<FxHashSet<_>>()
-        });
-
-        // TODO: parallelize if it helps (profiling should be necessary).
-        logger.measure("mark", || {
-            for batch in &obj_taken {
-                for obj in &batch.0 {
-                    if obj.root_count() > 0 || hazards.contains(&obj.address()) {
-                        obj.mark(&guard);
-                    }
-                }
-            }
-        });
-        obj_taken
-    };
+    logger.measure("scan", || scan_allocated_objs(handle));
     // After scanning:
     // * Speaking with weak tricolor invariant, both mutators’ stacks (HP) and
     //   the global region (RC) are black (rescanning isn’t needed).
@@ -88,7 +50,38 @@ fn root_tracing(handle: &Handle, logger: &Logger) -> Vec<Box<ObjBatch>> {
     //   collectors guarantee that no live objects are missed.
 
     logger.measure("drain", || drain_mark_tasks(handle));
-    obj_batches
+}
+
+fn scan_allocated_objs(handle: &Handle) {
+    let guard = handle.pin();
+    let ebr_guard = &ebr_pin();
+
+    // Make sure that there's no pending freshly allocated objects in locals.
+    let pending = global()
+        .iter_locals(ebr_guard)
+        .flat_map(|local| unsafe { local.take_obj_batch(guard.white_color() as usize) });
+
+    for obj in pending {
+        global().fresh_objs[guard.white_color() as usize][handle.local().select_obj_shard()]
+            .push(obj, ebr_guard);
+    }
+
+    // Scan HPs first. And they will be marked during the RC scan.
+    let hazards = global().collect_hps(ebr_guard);
+
+    for q_idx in handle.local().generate_shard_permut() {
+        let fresh_q = &global().fresh_objs[guard.white_color() as usize][q_idx];
+        while let Some(batch) = fresh_q.try_pop(ebr_guard) {
+            for obj in &batch.0 {
+                if obj.root_count() > 0 || hazards.contains(&obj.address()) {
+                    obj.mark(&guard);
+                }
+            }
+            let marked_q_idx = handle.local().select_obj_shard();
+            let marked_q = &global().marked_objs[guard.white_color() as usize][marked_q_idx];
+            marked_q.push(batch, ebr_guard);
+        }
+    }
 }
 
 fn completion_tracing(handle: &Handle, logger: &Logger) -> bool {
@@ -113,14 +106,18 @@ fn try_confirm_completion() -> bool {
     let ebr_guard = ebr_pin();
     // The 1st iteration of reading `mt_modified_ts` flags.
     // If any of them are the latest timestamp, we assume that the tracing is not done.
-    if iter_locals(&ebr_guard).any(|local| local.mt_modified_ts.load(Ordering::Relaxed) == curr_ts)
+    if global()
+        .iter_locals(&ebr_guard)
+        .any(|local| local.mt_modified_ts.load(Ordering::Relaxed) == curr_ts)
     {
         return false;
     }
 
     // Check whether there's a non-empty mark queue.
     if !global().mark_tasks.is_empty()
-        || iter_locals(&ebr_guard).any(|local| !local.mark_tasks_stealer.is_empty())
+        || global()
+            .iter_locals(&ebr_guard)
+            .any(|local| !local.mark_tasks_stealer.is_empty())
     {
         return false;
     }
@@ -130,7 +127,9 @@ fn try_confirm_completion() -> bool {
     // so even if the collector misses a non-empty mark queue due to races,
     // the collector can recognize that the `mt_modified_ts` flag changed.
     // Note: we do not need `fence(SeqCst)` here, as `Stealer::is_empty` above already uses it.
-    if iter_locals(&ebr_guard).any(|local| local.mt_modified_ts.load(Ordering::Relaxed) == curr_ts)
+    if global()
+        .iter_locals(&ebr_guard)
+        .any(|local| local.mt_modified_ts.load(Ordering::Relaxed) == curr_ts)
     {
         return false;
     }
@@ -155,7 +154,8 @@ fn find_task(handle: &Handle) -> Option<Task> {
     local_w.pop().or_else(|| {
         repeat_with(|| {
             global_inj.steal_batch_and_pop(local_w).or_else(|| {
-                iter_locals(&ebr_pin())
+                global()
+                    .iter_locals(&ebr_pin())
                     .map(|local| local.mark_tasks_stealer.steal())
                     .collect()
             })
@@ -173,7 +173,7 @@ fn phase_trans(new: Phase) {
     wait_all_mutators_unpin(new_epoch.timestamp());
 }
 
-fn next_normal(obj_batches: Vec<Box<ObjBatch>>, handle: &Handle, logger: &Logger) {
+fn next_normal(handle: &Handle, logger: &Logger) {
     let prev_epoch = global().load_epoch();
     debug_assert!(prev_epoch.phase() == Phase::CT);
     debug_assert!(find_task(handle).is_none());
@@ -186,48 +186,45 @@ fn next_normal(obj_batches: Vec<Box<ObjBatch>>, handle: &Handle, logger: &Logger
     fence::heavy();
 
     // Reclaim unmarked objects from the previous cycle.
-    logger.measure("sweep", || {
-        sweep(obj_batches, prev_epoch.color(), &handle, logger)
-    });
+    logger.measure("sweep", || sweep(prev_epoch.color(), &handle, logger));
     // For the case of very fast execution of `sweep`, we need to check and wait
     // the unpinning of all mutators.
     logger.measure("unpin", || wait_all_mutators_unpin(new_epoch.timestamp()));
 }
 
-fn sweep(obj_batches: Vec<Box<ObjBatch>>, prev_white: Color, handle: &Handle, logger: &Logger) {
-    let survived = logger.measure("sweep and free", || {
-        obj_batches
-            .into_iter()
-            .flat_map(|batch| batch.0.into_iter())
-            .filter_map(|obj| {
-                if prev_white == obj.color() {
-                    None // `drop(obj)` is called implicitly.
-                } else {
-                    Some(obj)
-                }
-            })
-            .collect::<Vec<_>>()
-    });
+fn sweep(prev_white: Color, handle: &Handle, _logger: &Logger) {
+    let guard = &ebr_pin();
 
-    let batch_count = survived.len().div_ceil(OBJ_BATCH_SIZE);
-    let mut batches: Vec<Box<ObjBatch>> = Vec::with_capacity(batch_count);
-    batches.push(Box::default());
-    logger.measure("pack", || {
-        for obj in survived {
-            if let Err(e) = batches.last_mut().unwrap().0.push_within_capacity(obj) {
-                batches.push(Box::default());
-                batches.last_mut().unwrap().0.push(e);
+    let mut survived_batch = ObjBatch::default();
+    for q_idx in handle.local().generate_shard_permut() {
+        let marked_q = &global().marked_objs[prev_white as usize][q_idx];
+        while let Some(batch) = marked_q.try_pop(guard) {
+            for obj in batch.0 {
+                if prev_white == obj.color() {
+                    drop(obj);
+                    continue;
+                }
+                if let Err(e) = survived_batch.0.push_within_capacity(obj) {
+                    let full = take(&mut survived_batch);
+                    let next_white = prev_white.flip() as usize;
+                    let shard = handle.local().select_obj_shard();
+                    global().fresh_objs[next_white][shard].push(full, guard);
+                    assert!(survived_batch.0.push_within_capacity(e).is_ok());
+                }
             }
         }
-    });
-    logger.measure("push batch", || {
-        global().objs[handle.local().select_obj_shard()].push_batch(batches.into_iter())
-    });
+    }
+
+    if !survived_batch.0.is_empty() {
+        let next_white = prev_white.flip() as usize;
+        let shard = handle.local().select_obj_shard();
+        global().fresh_objs[next_white][shard].push(survived_batch, guard);
+    }
 }
 
 fn wait_all_mutators_unpin(new_ts: usize) {
     // Loop until all mutators unpin from the previous phase.
-    for local in iter_locals(&ebr_pin()) {
+    for local in global().iter_locals(&ebr_pin()) {
         let backoff = Backoff::new();
         let mut local_epoch;
         loop {
@@ -243,10 +240,6 @@ fn wait_all_mutators_unpin(new_ts: usize) {
 fn is_collection_necessary() -> bool {
     // TODO: How long should it sleep? Heuristic. E.g., MemBalancer
     true
-}
-
-fn iter_locals(guard: &EbrGuard) -> impl Iterator<Item = &'_ Local> {
-    global().locals.iter(guard).map(|r| r.unwrap())
 }
 
 #[cfg(feature = "logging")]
