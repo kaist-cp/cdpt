@@ -1,5 +1,5 @@
 use crossbeam::{epoch::pin as ebr_pin, utils::Backoff};
-use std::{iter::repeat_with, mem::take, sync::atomic::Ordering, thread::sleep, time::Duration};
+use std::{iter::repeat_with, mem::take, sync::atomic::Ordering};
 
 use crate::{
     Handle,
@@ -17,10 +17,11 @@ use log::Logger;
 pub(crate) fn collector_loop() {
     let handle = handle();
     let logger = Logger::new();
+    let backoff = Backoff::new();
 
     loop {
         while !is_collection_necessary() {
-            sleep(Duration::from_millis(1));
+            backoff.snooze();
         }
         logger.measure("RT", || root_tracing(&handle, &logger));
         while logger.measure("CT", || !completion_tracing(&handle, &logger)) {}
@@ -232,7 +233,7 @@ fn wait_all_mutators_unpin(new_ts: usize) {
             if !local_epoch.is_pinned() || new_ts <= local_epoch.timestamp() {
                 break;
             }
-            backoff.spin();
+            backoff.snooze();
         }
     }
 }

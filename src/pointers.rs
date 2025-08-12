@@ -282,7 +282,7 @@ impl<T: 'static + TraceObj> ManPtr<T> {
     }
 
     /// Returns `true` if it scheduled a task.
-    pub(crate) fn shade_pointee(self, guard: &Guard) -> bool {
+    pub(crate) fn shade_pointee(self, mark_imm: bool, guard: &Guard) -> bool {
         let Some(mobj) = (unsafe { self.as_ref() }) else {
             // The pointer is null.
             return false;
@@ -291,7 +291,11 @@ impl<T: 'static + TraceObj> ManPtr<T> {
             // It is already marked and traced.
             return false;
         }
-        guard.schedule_mark(mobj);
+        if mark_imm {
+            mobj.mark(guard);
+        } else {
+            guard.schedule_mark(mobj);
+        }
         return true;
     }
 }
@@ -509,7 +513,7 @@ impl<T: 'static + Send + Sync + TraceObj> AtomicShared<T> {
                     && guard.global_phase() != Phase::N
                 {
                     // Root-count deletion barrier.
-                    old.shade_pointee(guard);
+                    old.shade_pointee(true, guard);
                 }
                 Ok(old)
             }
@@ -531,7 +535,7 @@ impl<T: 'static + Send + Sync + TraceObj> AtomicShared<T> {
             };
             if old.as_ptr() != new.as_ptr() && old_color == guard.black_color() {
                 // Dijkstra-style insertion barrier.
-                new.shade_pointee(guard);
+                new.shade_pointee(true, guard);
             }
             let new = new.with_meta(PtrMeta::Unrooted(old_color));
 
@@ -548,7 +552,7 @@ impl<T: 'static + Send + Sync + TraceObj> AtomicShared<T> {
                         && guard.global_phase() != Phase::N
                     {
                         // Yuasa-style deletion barrier.
-                        old.shade_pointee(guard);
+                        old.shade_pointee(true, guard);
                     }
                 }
                 Err(current) => {
@@ -597,7 +601,7 @@ impl<T: 'static + Send + Sync + TraceObj> Drop for AtomicShared<T> {
             && guard.global_phase() != Phase::N
         {
             // Root-count deletion barrier.
-            ptr.shade_pointee(&guard);
+            ptr.shade_pointee(true, &guard);
         }
     }
 }
@@ -624,7 +628,7 @@ impl<T: Send + Sync + TraceObj> TracePtr for AtomicShared<T> {
                 // Already shaded by others. Let's skip.
                 break;
             }
-            ptr.shade_pointee(guard);
+            ptr.shade_pointee(false, guard);
             let black = ptr.with_meta(PtrMeta::Unrooted(guard.black_color()));
             match self.link.compare_exchange(
                 ptr.data,

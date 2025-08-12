@@ -363,7 +363,7 @@ impl Local {
         let b = Box::new(obj);
         let ptr = ((&*b) as *const ManObj<T>).cast_mut();
         let b_dyn: Box<dyn MarkObj> = b;
-        unsafe { self.push_mark_obj(b_dyn) };
+        unsafe { self.push_fresh_obj(b_dyn) };
 
         let alloc_count = self.alloc_count.get() + 1;
         self.alloc_count.set(alloc_count);
@@ -378,7 +378,7 @@ impl Local {
     ///
     /// The thread must be properly pinned.
     #[inline]
-    pub(crate) unsafe fn push_mark_obj(&self, mut obj: Box<dyn MarkObj>) {
+    pub(crate) unsafe fn push_fresh_obj(&self, mut obj: Box<dyn MarkObj>) {
         let objs_index = unsafe { self.pinned_alloc_color() } as usize;
         loop {
             match unsafe { &mut *self.objs[objs_index].get() }

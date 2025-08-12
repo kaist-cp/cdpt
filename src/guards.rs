@@ -134,7 +134,7 @@ impl Guard {
         let mut trial_count = 0;
 
         for q_idx in self.local().generate_shard_permut() {
-            let prev_white = self.local_epoch().color().flip();
+            let prev_white = self.black_color();
             let marked_q = &global().marked_objs[prev_white as usize][q_idx];
 
             loop {
@@ -144,7 +144,7 @@ impl Guard {
                             drop(obj);
                             continue;
                         }
-                        unsafe { self.local().push_mark_obj(obj) };
+                        unsafe { self.local().push_fresh_obj(obj) };
                     }
                 }
 
@@ -174,7 +174,8 @@ impl Guard {
 
         let ebr_guard = &ebr_pin();
         let synced = global().iter_locals(ebr_guard).all(|local| {
-            self.local_epoch().timestamp() <= local.epoch.load(Ordering::Relaxed).timestamp()
+            let other_epoch = local.epoch.load(Ordering::Relaxed);
+            !other_epoch.is_pinned() || self.local_epoch().timestamp() <= other_epoch.timestamp()
         });
         if !synced {
             return;
