@@ -181,7 +181,7 @@ impl Guard {
             return;
         }
 
-        let hazards = LazyCell::new(|| global().collect_hps(ebr_guard));
+        let hazards = LazyCell::new(|| self.local().scan_or_reuse_hazards(self, ebr_guard));
         let mut trial_count = 0;
 
         for q_idx in self.local().generate_shard_permut() {

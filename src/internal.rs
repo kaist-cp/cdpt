@@ -167,6 +167,9 @@ pub(crate) struct Local {
 
     /// A local mark queue.
     pub(crate) mark_tasks: UnsafeCell<ManuallyDrop<Worker<Task>>>,
+
+    /// A previously collected hazards that may be reused for later helpings.
+    pub(crate) cached_hazards: UnsafeCell<ManuallyDrop<Option<(FxHashSet<*mut ()>, Epoch)>>>,
 }
 
 impl Local {
@@ -192,6 +195,7 @@ impl Local {
                 rng: UnsafeCell::new(ManuallyDrop::new(Rng::new())),
                 objs: [UnsafeCell::default(), UnsafeCell::default()],
                 mark_tasks: UnsafeCell::new(ManuallyDrop::new(mark_tasks)),
+                cached_hazards: UnsafeCell::default(),
             })
             .into_shared(unprotected());
             // SAFETY: `Local` is being inserted at the head of the list, so we will not
@@ -561,6 +565,28 @@ impl Local {
             }
         }
         None
+    }
+
+    #[inline]
+    pub(crate) fn scan_or_reuse_hazards<'g>(
+        &self,
+        guard: &'g Guard,
+        ebr_guard: &EbrGuard,
+    ) -> &'g FxHashSet<*mut ()> {
+        unsafe {
+            let hazards = &mut **self.cached_hazards.get();
+            if let Some((hazards, prev_epoch)) = hazards {
+                if *prev_epoch == guard.local_epoch() {
+                    return hazards;
+                }
+            }
+        }
+        let new_hazards = global().collect_hps(ebr_guard);
+        unsafe {
+            let hazards = &mut **self.cached_hazards.get();
+            *hazards = Some((new_hazards, guard.local_epoch()));
+            &hazards.as_ref().unwrap_unchecked().0
+        }
     }
 }
 
