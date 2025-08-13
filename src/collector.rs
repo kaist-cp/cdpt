@@ -70,6 +70,8 @@ fn scan_allocated_objs(handle: &Handle) {
     // Scan HPs first. And they will be marked during the RC scan.
     let hazards = global().collect_hps(ebr_guard);
 
+    // Scan all freshly allocated objects (in `fresh_objs`)
+    // and mark protected ones (moving to `marked_objs`).
     for q_idx in handle.local().generate_shard_permut() {
         let fresh_q = &global().fresh_objs[guard.white_color() as usize][q_idx];
         while let Some(batch) = fresh_q.try_pop(ebr_guard) {

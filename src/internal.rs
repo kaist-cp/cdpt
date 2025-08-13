@@ -478,8 +478,11 @@ impl Local {
     #[inline]
     pub(crate) unsafe fn flush_mark_tasks(&self) {
         unsafe {
-            self.record_mt_modification();
             let tasks = &mut *self.mark_tasks.get();
+            if !tasks.is_empty() {
+                // Optimistically assume that we are going to successfully pop tasks.
+                self.record_mt_modification();
+            }
             while let Some(task) = tasks.pop() {
                 global().mark_tasks.push(task);
             }
@@ -530,6 +533,7 @@ impl Local {
             ManuallyDrop::drop(&mut *self.available_hids.get());
             ManuallyDrop::drop(&mut *self.rng.get());
             ManuallyDrop::drop(&mut *self.mark_tasks.get());
+            ManuallyDrop::drop(&mut *self.cached_hazards.get());
             // TODO: objs should be safe to dereference by the collector, even after finalization.
             // for i in 0..self.objs.len() {
             //     ManuallyDrop::drop(&mut *self.objs[i].get());
@@ -559,8 +563,11 @@ impl Local {
     pub(crate) fn try_pop_mark_task(&self) -> Option<Task> {
         unsafe {
             let tasks = &mut *self.mark_tasks.get();
-            if let Some(task) = tasks.pop() {
+            if !tasks.is_empty() {
+                // Optimistically assume that we are going to successfully pop the task.
                 self.record_mt_modification();
+            }
+            if let Some(task) = tasks.pop() {
                 return Some(task);
             }
         }

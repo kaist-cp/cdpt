@@ -9,7 +9,7 @@ use crate::{
     task::Task,
     tls::global,
 };
-use crossbeam::epoch::pin as ebr_pin;
+use crossbeam::epoch::{Guard as EbrGuard, pin as ebr_pin};
 use std::{cell::LazyCell, ptr::NonNull, sync::atomic::Ordering};
 
 const HELP_NORMAL_MAX_TRIAL: usize = 2;
@@ -137,15 +137,13 @@ impl Guard {
             let prev_white = self.black_color();
             let marked_q = &global().marked_objs[prev_white as usize][q_idx];
 
-            loop {
-                if let Some(batch) = marked_q.try_pop(ebr_guard) {
-                    for obj in batch.0 {
-                        if prev_white == obj.color() {
-                            drop(obj);
-                            continue;
-                        }
-                        unsafe { self.local().push_fresh_obj(obj) };
+            while let Some(batch) = marked_q.try_pop(ebr_guard) {
+                for obj in batch.0 {
+                    if prev_white == obj.color() {
+                        drop(obj);
+                        continue;
                     }
+                    unsafe { self.local().push_fresh_obj(obj) };
                 }
 
                 trial_count += 1;
@@ -159,6 +157,27 @@ impl Guard {
     /// Helps root marking and tracing works for the current RT or CT phase.
     #[inline]
     fn help_tracing(&self) {
+        // Ensure that all previous Normal phases have ended.
+        // Note: If some threads (T_m) are helping with marking tasks
+        // while others (T_s) are helping with sweeping tasks,
+        // T_s may misinterpret a black object (i.e., marked by T_m)
+        // as an unreachable object (i.e., still having the previous allocation color),
+        // which can lead to a use-after-free error.
+        let ebr_guard = &ebr_pin();
+        let synced = global().iter_locals(ebr_guard).all(|local| {
+            let other_epoch = local.epoch.load(Ordering::Relaxed);
+            !other_epoch.is_pinned() || other_epoch.phase() != Phase::N
+        });
+        if !synced {
+            return;
+        }
+
+        self.help_draining_mark_tasks();
+        self.help_root_tracing(ebr_guard);
+    }
+
+    #[inline]
+    fn help_draining_mark_tasks(&self) {
         let mt_len = unsafe { &*self.local().mark_tasks.get() }.len();
         for _ in 0..(mt_len.min(OBJ_BATCH_SIZE / 2)) {
             if let Some(task) = self.try_pop_mark_task() {
@@ -167,17 +186,11 @@ impl Guard {
             }
             break;
         }
+    }
 
+    #[inline]
+    fn help_root_tracing(&self, ebr_guard: &EbrGuard) {
         if self.local_epoch().phase() != Phase::RT {
-            return;
-        }
-
-        let ebr_guard = &ebr_pin();
-        let synced = global().iter_locals(ebr_guard).all(|local| {
-            let other_epoch = local.epoch.load(Ordering::Relaxed);
-            !other_epoch.is_pinned() || self.local_epoch().timestamp() <= other_epoch.timestamp()
-        });
-        if !synced {
             return;
         }
 
@@ -186,17 +199,15 @@ impl Guard {
 
         for q_idx in self.local().generate_shard_permut() {
             let fresh_q = &global().fresh_objs[self.white_color() as usize][q_idx];
-            loop {
-                if let Some(batch) = fresh_q.try_pop(ebr_guard) {
-                    for obj in &batch.0 {
-                        if obj.root_count() > 0 || hazards.contains(&obj.address()) {
-                            obj.mark(self);
-                        }
+            while let Some(batch) = fresh_q.try_pop(ebr_guard) {
+                for obj in &batch.0 {
+                    if obj.root_count() > 0 || hazards.contains(&obj.address()) {
+                        obj.mark(self);
                     }
-                    let marked_q_idx = self.local().select_obj_shard();
-                    let marked_q = &global().marked_objs[self.white_color() as usize][marked_q_idx];
-                    marked_q.push(batch, ebr_guard);
                 }
+                let marked_q_idx = self.local().select_obj_shard();
+                let marked_q = &global().marked_objs[self.white_color() as usize][marked_q_idx];
+                marked_q.push(batch, ebr_guard);
 
                 trial_count += 1;
                 if trial_count >= HELP_TRACING_MAX_TRIAL {
