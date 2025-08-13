@@ -198,7 +198,7 @@ impl Guard {
 
     #[inline]
     fn help_root_tracing(&self, ebr_guard: &EbrGuard) {
-        if self.local_epoch().phase() != Phase::RT {
+        if self.phase() != Phase::RT {
             return;
         }
 

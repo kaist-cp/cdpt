@@ -121,8 +121,10 @@ impl<T: TraceObj> ManObj<T> {
     }
 
     pub fn mark(&self, guard: &Guard) {
-        self.shade_outgoings(guard);
-        self.mark_header(guard);
+        if self.header.load(Ordering::Acquire).marked() == guard.white_color() {
+            self.shade_outgoings(guard);
+            self.mark_header(guard);
+        }
     }
 }
 
@@ -282,7 +284,7 @@ impl<T: 'static + TraceObj> ManPtr<T> {
     }
 
     /// Returns `true` if it scheduled a task.
-    pub(crate) fn shade_pointee(self, mark_imm: bool, guard: &Guard) -> bool {
+    pub(crate) fn shade_pointee(self, guard: &Guard) -> bool {
         let Some(mobj) = (unsafe { self.as_ref() }) else {
             // The pointer is null.
             return false;
@@ -291,11 +293,11 @@ impl<T: 'static + TraceObj> ManPtr<T> {
             // It is already marked and traced.
             return false;
         }
-        if mark_imm {
-            mobj.mark(guard);
-        } else {
-            guard.schedule_mark(mobj);
-        }
+        // Note that marking the object immediately (not scheduling) may be dangerous
+        // if the current thread is in RT, and there are threads in N.
+        // If those threads in N are helping the sweeping, the marked object here
+        // can be misidentified as a dead object.
+        guard.schedule_mark(mobj);
         return true;
     }
 }
@@ -359,6 +361,12 @@ pub struct AtomicShared<T: 'static + Send + Sync + TraceObj> {
 unsafe impl<T: Send + Sync + TraceObj> Sync for AtomicShared<T> {}
 unsafe impl<T: Send + Sync + TraceObj> Send for AtomicShared<T> {}
 
+impl<T: 'static + Send + Sync + TraceObj> Default for AtomicShared<T> {
+    fn default() -> Self {
+        Self::null()
+    }
+}
+
 impl<'g, G, T> From<Local<'g, G, T>> for AtomicShared<T>
 where
     G: Protector,
@@ -377,8 +385,19 @@ impl<T: 'static + Send + Sync + TraceObj> AtomicShared<T> {
         Self::from_raw(ptr)
     }
 
+    pub fn new_with_tag<'g>(item: T, tag: usize, guard: &'g Guard) -> Self {
+        let ptr = ManPtr::alloc_rooted(item, guard.alloc_color(), 1, guard);
+        // Safety: `ptr` is freshly allocated.
+        unsafe { &ptr.deref().item }.unroot_outgoings(guard);
+        Self::from_raw(ptr.with_tag(tag))
+    }
+
     pub fn null() -> Self {
         Self::from_raw(ManPtr::null_rooted())
+    }
+
+    pub fn null_with_tag(tag: usize) -> Self {
+        Self::from_raw(ManPtr::null_rooted().with_tag(tag))
     }
 
     pub(crate) fn from_raw(ptr: ManPtr<T>) -> Self {
@@ -483,8 +502,8 @@ impl<T: 'static + Send + Sync + TraceObj> AtomicShared<T> {
         // If the source is unrooted, we focus on the `Unrooted` case only from now on.
         // We can guarantee that an unrooted pointer will never be re-rooted later.
         self.internal_cmpxchg_unrooted(old, new.as_man_ptr(), success, failure, guard)
-            .map(|current| Local::from_raw(ManPtr::from(current), guard))
-            .map_err(|current| Local::from_raw(ManPtr::from(current), guard))
+            .map(|current| Local::from_raw(current, guard))
+            .map_err(|current| Local::from_raw(current, guard))
     }
 
     fn internal_cmpxchg_rooted(
@@ -513,7 +532,7 @@ impl<T: 'static + Send + Sync + TraceObj> AtomicShared<T> {
                     && guard.global_phase() != Phase::N
                 {
                     // Root-count deletion barrier.
-                    old.shade_pointee(true, guard);
+                    old.shade_pointee(guard);
                 }
                 Ok(old)
             }
@@ -535,7 +554,7 @@ impl<T: 'static + Send + Sync + TraceObj> AtomicShared<T> {
             };
             if old.as_ptr() != new.as_ptr() && old_color == guard.black_color() {
                 // Dijkstra-style insertion barrier.
-                new.shade_pointee(true, guard);
+                new.shade_pointee(guard);
             }
             let new = new.with_meta(PtrMeta::Unrooted(old_color));
 
@@ -552,7 +571,7 @@ impl<T: 'static + Send + Sync + TraceObj> AtomicShared<T> {
                         && guard.global_phase() != Phase::N
                     {
                         // Yuasa-style deletion barrier.
-                        old.shade_pointee(true, guard);
+                        old.shade_pointee(guard);
                     }
                 }
                 Err(current) => {
@@ -601,7 +620,7 @@ impl<T: 'static + Send + Sync + TraceObj> Drop for AtomicShared<T> {
             && guard.global_phase() != Phase::N
         {
             // Root-count deletion barrier.
-            ptr.shade_pointee(true, &guard);
+            ptr.shade_pointee(&guard);
         }
     }
 }
@@ -611,6 +630,7 @@ impl<T: Send + Sync + TraceObj> TracePtr for AtomicShared<T> {
         let ptr = ManPtr::<T>::from(self.link.load(Ordering::Relaxed));
         debug_assert!(ptr.meta() == PtrMeta::Rooted);
         if let Some(obj) = unsafe { ptr.as_ref() } {
+            // TODO: should we consider the deletion barrier here?
             obj.header.decrement_root_count(Ordering::Relaxed);
         }
         self.link.store(
@@ -628,7 +648,7 @@ impl<T: Send + Sync + TraceObj> TracePtr for AtomicShared<T> {
                 // Already shaded by others. Let's skip.
                 break;
             }
-            ptr.shade_pointee(false, guard);
+            ptr.shade_pointee(guard);
             let black = ptr.with_meta(PtrMeta::Unrooted(guard.black_color()));
             match self.link.compare_exchange(
                 ptr.data,
