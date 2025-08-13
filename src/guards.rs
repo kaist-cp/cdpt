@@ -13,7 +13,7 @@ use crossbeam::epoch::{Guard as EbrGuard, pin as ebr_pin};
 use std::{cell::LazyCell, ptr::NonNull, sync::atomic::Ordering};
 
 const HELP_NORMAL_MAX_TRIAL: usize = 2;
-const HELP_TRACING_MAX_TRIAL: usize = 2;
+const HELP_TRACING_MAX_TRIAL: usize = 4;
 
 /// A handle to a garbage collector.
 pub struct Handle {
@@ -112,7 +112,7 @@ impl Guard {
     }
 
     pub(crate) fn schedule_mark<T: 'static + TraceObj>(&self, obj: &ManObj<T>) {
-        unsafe { self.local().schedule_mark(obj) };
+        self.local().schedule_mark(obj, self);
     }
 
     pub(crate) fn try_pop_mark_task(&self) -> Option<Task> {
@@ -129,7 +129,11 @@ impl Guard {
 
     /// Helps sweeping works for the current Normal phase.
     #[inline]
-    fn help_normal(&self) {
+    pub(crate) fn help_normal(&self) {
+        if self.phase() != Phase::N {
+            return;
+        }
+
         let ebr_guard = &ebr_pin();
         let mut trial_count = 0;
 
@@ -156,7 +160,11 @@ impl Guard {
 
     /// Helps root marking and tracing works for the current RT or CT phase.
     #[inline]
-    fn help_tracing(&self) {
+    pub(crate) fn help_tracing(&self) {
+        if self.phase() != Phase::RT && self.phase() != Phase::CT {
+            return;
+        }
+
         // Ensure that all previous Normal phases have ended.
         // Note: If some threads (T_m) are helping with marking tasks
         // while others (T_s) are helping with sweeping tasks,
@@ -172,8 +180,8 @@ impl Guard {
             return;
         }
 
-        self.help_draining_mark_tasks();
         self.help_root_tracing(ebr_guard);
+        self.help_draining_mark_tasks();
     }
 
     #[inline]

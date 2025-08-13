@@ -24,6 +24,7 @@ pub(crate) const OBJ_BATCH_SIZE: usize = 64;
 /// TODO: Make it resizable. We might need a dedicated SMR (e.g., EBR, HP).
 const HAZARDS_COUNT: usize = 8;
 const ALLOC_HELPING_PERIOD: usize = 64;
+const SCHED_HELPING_PERIOD: usize = OBJ_BATCH_SIZE / 2;
 
 /// The global data for a garbage collector.
 pub struct Global {
@@ -130,8 +131,11 @@ pub(crate) struct Local {
     /// The epoch that this local thread observed most recently.
     last_observed: Cell<Epoch>,
 
-    /// An allocation counter to periodically trigger helping collection.
+    /// A counter of allocations to periodically trigger helping collection.
     alloc_count: Cell<usize>,
+
+    /// A counter of scheduling to periodically trigger helping collection.
+    sched_count: Cell<usize>,
 
     /// A single-writer multiple-reader list of protected pointers.
     pub(crate) hazards: [AtomicPtr<()>; HAZARDS_COUNT],
@@ -186,6 +190,7 @@ impl Local {
                 handle_count: Cell::new(1),
                 last_observed: Cell::new(Epoch::starting()),
                 alloc_count: Cell::new(0),
+                sched_count: Cell::new(0),
                 hazards: [const { AtomicPtr::new(ptr::null_mut()) }; HAZARDS_COUNT],
                 hazards_marker: [const { Cell::new(None) }; HAZARDS_COUNT],
                 mark_tasks_stealer: stealer,
@@ -489,17 +494,18 @@ impl Local {
         }
     }
 
-    /// # Safety
-    ///
-    /// * The thread must be properly pinned.
-    /// * There must not be any interleaving writes.
-    ///   (i.e., this local thread must have a write permission for this `Local` record.)
     #[inline]
-    pub(crate) unsafe fn schedule_mark<T: 'static + TraceObj>(&self, obj: &ManObj<T>) {
+    pub(crate) fn schedule_mark<T: 'static + TraceObj>(&self, obj: &ManObj<T>, guard: &Guard) {
         let task = Task::new(|| obj.mark(&pin()));
         unsafe {
             self.record_mt_modification();
             (&mut *self.mark_tasks.get()).push(task);
+        }
+
+        let sched_count = self.sched_count.get() + 1;
+        self.sched_count.set(sched_count);
+        if sched_count % SCHED_HELPING_PERIOD == 0 {
+            guard.help_tracing();
         }
     }
 
