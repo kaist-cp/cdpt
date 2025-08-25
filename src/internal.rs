@@ -137,6 +137,15 @@ pub(crate) struct Local {
     /// A counter of scheduling to periodically trigger helping collection.
     sched_count: Cell<usize>,
 
+    /// An indicator that the thread is helping sweeping works for the current Normal phase.
+    pub(crate) is_helping_normal: Cell<bool>,
+
+    /// An indicator that the thread is helping root marking for the current RT phase.
+    pub(crate) is_helping_root_tracing: Cell<bool>,
+
+    /// An indicator that the thread is helping tracing works for the current CT phase.
+    pub(crate) is_helping_draining_mark_tasks: Cell<bool>,
+
     /// A single-writer multiple-reader list of protected pointers.
     pub(crate) hazards: [AtomicPtr<()>; HAZARDS_COUNT],
 
@@ -191,6 +200,9 @@ impl Local {
                 last_observed: Cell::new(Epoch::starting()),
                 alloc_count: Cell::new(0),
                 sched_count: Cell::new(0),
+                is_helping_normal: Cell::new(false),
+                is_helping_root_tracing: Cell::new(false),
+                is_helping_draining_mark_tasks: Cell::new(false),
                 hazards: [const { AtomicPtr::new(ptr::null_mut()) }; HAZARDS_COUNT],
                 hazards_marker: [const { Cell::new(None) }; HAZARDS_COUNT],
                 mark_tasks_stealer: stealer,
@@ -505,7 +517,7 @@ impl Local {
         let sched_count = self.sched_count.get() + 1;
         self.sched_count.set(sched_count);
         if sched_count % SCHED_HELPING_PERIOD == 0 {
-            guard.help_tracing();
+            guard.help_draining_mark_tasks();
         }
     }
 

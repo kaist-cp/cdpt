@@ -10,7 +10,11 @@ use crate::{
     tls::global,
 };
 use crossbeam::epoch::{Guard as EbrGuard, pin as ebr_pin};
-use std::{cell::LazyCell, ptr::NonNull, sync::atomic::Ordering};
+use std::{
+    cell::{Cell, LazyCell},
+    ptr::NonNull,
+    sync::atomic::Ordering,
+};
 
 const HELP_NORMAL_MAX_TRIAL: usize = 2;
 const HELP_TRACING_MAX_TRIAL: usize = 4;
@@ -134,6 +138,11 @@ impl Guard {
             return;
         }
 
+        call_without_recursion(&self.local().is_helping_normal, || self.help_normal_inner());
+    }
+
+    #[inline]
+    fn help_normal_inner(&self) {
         let ebr_guard = &ebr_pin();
         let mut trial_count = 0;
 
@@ -165,27 +174,50 @@ impl Guard {
             return;
         }
 
+        let ebr_guard = &ebr_pin();
+        if !self.is_tracing_synced(ebr_guard) {
+            return;
+        }
+
+        call_without_recursion(&self.local().is_helping_root_tracing, || {
+            self.help_root_tracing(ebr_guard)
+        });
+        call_without_recursion(&self.local().is_helping_draining_mark_tasks, || {
+            self.help_draining_mark_tasks_inner()
+        });
+    }
+
+    #[inline]
+    fn is_tracing_synced(&self, ebr_guard: &EbrGuard) -> bool {
         // Ensure that all previous Normal phases have ended.
         // Note: If some threads (T_m) are helping with marking tasks
         // while others (T_s) are helping with sweeping tasks,
         // T_s may misinterpret a black object (i.e., marked by T_m)
         // as an unreachable object (i.e., still having the previous allocation color),
         // which can lead to a use-after-free error.
-        let ebr_guard = &ebr_pin();
-        let synced = global().iter_locals(ebr_guard).all(|local| {
+        global().iter_locals(ebr_guard).all(|local| {
             let other_epoch = local.epoch.load(Ordering::Relaxed);
             !other_epoch.is_pinned() || other_epoch.phase() != Phase::N
-        });
-        if !synced {
-            return;
-        }
-
-        self.help_root_tracing(ebr_guard);
-        self.help_draining_mark_tasks();
+        })
     }
 
     #[inline]
-    fn help_draining_mark_tasks(&self) {
+    pub(crate) fn help_draining_mark_tasks(&self) {
+        if self.phase() != Phase::RT && self.phase() != Phase::CT {
+            return;
+        }
+
+        if !self.is_tracing_synced(&ebr_pin()) {
+            return;
+        }
+
+        call_without_recursion(&self.local().is_helping_draining_mark_tasks, || {
+            self.help_draining_mark_tasks_inner()
+        });
+    }
+
+    #[inline]
+    pub fn help_draining_mark_tasks_inner(&self) {
         let mt_len = unsafe { &*self.local().mark_tasks.get() }.len();
         for _ in 0..(mt_len.min(OBJ_BATCH_SIZE / 2)) {
             if let Some(task) = self.try_pop_mark_task() {
@@ -231,4 +263,14 @@ impl Drop for Guard {
     fn drop(&mut self) {
         self.local().unpin_inner();
     }
+}
+
+#[inline]
+fn call_without_recursion(flag: &Cell<bool>, f: impl FnOnce()) {
+    if flag.get() {
+        return;
+    }
+    flag.set(true);
+    f();
+    flag.set(false);
 }
