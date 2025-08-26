@@ -207,15 +207,23 @@ impl<T: 'static + TraceObj> ManPtr<T> {
         ptr.with_meta(PtrMeta::Unrooted(color))
     }
 
-    pub(crate) fn null_base() -> Self {
+    pub(crate) const fn null_base() -> Self {
         Self {
             data: null_mut(),
             _marker: PhantomData,
         }
     }
 
-    pub(crate) fn null_rooted() -> Self {
-        Self::null_base().with_meta(PtrMeta::Rooted)
+    pub(crate) const fn null_rooted() -> Self {
+        Self::null_rooted_with_tag(0)
+    }
+
+    pub(crate) const fn null_rooted_with_tag(tag: usize) -> Self {
+        Self {
+            data: ((0b10 << (usize::BITS - Self::META_WIDTH)) | (tag & Self::LOW_BITS)) as *const ()
+                as *mut (),
+            _marker: PhantomData,
+        }
     }
 
     pub(crate) fn meta(self) -> PtrMeta {
@@ -392,15 +400,15 @@ impl<T: 'static + Send + Sync + TraceObj> AtomicShared<T> {
         Self::from_raw(ptr.with_tag(tag))
     }
 
-    pub fn null() -> Self {
+    pub const fn null() -> Self {
         Self::from_raw(ManPtr::null_rooted())
     }
 
-    pub fn null_with_tag(tag: usize) -> Self {
-        Self::from_raw(ManPtr::null_rooted().with_tag(tag))
+    pub const fn null_with_tag(tag: usize) -> Self {
+        Self::from_raw(ManPtr::null_rooted_with_tag(tag))
     }
 
-    pub(crate) fn from_raw(ptr: ManPtr<T>) -> Self {
+    pub(crate) const fn from_raw(ptr: ManPtr<T>) -> Self {
         Self {
             link: AtomicPtr::new(ptr.data),
             _marker: PhantomData,
