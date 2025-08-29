@@ -7,7 +7,7 @@ use crate::{
     tls::pin,
 };
 use std::{
-    hint::unlikely,
+    hint::{cold_path, unlikely},
     marker::PhantomData,
     mem::forget,
     ptr::null_mut,
@@ -116,15 +116,19 @@ impl<T: TraceObj> ManObj<T> {
         }
     }
 
-    pub fn mark_header(&self, guard: &Guard) {
-        self.header.mark(guard);
+    /// Note that marking the object immediately (not scheduling) may be dangerous
+    /// if the current thread is in RT, and there are threads in N.
+    /// If those threads in N are helping the sweeping, the marked object here
+    /// can be misidentified as a dead object.
+    pub fn mark(&self, guard: &Guard) {
+        if !self.is_marked(guard) {
+            self.shade_outgoings(guard);
+            self.header.mark(guard);
+        }
     }
 
-    pub fn mark(&self, guard: &Guard) {
-        if self.header.load(Ordering::Acquire).marked() == guard.white_color() {
-            self.shade_outgoings(guard);
-            self.mark_header(guard);
-        }
+    pub fn is_marked(&self, guard: &Guard) -> bool {
+        self.header.load(Ordering::Acquire).marked() == guard.black_color()
     }
 }
 
@@ -297,7 +301,7 @@ impl<T: 'static + TraceObj> ManPtr<T> {
             // The pointer is null.
             return false;
         };
-        if mobj.header.load(Ordering::Acquire).marked() == guard.black_color() {
+        if mobj.is_marked(guard) {
             // It is already marked and traced.
             return false;
         }
@@ -522,7 +526,6 @@ impl<T: 'static + Send + Sync + TraceObj> AtomicShared<T> {
         failure: Ordering,
         guard: &Guard,
     ) -> Result<ManPtr<T>, (ManPtr<T>, Shared<T>)> {
-        // TODO: if the only change is the tag, we may optimize it further.
         match self
             .link
             .compare_exchange(old.data, new_rooted.as_man_ptr().data, success, failure)
@@ -638,8 +641,16 @@ impl<T: Send + Sync + TraceObj> TracePtr for AtomicShared<T> {
         let ptr = ManPtr::<T>::from(self.link.load(Ordering::Relaxed));
         debug_assert!(ptr.meta() == PtrMeta::Rooted);
         if let Some(obj) = unsafe { ptr.as_ref() } {
-            // TODO: should we consider the deletion barrier here?
-            obj.header.decrement_root_count(Ordering::Relaxed);
+            cold_path(); // When being allocated, most objects' outgoing edges are `null`. 
+            // Note: We believe that the deletion barrier must be considered here.
+            // Imagine a scenario that an object is allocated in a normal phase,
+            // and it becomes a child of another object that is allocated in a next tracing phase.
+            // If its link has the allocation color (i.e., black) without marking the child,
+            // it is possible that the collector misses the child object.
+            let count = obj.header.decrement_root_count(Ordering::Relaxed);
+            if count == 1 && guard.global_phase() != Phase::N {
+                ptr.shade_pointee(guard);
+            }
         }
         self.link.store(
             ptr.with_meta(PtrMeta::Unrooted(guard.alloc_color())).data,

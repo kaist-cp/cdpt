@@ -108,7 +108,6 @@ impl Global {
     }
 }
 
-// TODO: add finalization (all handles are dead) trait. Call self.finalize().
 /// Participant for garbage collection.
 pub(crate) struct Local {
     /// The number of guards keeping this participant pinned.

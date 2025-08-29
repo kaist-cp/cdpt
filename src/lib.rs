@@ -1,3 +1,4 @@
+#![feature(cold_path)]
 #![feature(likely_unlikely)]
 #![feature(strict_provenance_atomic_ptr)]
 #![feature(vec_push_within_capacity)]
