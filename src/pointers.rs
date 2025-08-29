@@ -748,7 +748,7 @@ impl Protector for Handle {
     type Shield = HazardPointer;
 
     fn protect<T: 'static + TraceObj>(&self, ptr: ManPtr<T>) -> Self::Shield {
-        let hp = HazardPointer::new(unsafe { self.local.as_ref() });
+        let hp = HazardPointer::new(self.local.clone());
         hp.protect(ptr);
         hp
     }

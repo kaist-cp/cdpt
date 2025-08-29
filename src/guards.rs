@@ -5,14 +5,14 @@ use crate::{
     epoch::{Color, Epoch, Phase},
     internal::{Local, OBJ_BATCH_SIZE},
     pointers::ManObj,
-    sync::fence,
+    sync::{Entry, fence},
     task::Task,
     tls::global,
 };
-use crossbeam::epoch::{Guard as EbrGuard, pin as ebr_pin};
+use crossbeam::epoch::pin as ebr_pin;
 use std::{
     cell::{Cell, LazyCell},
-    ptr::NonNull,
+    rc::Rc,
     sync::atomic::Ordering,
 };
 
@@ -20,20 +20,25 @@ const HELP_NORMAL_MAX_TRIAL: usize = 2;
 const HELP_TRACING_MAX_TRIAL: usize = 4;
 
 /// A handle to a garbage collector.
+#[derive(Clone)]
 pub struct Handle {
-    pub(crate) local: NonNull<Local>,
+    pub(crate) local: Rc<Entry<Local>>,
 }
 
 impl Handle {
     #[inline]
     pub(crate) fn local(&self) -> &Local {
-        unsafe { self.local.as_ref() }
+        &self.local
     }
 
     /// Pins the handle.
     #[inline]
     pub fn pin(&self) -> Guard {
-        self.local().pin()
+        let guard = Guard {
+            local: self.local.clone(),
+        };
+        self.local().pin_inner();
+        guard
     }
 
     /// Returns `true` if the handle is pinned.
@@ -49,22 +54,8 @@ impl Handle {
     }
 }
 
-impl Clone for Handle {
-    fn clone(&self) -> Self {
-        unsafe { Local::acquire_handle(self.local.as_ref()) };
-        Self { local: self.local }
-    }
-}
-
-impl Drop for Handle {
-    #[inline]
-    fn drop(&mut self) {
-        unsafe { Local::release_handle(self.local.as_ref()) };
-    }
-}
-
 pub struct Guard {
-    pub(crate) local: NonNull<Local>,
+    pub(crate) local: Rc<Entry<Local>>,
 }
 
 impl Guard {
@@ -79,7 +70,7 @@ impl Guard {
     }
 
     pub(crate) fn local(&self) -> &Local {
-        unsafe { self.local.as_ref() }
+        &self.local
     }
 
     pub(crate) fn local_epoch(&self) -> Epoch {
@@ -99,11 +90,7 @@ impl Guard {
     }
 
     pub(crate) fn alloc_color(&self) -> Color {
-        // TODO: We may want to relax this (e.g., white for `Local` even during tracing).
-        match self.phase() {
-            Phase::N => self.white_color(),
-            _ => self.black_color(),
-        }
+        unsafe { self.local().pinned_alloc_color() }
     }
 
     pub(crate) fn global_phase(&self) -> Phase {
@@ -174,13 +161,12 @@ impl Guard {
             return;
         }
 
-        let ebr_guard = &ebr_pin();
-        if !self.is_tracing_synced(ebr_guard) {
+        if !self.is_tracing_synced() {
             return;
         }
 
         call_without_recursion(&self.local().is_helping_root_tracing, || {
-            self.help_root_tracing(ebr_guard)
+            self.help_root_tracing()
         });
         call_without_recursion(&self.local().is_helping_draining_mark_tasks, || {
             self.help_draining_mark_tasks_inner()
@@ -188,14 +174,14 @@ impl Guard {
     }
 
     #[inline]
-    fn is_tracing_synced(&self, ebr_guard: &EbrGuard) -> bool {
+    fn is_tracing_synced(&self) -> bool {
         // Ensure that all previous Normal phases have ended.
         // Note: If some threads (T_m) are helping with marking tasks
         // while others (T_s) are helping with sweeping tasks,
         // T_s may misinterpret a black object (i.e., marked by T_m)
         // as an unreachable object (i.e., still having the previous allocation color),
         // which can lead to a use-after-free error.
-        global().iter_locals(ebr_guard).all(|local| {
+        global().locals.iter_using().all(|local| {
             let other_epoch = local.epoch.load(Ordering::Relaxed);
             !other_epoch.is_pinned() || other_epoch.phase() != Phase::N
         })
@@ -207,7 +193,7 @@ impl Guard {
             return;
         }
 
-        if !self.is_tracing_synced(&ebr_pin()) {
+        if !self.is_tracing_synced() {
             return;
         }
 
@@ -229,12 +215,13 @@ impl Guard {
     }
 
     #[inline]
-    fn help_root_tracing(&self, ebr_guard: &EbrGuard) {
+    fn help_root_tracing(&self) {
         if self.phase() != Phase::RT {
             return;
         }
 
-        let hazards = LazyCell::new(|| self.local().scan_or_reuse_hazards(self, ebr_guard));
+        let ebr_guard = &ebr_pin();
+        let hazards = LazyCell::new(|| self.local().scan_or_reuse_hazards(self));
         let mut trial_count = 0;
 
         for q_idx in self.local().generate_shard_permut() {

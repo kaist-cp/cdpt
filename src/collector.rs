@@ -59,7 +59,8 @@ fn scan_allocated_objs(handle: &Handle) {
 
     // Make sure that there's no pending freshly allocated objects in locals.
     let pending = global()
-        .iter_locals(ebr_guard)
+        .locals
+        .iter_all()
         .flat_map(|local| unsafe { local.take_obj_batch(guard.white_color() as usize) });
 
     for obj in pending {
@@ -68,7 +69,7 @@ fn scan_allocated_objs(handle: &Handle) {
     }
 
     // Scan HPs first. And they will be marked during the RC scan.
-    let hazards = global().collect_hps(ebr_guard);
+    let hazards = global().collect_hps();
 
     // Scan all freshly allocated objects (in `fresh_objs`)
     // and mark protected ones (moving to `marked_objs`).
@@ -106,11 +107,11 @@ fn try_confirm_completion() -> bool {
     // when each mutator thread closed its last critical section.
     let curr_ts = global().load_epoch().timestamp();
 
-    let ebr_guard = ebr_pin();
     // The 1st iteration of reading `mt_modified_ts` flags.
     // If any of them are the latest timestamp, we assume that the tracing is not done.
     if global()
-        .iter_locals(&ebr_guard)
+        .locals
+        .iter_all()
         .any(|local| local.mt_modified_ts.load(Ordering::Relaxed) == curr_ts)
     {
         return false;
@@ -119,7 +120,8 @@ fn try_confirm_completion() -> bool {
     // Check whether there's a non-empty mark queue.
     if !global().mark_tasks.is_empty()
         || global()
-            .iter_locals(&ebr_guard)
+            .locals
+            .iter_all()
             .any(|local| !local.mark_tasks_stealer.is_empty())
     {
         return false;
@@ -131,7 +133,8 @@ fn try_confirm_completion() -> bool {
     // the collector can recognize that the `mt_modified_ts` flag changed.
     // Note: we do not need `fence(SeqCst)` here, as `Stealer::is_empty` above already uses it.
     if global()
-        .iter_locals(&ebr_guard)
+        .locals
+        .iter_all()
         .any(|local| local.mt_modified_ts.load(Ordering::Relaxed) == curr_ts)
     {
         return false;
@@ -151,14 +154,15 @@ fn drain_mark_tasks(handle: &Handle) -> bool {
 }
 
 fn find_task(handle: &Handle) -> Option<Task> {
-    let local_w = unsafe { &**handle.local().mark_tasks.get() };
+    let local_w = unsafe { &*handle.local().mark_tasks.get() };
     let global_inj = &global().mark_tasks;
 
     local_w.pop().or_else(|| {
         repeat_with(|| {
             global_inj.steal_batch_and_pop(local_w).or_else(|| {
                 global()
-                    .iter_locals(&ebr_pin())
+                    .locals
+                    .iter_all()
                     .map(|local| local.mark_tasks_stealer.steal())
                     .collect()
             })
@@ -227,7 +231,7 @@ fn sweep(prev_white: Color, handle: &Handle, _logger: &Logger) {
 
 fn wait_all_mutators_unpin(new_ts: usize) {
     // Loop until all mutators unpin from the previous phase.
-    for local in global().iter_locals(&ebr_pin()) {
+    for local in global().locals.iter_using() {
         let backoff = Backoff::new();
         let mut local_epoch;
         loop {

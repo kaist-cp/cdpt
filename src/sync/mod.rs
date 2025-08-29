@@ -1,6 +1,6 @@
 pub mod fence;
-mod list;
 mod queue;
+mod reusable_slots;
 
-pub(crate) use list::*;
 pub(crate) use queue::*;
+pub(crate) use reusable_slots::*;
