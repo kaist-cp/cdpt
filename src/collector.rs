@@ -29,7 +29,6 @@ pub(crate) fn collector_loop() {
     }
 }
 
-#[must_use]
 fn root_tracing(handle: &Handle, logger: &Logger) {
     debug_assert!(global().load_epoch().phase() == Phase::N);
     logger.measure("transition", || phase_trans(Phase::RT));
@@ -99,7 +98,7 @@ fn completion_tracing(handle: &Handle, logger: &Logger) -> bool {
         return true;
     }
     logger.measure("drain", || drain_mark_tasks(handle));
-    return false;
+    false
 }
 
 fn try_confirm_completion() -> bool {
@@ -193,7 +192,7 @@ fn next_normal(handle: &Handle, logger: &Logger) {
     fence::heavy();
 
     // Reclaim unmarked objects from the previous cycle.
-    logger.measure("sweep", || sweep(prev_epoch.color(), &handle, logger));
+    logger.measure("sweep", || sweep(prev_epoch.color(), handle, logger));
     // For the case of very fast execution of `sweep`, we need to check and wait
     // the unpinning of all mutators.
     logger.measure("unpin", || wait_all_mutators_unpin(new_epoch.timestamp()));

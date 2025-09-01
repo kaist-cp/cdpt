@@ -14,14 +14,8 @@ use std::{
     sync::atomic::{AtomicPtr, AtomicUsize, Ordering},
 };
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Default)]
 pub(crate) struct ObjMeta(usize);
-
-impl Default for ObjMeta {
-    fn default() -> Self {
-        Self(0)
-    }
-}
 
 impl From<usize> for ObjMeta {
     fn from(value: usize) -> Self {
@@ -158,10 +152,7 @@ pub struct ManPtr<T: TraceObj> {
 
 impl<T: TraceObj> Clone for ManPtr<T> {
     fn clone(&self) -> Self {
-        Self {
-            data: self.data,
-            _marker: PhantomData,
-        }
+        *self
     }
 }
 
@@ -310,7 +301,7 @@ impl<T: 'static + TraceObj> ManPtr<T> {
         // If those threads in N are helping the sweeping, the marked object here
         // can be misidentified as a dead object.
         guard.schedule_mark(mobj);
-        return true;
+        true
     }
 }
 
@@ -390,14 +381,14 @@ where
 }
 
 impl<T: 'static + Send + Sync + TraceObj> AtomicShared<T> {
-    pub fn new<'g>(item: T, guard: &'g Guard) -> Self {
+    pub fn new(item: T, guard: &Guard) -> Self {
         let ptr = ManPtr::alloc_rooted(item, guard.alloc_color(), 1, guard);
         // Safety: `ptr` is freshly allocated.
         unsafe { &ptr.deref().item }.unroot_outgoings(guard);
         Self::from_raw(ptr)
     }
 
-    pub fn new_with_tag<'g>(item: T, tag: usize, guard: &'g Guard) -> Self {
+    pub fn new_with_tag(item: T, tag: usize, guard: &Guard) -> Self {
         let ptr = ManPtr::alloc_rooted(item, guard.alloc_color(), 1, guard);
         // Safety: `ptr` is freshly allocated.
         unsafe { &ptr.deref().item }.unroot_outgoings(guard);
@@ -437,7 +428,7 @@ impl<T: 'static + Send + Sync + TraceObj> AtomicShared<T> {
         new: &Local<'l, G, T>,
         order: Ordering,
         guard: &'g Guard,
-    ) -> Local<'l, Guard, T> {
+    ) -> Local<'g, Guard, T> {
         let mut old = ManPtr::<T>::from(self.link.load(Ordering::Relaxed));
 
         // First loop to handle the `Rooted` case.
@@ -572,8 +563,8 @@ impl<T: 'static + Send + Sync + TraceObj> AtomicShared<T> {
             let result = self
                 .link
                 .compare_exchange(old.data, new.data, success, failure)
-                .map(|current| ManPtr::from(current))
-                .map_err(|current| ManPtr::from(current));
+                .map(ManPtr::from)
+                .map_err(ManPtr::from);
 
             match result {
                 Ok(_) => {
@@ -701,7 +692,7 @@ unsafe impl<T: Send + Sync + TraceObj> Sync for Shared<T> {}
 unsafe impl<T: Send + Sync + TraceObj> Send for Shared<T> {}
 
 impl<T: Send + Sync + TraceObj> Shared<T> {
-    pub fn new<'g>(item: T, guard: &'g Guard) -> Self {
+    pub fn new(item: T, guard: &Guard) -> Self {
         Self {
             inner: AtomicShared::new(item, guard),
         }
@@ -768,9 +759,7 @@ impl Protector for Handle {
 impl Protector for Guard {
     type Shield = ();
 
-    fn protect<T: 'static + TraceObj>(&self, _: ManPtr<T>) -> Self::Shield {
-        ()
-    }
+    fn protect<T: 'static + TraceObj>(&self, _: ManPtr<T>) -> Self::Shield {}
 }
 
 /// A thread-local reference to the managed object, protected by either a hazard pointer,

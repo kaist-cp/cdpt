@@ -146,6 +146,7 @@ pub(crate) struct Local {
     pub(crate) hazards: EbrAtomic<[MaybeUninit<AtomicPtr<()>>]>,
 
     /// The function pointers to mark each HP-protected object.
+    #[allow(clippy::type_complexity)]
     hazards_marker: UnsafeCell<Vec<Option<unsafe fn(*mut ())>>>,
 
     /// A stealer handle for `mark_tasks`.
@@ -329,7 +330,7 @@ impl Local {
 
         unsafe {
             ptr::copy(old_ref.as_ptr(), new.deref_mut().as_mut_ptr(), half);
-            ptr::write_bytes(new.deref_mut().as_mut_ptr().offset(half as _), 0, half);
+            ptr::write_bytes(new.deref_mut().as_mut_ptr().add(half), 0, half);
         }
         self.hazards.store(new, Ordering::Release);
 
@@ -374,7 +375,7 @@ impl Local {
 
         let alloc_count = self.alloc_count.get() + 1;
         self.alloc_count.set(alloc_count);
-        if alloc_count % ALLOC_HELPING_PERIOD == 0 {
+        if alloc_count.is_multiple_of(ALLOC_HELPING_PERIOD) {
             guard.help_collect();
         }
 
@@ -475,12 +476,12 @@ impl Local {
         let task = Task::new(|| obj.mark(&pin()));
         unsafe {
             self.record_mt_modification();
-            (&mut *self.mark_tasks.get()).push(task);
+            (&*self.mark_tasks.get()).push(task);
         }
 
         let sched_count = self.sched_count.get() + 1;
         self.sched_count.set(sched_count);
-        if sched_count % SCHED_HELPING_PERIOD == 0 {
+        if sched_count.is_multiple_of(SCHED_HELPING_PERIOD) {
             guard.help_draining_mark_tasks();
         }
     }
@@ -522,10 +523,10 @@ impl Local {
     ) -> &'g FxHashSet<*mut ()> {
         unsafe {
             let hazards = &mut *self.cached_hazards.get();
-            if let Some((hazards, prev_epoch)) = hazards {
-                if *prev_epoch == guard.local_epoch() {
-                    return hazards;
-                }
+            if let Some((hazards, prev_epoch)) = hazards
+                && *prev_epoch == guard.local_epoch()
+            {
+                return hazards;
             }
         }
         let new_hazards = global().collect_hps(ebr_guard);
