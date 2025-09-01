@@ -221,7 +221,7 @@ impl Guard {
         }
 
         let ebr_guard = &ebr_pin();
-        let hazards = LazyCell::new(|| self.local().scan_or_reuse_hazards(self));
+        let hazards = LazyCell::new(|| self.local().scan_or_reuse_hazards(self, ebr_guard));
         let mut trial_count = 0;
 
         for q_idx in self.local().generate_shard_permut() {

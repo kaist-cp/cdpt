@@ -69,7 +69,7 @@ fn scan_allocated_objs(handle: &Handle) {
     }
 
     // Scan HPs first. And they will be marked during the RC scan.
-    let hazards = global().collect_hps();
+    let hazards = global().collect_hps(ebr_guard);
 
     // Scan all freshly allocated objects (in `fresh_objs`)
     // and mark protected ones (moving to `marked_objs`).

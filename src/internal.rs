@@ -6,12 +6,16 @@ use crate::sync::{Entry, Queue, ReusableSlots, fence};
 use crate::task::Task;
 use crate::{global, pin};
 use crossbeam::deque::{Injector, Stealer, Worker};
-use crossbeam::epoch::pin as ebr_pin;
+use crossbeam::epoch::{
+    Atomic as EbrAtomic, Guard as EbrGuard, Owned as EbrOwned, pin as ebr_pin, unprotected,
+};
 use crossbeam::utils::CachePadded;
 use fastrand::Rng;
 use rustc_hash::FxHashSet;
 use std::array::from_fn;
 use std::cell::{Cell, UnsafeCell};
+use std::mem::MaybeUninit;
+use std::ops::DerefMut;
 use std::ptr;
 use std::rc::Rc;
 use std::sync::atomic::{self, AtomicBool, AtomicPtr, AtomicUsize, Ordering};
@@ -19,8 +23,7 @@ use std::thread::spawn;
 
 const OBJ_BATCHES_SHARD: usize = 8;
 pub(crate) const OBJ_BATCH_SIZE: usize = 64;
-/// TODO: Make it resizable. We might need a dedicated SMR (e.g., EBR, HP).
-const HAZARDS_COUNT: usize = 8;
+const HAZARDS_INIT_COUNT: usize = 8;
 const ALLOC_HELPING_PERIOD: usize = 64;
 const SCHED_HELPING_PERIOD: usize = OBJ_BATCH_SIZE / 2;
 
@@ -100,10 +103,15 @@ impl Global {
         }
     }
 
-    pub(crate) fn collect_hps(&self) -> FxHashSet<*mut ()> {
+    pub(crate) fn collect_hps(&self, ebr_guard: &EbrGuard) -> FxHashSet<*mut ()> {
         self.locals
             .iter_using()
-            .flat_map(|local| local.hazards.iter().map(|hp| hp.load(Ordering::Relaxed)))
+            .flat_map(|local| {
+                let hazards = local.hazards.load(Ordering::Acquire, ebr_guard);
+                unsafe { hazards.deref() }
+                    .iter()
+                    .map(|hp| unsafe { hp.assume_init_ref() }.load(Ordering::Relaxed))
+            })
             .collect::<_>()
     }
 }
@@ -132,10 +140,13 @@ pub(crate) struct Local {
     pub(crate) is_helping_draining_mark_tasks: Cell<bool>,
 
     /// A single-writer multiple-reader list of protected pointers.
-    pub(crate) hazards: [AtomicPtr<()>; HAZARDS_COUNT],
+    ///
+    /// The owning thread may resize and defer destruction of the old hazards.
+    /// Therefore, a collector must access this array with an EBR guard.
+    pub(crate) hazards: EbrAtomic<[MaybeUninit<AtomicPtr<()>>]>,
 
     /// The function pointers to mark each HP-protected object.
-    hazards_marker: [Cell<Option<unsafe fn(*mut ())>>; HAZARDS_COUNT],
+    hazards_marker: UnsafeCell<Vec<Option<unsafe fn(*mut ())>>>,
 
     /// A stealer handle for `mark_tasks`.
     pub(crate) mark_tasks_stealer: Stealer<Task>,
@@ -174,6 +185,14 @@ impl Default for Local {
     fn default() -> Self {
         let mark_tasks = Worker::new_fifo();
         let stealer = mark_tasks.stealer();
+
+        let mut hazards: EbrOwned<[MaybeUninit<AtomicPtr<()>>]> =
+            EbrOwned::init(HAZARDS_INIT_COUNT);
+        let slots = hazards.deref_mut();
+        unsafe {
+            ptr::write_bytes(slots.as_mut_ptr(), 0, slots.len());
+        }
+
         Self {
             guard_count: Cell::new(0),
             last_observed: Cell::new(Epoch::starting()),
@@ -182,12 +201,12 @@ impl Default for Local {
             is_helping_normal: Cell::new(false),
             is_helping_root_tracing: Cell::new(false),
             is_helping_draining_mark_tasks: Cell::new(false),
-            hazards: [const { AtomicPtr::new(ptr::null_mut()) }; HAZARDS_COUNT],
-            hazards_marker: [const { Cell::new(None) }; HAZARDS_COUNT],
+            hazards: EbrAtomic::from(hazards),
+            hazards_marker: UnsafeCell::new(vec![None; HAZARDS_INIT_COUNT]),
             mark_tasks_stealer: stealer,
             epoch: CachePadded::new(AtomicEpoch::new(Epoch::starting())),
             mt_modified_ts: CachePadded::new(AtomicUsize::new(0)),
-            available_hids: UnsafeCell::new((0..HAZARDS_COUNT).collect()),
+            available_hids: UnsafeCell::new((0..HAZARDS_INIT_COUNT).collect()),
             rng: UnsafeCell::new(Rng::new()),
             objs: [UnsafeCell::default(), UnsafeCell::default()],
             mark_tasks: UnsafeCell::new(mark_tasks),
@@ -268,12 +287,18 @@ impl Local {
     /// Execute the phase barrier for this local thread.
     #[inline]
     pub(crate) fn phase_barrier(&self) {
-        for (hp, mark) in self.hazards.iter().zip(self.hazards_marker.iter()) {
-            let ptr = hp.load(Ordering::Relaxed);
+        // Safety of `unprotected`: It is always safe to access my own hazard vector.
+        // This is because other threads never attempt to change this hazard vector.
+        let hazards = self
+            .hazards
+            .load(Ordering::Acquire, unsafe { unprotected() });
+        let hazards_marker = unsafe { &*self.hazards_marker.get() };
+        for (hp, mark) in unsafe { hazards.deref() }.iter().zip(hazards_marker.iter()) {
+            let ptr = unsafe { hp.assume_init_ref() }.load(Ordering::Relaxed);
             if ptr.is_null() {
                 continue;
             }
-            let mark = mark.get().unwrap();
+            let mark = mark.unwrap();
             unsafe { mark(ptr) };
         }
     }
@@ -281,9 +306,35 @@ impl Local {
     #[inline]
     pub(crate) fn acquire_hp(&self) -> usize {
         let Some(hid) = (unsafe { (*self.available_hids.get()).pop() }) else {
-            unimplemented!("implement growable HP");
+            self.grow_hazards();
+            return unsafe { (*self.available_hids.get()).pop() }.unwrap();
         };
         hid
+    }
+
+    #[cold]
+    pub(crate) fn grow_hazards(&self) {
+        let ebr_guard = &ebr_pin();
+        let old_sh = self.hazards.load(Ordering::Relaxed, ebr_guard);
+        let old_ref = unsafe { old_sh.deref() };
+        let mut new: EbrOwned<[MaybeUninit<AtomicPtr<()>>]> = EbrOwned::init(old_ref.len() * 2);
+        let half = old_ref.len();
+
+        unsafe {
+            ptr::copy(old_ref.as_ptr(), new.deref_mut().as_mut_ptr(), half);
+            ptr::write_bytes(new.deref_mut().as_mut_ptr().offset(half as _), 0, half);
+        }
+        self.hazards.store(new, Ordering::Release);
+
+        unsafe {
+            // FIXME: crossbeam-epoch's `defer_destroy` does not allow unsized types,
+            // but defering its destruction is actually safe. Replace the following line
+            // with `defer_destroy` once the following patch is accepted:
+            // https://github.com/crossbeam-rs/crossbeam/pull/1201
+            ebr_guard.defer_unchecked(move || old_sh.into_owned());
+            (*self.hazards_marker.get()).resize(old_ref.len() * 2, None);
+            (*self.available_hids.get()).extend(half..(half * 2));
+        }
     }
 
     #[inline]
@@ -457,7 +508,11 @@ impl Local {
     }
 
     #[inline]
-    pub(crate) fn scan_or_reuse_hazards<'g>(&self, guard: &'g Guard) -> &'g FxHashSet<*mut ()> {
+    pub(crate) fn scan_or_reuse_hazards<'g>(
+        &self,
+        guard: &'g Guard,
+        ebr_guard: &EbrGuard,
+    ) -> &'g FxHashSet<*mut ()> {
         unsafe {
             let hazards = &mut *self.cached_hazards.get();
             if let Some((hazards, prev_epoch)) = hazards {
@@ -466,7 +521,7 @@ impl Local {
                 }
             }
         }
-        let new_hazards = global().collect_hps();
+        let new_hazards = global().collect_hps(ebr_guard);
         unsafe {
             let hazards = &mut *self.cached_hazards.get();
             *hazards = Some((new_hazards, guard.local_epoch()));
@@ -492,30 +547,39 @@ impl HazardPointer {
             unsafe { ptr.deref().mark(&pin()) };
         }
 
+        self.hazard_slot()
+            .store(addr.as_ptr().cast(), Ordering::Release);
+
         unsafe {
             let local = self.local.as_ref();
-            local
-                .hazards
-                .get_unchecked(self.hid)
-                .store(addr.as_ptr().cast(), Ordering::Release);
-
-            let marker_ref = local.hazards_marker.get_unchecked(self.hid);
-            if addr.is_null() {
-                marker_ref.set(None);
+            let marker_ref = (&mut *local.hazards_marker.get()).get_unchecked_mut(self.hid);
+            *marker_ref = if addr.is_null() {
+                None
             } else {
-                marker_ref.set(Some(mark::<T>));
+                Some(mark::<T>)
             };
         }
     }
 
     pub(crate) fn clear(&self) {
+        self.hazard_slot().store(ptr::null_mut(), Ordering::Release);
         unsafe {
             let local = self.local.as_ref();
-            local
+            *(&mut *local.hazards_marker.get()).get_unchecked_mut(self.hid) = None;
+        }
+    }
+
+    fn hazard_slot(&self) -> &AtomicPtr<()> {
+        // Safety of `unprotected`: It is always safe to access my own hazard vector.
+        // This is because other threads never attempt to destroy this hazard vector.
+        unsafe {
+            self.local
+                .as_ref()
                 .hazards
+                .load(Ordering::Relaxed, unprotected())
+                .deref()
                 .get_unchecked(self.hid)
-                .store(ptr::null_mut(), Ordering::Release);
-            local.hazards_marker.get_unchecked(self.hid).set(None);
+                .assume_init_ref()
         }
     }
 }
