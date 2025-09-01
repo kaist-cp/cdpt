@@ -14,7 +14,7 @@ use fastrand::Rng;
 use rustc_hash::FxHashSet;
 use std::array::from_fn;
 use std::cell::{Cell, UnsafeCell};
-use std::mem::MaybeUninit;
+use std::mem::{MaybeUninit, take};
 use std::ops::DerefMut;
 use std::ptr;
 use std::rc::Rc;
@@ -179,6 +179,13 @@ pub(crate) struct Local {
 
     /// A previously collected hazards that may be reused for later helpings.
     pub(crate) cached_hazards: UnsafeCell<Option<(FxHashSet<*mut ()>, Epoch)>>,
+}
+
+impl Drop for Local {
+    fn drop(&mut self) {
+        // This is called when an insertion fails in `reusable_slot.rs`.
+        unsafe { take(&mut self.hazards).into_owned() };
+    }
 }
 
 impl Default for Local {
