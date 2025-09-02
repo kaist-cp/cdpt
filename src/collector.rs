@@ -62,9 +62,14 @@ fn scan_allocated_objs(handle: &Handle) {
         .iter_all()
         .flat_map(|local| unsafe { local.take_obj_batch(guard.white_color() as usize) });
 
-    for obj in pending {
-        global().fresh_objs[guard.white_color() as usize][handle.local().select_obj_shard()]
-            .push(obj, ebr_guard);
+    for (batch, size_bytes) in pending {
+        global().push_fresh_objs(
+            batch,
+            size_bytes,
+            guard.white_color(),
+            handle.local().select_obj_shard(),
+            ebr_guard,
+        );
     }
 
     // Scan HPs first. And they will be marked during the RC scan.
@@ -75,7 +80,7 @@ fn scan_allocated_objs(handle: &Handle) {
     for q_idx in handle.local().generate_shard_permut() {
         let fresh_q = &global().fresh_objs[guard.white_color() as usize][q_idx];
         while let Some(batch) = fresh_q.try_pop(ebr_guard) {
-            for obj in &batch.0 {
+            for obj in batch.iter() {
                 if obj.root_count() > 0 || hazards.contains(&obj.address()) {
                     obj.mark(&guard);
                 }
@@ -205,23 +210,29 @@ fn sweep(prev_white: Color, handle: &Handle, _logger: &Logger) {
     for q_idx in handle.local().generate_shard_permut() {
         let marked_q = &global().marked_objs[prev_white as usize][q_idx];
         while let Some(batch) = marked_q.try_pop(guard) {
-            for obj in batch.0 {
+            let mut reclaimed_bytes = 0;
+            for obj in batch.into_iter() {
                 if prev_white == obj.color() {
+                    reclaimed_bytes += size_of_val(&*obj);
                     drop(obj);
                     continue;
                 }
-                if let Err(e) = survived_batch.0.push_within_capacity(obj) {
+                if let Err(e) = survived_batch.push_within_capacity(obj) {
                     let full = take(&mut survived_batch);
                     let next_white = prev_white.flip() as usize;
                     let shard = handle.local().select_obj_shard();
                     global().fresh_objs[next_white][shard].push(full, guard);
-                    assert!(survived_batch.0.push_within_capacity(e).is_ok());
+                    assert!(survived_batch.push_within_capacity(e).is_ok());
                 }
             }
+            global()
+                .stats
+                .total_reclaimed
+                .fetch_add(reclaimed_bytes, Ordering::Release);
         }
     }
 
-    if !survived_batch.0.is_empty() {
+    if !survived_batch.is_empty() {
         let next_white = prev_white.flip() as usize;
         let shard = handle.local().select_obj_shard();
         global().fresh_objs[next_white][shard].push(survived_batch, guard);

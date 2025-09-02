@@ -138,13 +138,19 @@ impl Guard {
             let marked_q = &global().marked_objs[prev_white as usize][q_idx];
 
             while let Some(batch) = marked_q.try_pop(ebr_guard) {
-                for obj in batch.0 {
+                let mut reclaimed_bytes = 0;
+                for obj in batch.into_iter() {
                     if prev_white == obj.color() {
+                        reclaimed_bytes += size_of_val(&*obj);
                         drop(obj);
                         continue;
                     }
-                    unsafe { self.local().push_fresh_obj(obj) };
+                    unsafe { self.local().push_fresh_obj(obj, false) };
                 }
+                global()
+                    .stats
+                    .total_reclaimed
+                    .fetch_add(reclaimed_bytes, Ordering::Release);
 
                 trial_count += 1;
                 if trial_count >= HELP_NORMAL_MAX_TRIAL {
@@ -227,7 +233,7 @@ impl Guard {
         for q_idx in self.local().generate_shard_permut() {
             let fresh_q = &global().fresh_objs[self.white_color() as usize][q_idx];
             while let Some(batch) = fresh_q.try_pop(ebr_guard) {
-                for obj in &batch.0 {
+                for obj in batch.iter() {
                     if obj.root_count() > 0 || hazards.contains(&obj.address()) {
                         obj.mark(self);
                     }

@@ -35,6 +35,9 @@ pub struct Global {
     /// The global epoch.
     pub(crate) epoch: CachePadded<AtomicEpoch>,
 
+    /// The global statistics data.
+    pub(crate) stats: GlobalStats,
+
     /// `fresh_objs` and `marked_objs`: the global sharded object lists.
     ///
     /// The first index represents the allocation color when the object is allocated.
@@ -48,10 +51,29 @@ pub struct Global {
     collector_init: CachePadded<AtomicBool>,
 }
 
+/// FIXME: This may be very inaccurate for some types that internally allocate unmanaged memory.
+/// E.g., `String`'s size will be measured as 24 bytes,
+/// but its actual memory usage depends on the size of buffer.
+pub(crate) struct GlobalStats {
+    /// Total allocated memory (bytes) since the beginning of the program.
+    pub(crate) total_allocated: CachePadded<AtomicUsize>,
+    /// Total reclaimed memory (bytes) since the beginning of the program.
+    pub(crate) total_reclaimed: CachePadded<AtomicUsize>,
+}
+
+impl Default for GlobalStats {
+    fn default() -> Self {
+        Self {
+            total_allocated: CachePadded::new(AtomicUsize::new(0)),
+            total_reclaimed: CachePadded::new(AtomicUsize::new(0)),
+        }
+    }
+}
+
 unsafe impl Sync for Global {}
 unsafe impl Send for Global {}
 
-pub(crate) struct ObjBatch(pub Vec<Box<dyn MarkObj>>);
+pub(crate) struct ObjBatch(Vec<Box<dyn MarkObj>>);
 
 impl Default for ObjBatch {
     fn default() -> Self {
@@ -63,6 +85,22 @@ impl ObjBatch {
     pub fn with_capacity(capacity: usize) -> Self {
         Self(Vec::with_capacity(capacity))
     }
+
+    pub fn push_within_capacity(&mut self, item: Box<dyn MarkObj>) -> Result<(), Box<dyn MarkObj>> {
+        self.0.push_within_capacity(item)
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = &Box<dyn MarkObj>> {
+        self.0.iter()
+    }
+
+    pub fn into_iter(self) -> impl Iterator<Item = Box<dyn MarkObj>> {
+        self.0.into_iter()
+    }
 }
 
 impl Global {
@@ -72,6 +110,7 @@ impl Global {
         Self {
             locals: CachePadded::new(ReusableSlots::default()),
             epoch: CachePadded::new(AtomicEpoch::new(Epoch::starting())),
+            stats: GlobalStats::default(),
             fresh_objs: from_fn(|_| from_fn(|_| Queue::new())),
             marked_objs: from_fn(|_| from_fn(|_| Queue::new())),
             mark_tasks: Injector::new(),
@@ -113,6 +152,31 @@ impl Global {
                     .map(|hp| unsafe { hp.assume_init_ref() }.load(Ordering::Relaxed))
             })
             .collect::<_>()
+    }
+
+    pub(crate) fn push_fresh_objs(
+        &self,
+        batch: ObjBatch,
+        size_bytes: usize,
+        alloc_color: Color,
+        shard_index: usize,
+        ebr_guard: &EbrGuard,
+    ) {
+        unsafe {
+            self.fresh_objs
+                .get_unchecked(alloc_color as usize)
+                .get_unchecked(shard_index)
+                .push(batch, ebr_guard);
+            self.stats
+                .total_allocated
+                .fetch_add(size_bytes, Ordering::Release);
+        }
+    }
+
+    pub fn estimate_heap_usage(&self) -> usize {
+        let allocated = self.stats.total_allocated.load(Ordering::Acquire);
+        let reclaimed = self.stats.total_reclaimed.load(Ordering::Acquire);
+        allocated.saturating_sub(reclaimed)
     }
 }
 
@@ -173,7 +237,7 @@ pub(crate) struct Local {
     /// can take the object list of the previous normal phase without breaking lock-freedom of
     /// mutators, because the mutator can still modify its black object list during RT & CT phase
     /// while the collector accesses the white object list, which is from the previous N phase.
-    pub(crate) objs: [UnsafeCell<ObjBatch>; 2],
+    pub(crate) objs: [UnsafeCell<(ObjBatch, usize)>; 2],
 
     /// A local mark queue.
     pub(crate) mark_tasks: UnsafeCell<Worker<Task>>,
@@ -371,7 +435,7 @@ impl Local {
         let b = Box::new(obj);
         let ptr = ((&*b) as *const ManObj<T>).cast_mut();
         let b_dyn: Box<dyn MarkObj> = b;
-        unsafe { self.push_fresh_obj(b_dyn) };
+        unsafe { self.push_fresh_obj(b_dyn, true) };
 
         let alloc_count = self.alloc_count.get() + 1;
         self.alloc_count.set(alloc_count);
@@ -386,14 +450,18 @@ impl Local {
     ///
     /// The thread must be properly pinned.
     #[inline]
-    pub(crate) unsafe fn push_fresh_obj(&self, mut obj: Box<dyn MarkObj>) {
+    pub(crate) unsafe fn push_fresh_obj(&self, mut obj: Box<dyn MarkObj>, newly_allocated: bool) {
+        let obj_size = size_of_val(&*obj);
         let objs_index = unsafe { self.pinned_alloc_color() } as usize;
         loop {
-            match unsafe { &mut *self.objs[objs_index].get() }
-                .0
-                .push_within_capacity(obj)
-            {
-                Ok(_) => break,
+            let slot = unsafe { &mut *self.objs[objs_index].get() };
+            match slot.0.push_within_capacity(obj) {
+                Ok(_) => {
+                    if newly_allocated {
+                        slot.1 += obj_size;
+                    }
+                    break;
+                }
                 Err(e) => {
                     obj = e;
                     unsafe { self.flush_objs() };
@@ -423,14 +491,14 @@ impl Local {
     /// 2. The collector during RT phase has exclusive write permissions for the current
     ///    `white_color` index, for every mutator's allocation list.
     #[inline]
-    pub(crate) unsafe fn take_obj_batch(&self, index: usize) -> Option<ObjBatch> {
-        let batch = unsafe {
+    pub(crate) unsafe fn take_obj_batch(&self, index: usize) -> Option<(ObjBatch, usize)> {
+        let batch_and_size = unsafe {
             if (&*self.objs[index].get()).0.is_empty() {
                 return None;
             }
             ptr::replace(self.objs[index].get(), Default::default())
         };
-        Some(batch)
+        Some(batch_and_size)
     }
 
     /// # Safety
@@ -438,17 +506,18 @@ impl Local {
     /// The thread must be properly pinned.
     #[inline]
     pub(crate) unsafe fn flush_objs(&self) {
-        let index = unsafe { self.pinned_alloc_color() } as usize;
-        let Some(batch) = (unsafe { self.take_obj_batch(index) }) else {
+        let alloc_color = unsafe { self.pinned_alloc_color() };
+        let index = alloc_color as usize;
+        let Some((batch, size_bytes)) = (unsafe { self.take_obj_batch(index) }) else {
             return;
         };
-        unsafe {
-            global()
-                .fresh_objs
-                .get_unchecked(index)
-                .get_unchecked(self.select_obj_shard())
-                .push(batch, &ebr_pin());
-        }
+        global().push_fresh_objs(
+            batch,
+            size_bytes,
+            alloc_color,
+            self.select_obj_shard(),
+            &ebr_pin(),
+        );
     }
 
     /// # Safety
