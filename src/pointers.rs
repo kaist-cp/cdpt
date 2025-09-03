@@ -495,11 +495,11 @@ impl<T: 'static + Send + Sync + TraceObj> AtomicShared<T> {
                     PtrMeta::Unrooted(_) => old = current,
                 },
             }
-        }
 
-        // We just want to re-check the trivial failure case.
-        if old.without_meta() != current.as_man_ptr() {
-            return Err(Local::from_raw(old, guard));
+            // We just want to re-check the trivial failure case.
+            if old.without_meta() != current.as_man_ptr() {
+                return Err(Local::from_raw(old, guard));
+            }
         }
 
         // If the source is unrooted, we focus on the `Unrooted` case only from now on.

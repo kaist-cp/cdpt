@@ -211,7 +211,7 @@ impl Guard {
     #[inline]
     pub fn help_draining_mark_tasks_inner(&self) {
         let mt_len = unsafe { &*self.local().mark_tasks.get() }.len();
-        for _ in 0..(mt_len.min(OBJ_BATCH_SIZE / 2)) {
+        for _ in 0..((mt_len / 2).max(OBJ_BATCH_SIZE / 2)) {
             if let Some(task) = self.try_pop_mark_task() {
                 task.call();
                 continue;

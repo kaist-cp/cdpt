@@ -25,7 +25,8 @@ const OBJ_BATCHES_SHARD: usize = 8;
 pub(crate) const OBJ_BATCH_SIZE: usize = 64;
 const HAZARDS_INIT_COUNT: usize = 8;
 const ALLOC_HELPING_PERIOD: usize = 64;
-const SCHED_HELPING_PERIOD: usize = OBJ_BATCH_SIZE / 2;
+const SCHED_HELPING_PERIOD: usize = 32;
+const LOCAL_MARK_TASKS_CAP: usize = 4096;
 
 /// The global data for a garbage collector.
 pub struct Global {
@@ -543,9 +544,14 @@ impl Local {
     #[inline]
     pub(crate) fn schedule_mark<T: 'static + TraceObj>(&self, obj: &ManObj<T>, guard: &Guard) {
         let task = Task::new(|| obj.mark(&pin()));
-        unsafe {
+        let mark_task = unsafe {
             self.record_mt_modification();
-            (&*self.mark_tasks.get()).push(task);
+            &*self.mark_tasks.get()
+        };
+        if mark_task.len() >= LOCAL_MARK_TASKS_CAP {
+            global().mark_tasks.push(task);
+        } else {
+            mark_task.push(task);
         }
 
         let sched_count = self.sched_count.get() + 1;
@@ -575,10 +581,24 @@ impl Local {
             let tasks = &mut *self.mark_tasks.get();
             if !tasks.is_empty() {
                 // Optimistically assume that we are going to successfully pop the task.
+                // Note that recording after successfully popping the task will be too late.
+                // E.g., In CT phase, a mutator pops the last mark task, and it is stalled
+                // right before recording. In this case, the collector's validation succeeds,
+                // prematurly transitioning to the next normal.
                 self.record_mt_modification();
+                if let Some(task) = tasks.pop() {
+                    return Some(task);
+                }
             }
-            if let Some(task) = tasks.pop() {
-                return Some(task);
+
+            // If we couldn't pop from the local stack, let's try with the global one.
+            if !global().mark_tasks.is_empty() {
+                // Optimistically assume that we are going to successfully pop the task.
+                self.record_mt_modification();
+                return global()
+                    .mark_tasks
+                    .steal_batch_with_limit_and_pop(tasks, LOCAL_MARK_TASKS_CAP / 2)
+                    .success();
             }
         }
         None
