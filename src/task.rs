@@ -3,6 +3,8 @@ use core::mem::{self, MaybeUninit};
 use core::ptr;
 use std::mem::forget;
 
+use crate::Guard;
+
 /// Number of words a piece of `Data` can hold.
 const DATA_WORDS: usize = 1;
 
@@ -13,7 +15,7 @@ type Data = [usize; DATA_WORDS];
 ///
 /// This is a handy way of keeping an unsized `FnOnce()` within a sized structure.
 pub(crate) struct Task {
-    call: unsafe fn(*mut u8),
+    call: unsafe fn(*mut u8, &Guard),
     data: MaybeUninit<Data>,
     _marker: PhantomData<*mut ()>, // !Send + !Sync
 }
@@ -22,7 +24,7 @@ unsafe impl Send for Task {}
 
 impl Task {
     /// Constructs a new `Task` from a `FnOnce()`.
-    pub(crate) fn new<F: FnOnce()>(f: F) -> Self {
+    pub(crate) fn new<F: FnOnce(&Guard)>(f: F) -> Self {
         let size = mem::size_of::<F>();
         let align = mem::align_of::<F>();
 
@@ -34,9 +36,9 @@ impl Task {
             let mut data = MaybeUninit::<Data>::uninit();
             ptr::write(data.as_mut_ptr().cast::<F>(), f);
 
-            unsafe fn call<F: FnOnce()>(raw: *mut u8) {
+            unsafe fn call<F: FnOnce(&Guard)>(raw: *mut u8, guard: &Guard) {
                 let f: F = unsafe { ptr::read(raw.cast::<F>()) };
-                f();
+                f(guard);
             }
 
             Self {
@@ -49,9 +51,9 @@ impl Task {
 
     /// Calls the function.
     #[inline]
-    pub(crate) fn call(mut self) {
+    pub(crate) fn call(mut self, guard: &Guard) {
         let call = self.call;
-        unsafe { call(self.data.as_mut_ptr().cast::<u8>()) };
+        unsafe { call(self.data.as_mut_ptr().cast::<u8>(), guard) };
         forget(self);
     }
 }
@@ -65,18 +67,19 @@ impl Drop for Task {
 #[cfg(test)]
 mod tests {
     use super::Task;
+    use crate::pin;
     use std::cell::Cell;
 
     #[test]
     fn single_word_data() {
         let fired = &Cell::new(false);
 
-        let d = Task::new(move || {
+        let d = Task::new(move |_| {
             fired.set(true);
         });
 
         assert!(!fired.get());
-        d.call();
+        d.call(&pin());
         assert!(fired.get());
     }
 }

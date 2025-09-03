@@ -1,5 +1,14 @@
 use crossbeam::{epoch::pin as ebr_pin, utils::Backoff};
-use std::{iter::repeat_with, mem::take, sync::atomic::Ordering};
+use std::{
+    iter::repeat_with,
+    mem::take,
+    sync::{
+        LazyLock, RwLock,
+        atomic::{AtomicUsize, Ordering},
+    },
+    thread::{sleep, spawn},
+    time::{Duration, Instant},
+};
 
 use crate::{
     Handle,
@@ -13,19 +22,182 @@ use crate::{
 
 use log::Logger;
 
+#[derive(Clone)]
+struct HeartbeatStats {
+    measured_time: Instant,
+    heap_usage: usize,
+    total_alloc: usize,
+    alloc_per_ms: usize,
+    alloc_per_ms_smooth: usize,
+}
+
+struct CollectionStats {
+    reclm_per_ms_smooth: AtomicUsize,
+    coll_time_ms_smooth: AtomicUsize,
+    desired_heap_limit: AtomicUsize,
+}
+
+static HBSTATS: LazyLock<RwLock<HeartbeatStats>> = LazyLock::new(|| {
+    RwLock::new(HeartbeatStats {
+        measured_time: Instant::now(),
+        heap_usage: 0,
+        total_alloc: 0,
+        alloc_per_ms: 0,
+        alloc_per_ms_smooth: 0,
+    })
+});
+
+static CSTATS: CollectionStats = CollectionStats {
+    reclm_per_ms_smooth: AtomicUsize::new(0),
+    coll_time_ms_smooth: AtomicUsize::new(0),
+    desired_heap_limit: AtomicUsize::new(0),
+};
+
+const HEARTBEAT_PERIOD_MS: u64 = 500;
+const ALLOC_PER_MS_SMOOTH_FACTOR: f64 = 0.5;
+const RECLM_PER_MS_SMOOTH_FACTOR: f64 = 0.5;
+const COLL_TIME_MS_SMOOTH_FACTOR: f64 = 0.5;
+const EXTRA_TUNING_FACTOR: usize = 10;
+
 /// A function body for the primary collector thread.
 pub(crate) fn collector_loop() {
     let handle = handle();
     let logger = Logger::new();
-    let backoff = Backoff::new();
+
+    // Initialize stats data and spawn the heartbeat thread that periodically samples heap stats.
+    {
+        let mut stats = HBSTATS.write().unwrap();
+        stats.total_alloc = global().estimate_total_alloc();
+    }
+    spawn(heartbeat_loop);
 
     loop {
+        let backoff = Backoff::new();
         while !is_collection_necessary() {
             backoff.snooze();
         }
+
+        let start = Instant::now();
+        let recl_at_start = global().estimate_total_reclm();
+
+        // Do actual collection works.
         logger.measure("RT", || root_tracing(&handle, &logger));
         while logger.measure("CT", || !completion_tracing(&handle, &logger)) {}
         logger.measure("N", || next_normal(&handle, &logger));
+
+        record_collection_stats(start, recl_at_start);
+    }
+}
+
+fn heartbeat_loop() {
+    loop {
+        sleep(Duration::from_millis(HEARTBEAT_PERIOD_MS));
+        heartbeat();
+    }
+}
+
+fn heartbeat() -> HeartbeatStats {
+    let mut stats = HBSTATS.write().unwrap();
+    let now = Instant::now();
+    let dur = now - stats.measured_time;
+
+    if dur.as_millis() == 0 {
+        // Very low chance, but possible...
+        return stats.clone();
+    }
+
+    let new_total_alloc = global().estimate_total_alloc();
+    let new_total_reclm = global().estimate_total_reclm();
+    let alloc_diff = new_total_alloc - stats.total_alloc;
+    let new_alloc_per_ms = alloc_diff / (dur.as_millis() as usize);
+
+    let prev_alloc_per_ms_smooth = stats.alloc_per_ms_smooth;
+    let new_alloc_per_ms_smooth = smooth(
+        ALLOC_PER_MS_SMOOTH_FACTOR,
+        prev_alloc_per_ms_smooth,
+        new_alloc_per_ms,
+    );
+
+    stats.measured_time = now;
+    stats.total_alloc = new_total_alloc;
+    stats.heap_usage = new_total_alloc - new_total_reclm;
+    stats.alloc_per_ms = new_alloc_per_ms;
+    stats.alloc_per_ms_smooth = new_alloc_per_ms_smooth;
+
+    // TODO: Small profiling code. Remove later...
+    // fn readable_bytes(num: usize) -> String {
+    //     const UNITS: [&str; 4] = ["B", "KiB", "MiB", "GiB"];
+    //     for (i, unit) in UNITS.iter().enumerate() {
+    //         if num / 2usize.pow(i as u32 * 10) < 1000 {
+    //             return format!("{:.3} {}", num as f64 / 2f64.powf(i as f64 * 10.0), unit);
+    //         }
+    //     }
+    //     format!(
+    //         "{:.3} {}",
+    //         num as f64 / 2f64.powf((UNITS.len() - 1) as f64 * 10.0),
+    //         UNITS.last().unwrap()
+    //     )
+    // }
+    // println!(
+    //     "heap_usage: {}, total_alloc: {}, alloc_per_ms: {}, alloc_per_ms (smooth): {} / reclm_per_ms (smooth): {} / heap_limit: {}",
+    //     readable_bytes(new_total_alloc - new_total_reclm),
+    //     readable_bytes(new_total_alloc),
+    //     readable_bytes(new_alloc_per_ms),
+    //     readable_bytes(new_alloc_per_ms_smooth),
+    //     readable_bytes(CSTATS.reclm_per_ms_smooth.load(Ordering::Relaxed)),
+    //     readable_bytes(CSTATS.desired_heap_limit.load(Ordering::Relaxed))
+    // );
+
+    stats.clone()
+}
+
+fn record_collection_stats(start: Instant, recl_at_start: usize) {
+    let end = Instant::now();
+    let alloc_at_end = global().estimate_total_alloc();
+    let recl_at_end = global().estimate_total_reclm();
+
+    let prev_coll_time_ms = CSTATS.coll_time_ms_smooth.load(Ordering::Relaxed);
+    let curr_coll_time_ms = (end - start).as_millis() as usize;
+    let new_coll_time_ms = smooth(
+        COLL_TIME_MS_SMOOTH_FACTOR,
+        prev_coll_time_ms,
+        curr_coll_time_ms,
+    );
+
+    let prev_reclm_rate = CSTATS.reclm_per_ms_smooth.load(Ordering::Relaxed);
+    let curr_reclm_rate =
+        (((recl_at_end - recl_at_start) as f64) / (curr_coll_time_ms as f64)) as usize;
+    let new_reclm_rate = smooth(RECLM_PER_MS_SMOOTH_FACTOR, prev_reclm_rate, curr_reclm_rate);
+
+    let hbstats = heartbeat();
+
+    // Calculate the desired heap limit (Membalancer).
+    let heap_usage = alloc_at_end - recl_at_end;
+    let extra = if new_reclm_rate == 0 {
+        global().locals.active_count() * 1024 * 1024 * 1 // 1MB per thread
+    } else {
+        ((heap_usage * hbstats.alloc_per_ms_smooth / new_reclm_rate / EXTRA_TUNING_FACTOR) as f64)
+            .sqrt() as usize
+    };
+    let desired_heap_limit = heap_usage + extra;
+
+    CSTATS
+        .reclm_per_ms_smooth
+        .store(new_reclm_rate, Ordering::Relaxed);
+    CSTATS
+        .coll_time_ms_smooth
+        .store(new_coll_time_ms, Ordering::Relaxed);
+    CSTATS
+        .desired_heap_limit
+        .store(desired_heap_limit, Ordering::Relaxed);
+}
+
+fn smooth(factor: f64, prev: usize, curr: usize) -> usize {
+    if prev == 0 {
+        // If the previos value was 0, we do not smooth.
+        curr
+    } else {
+        (factor * (prev as f64) + (1.0 - factor) * (curr as f64)) as usize
     }
 }
 
@@ -149,10 +321,11 @@ fn try_confirm_completion() -> bool {
 
 /// Returns `true` if it executed something.
 fn drain_mark_tasks(handle: &Handle) -> bool {
+    let guard = &handle.pin();
     let mut executed = false;
     while let Some(task) = find_task(handle) {
         executed = true;
-        task.call();
+        task.call(guard);
     }
     executed
 }
@@ -255,8 +428,36 @@ fn wait_all_mutators_unpin(new_ts: usize) {
 }
 
 fn is_collection_necessary() -> bool {
-    // TODO: How long should it sleep? Heuristic. E.g., MemBalancer
-    true
+    if !global().collection_enabled.load(Ordering::SeqCst) {
+        // The user manually turned the collection off.
+        CSTATS.desired_heap_limit.store(0, Ordering::Relaxed);
+        return false;
+    }
+
+    let hbstats = HBSTATS.read().unwrap();
+
+    let reclm_per_ms_smooth = CSTATS.reclm_per_ms_smooth.load(Ordering::Relaxed);
+    let heap_usage = global().estimate_heap_usage();
+    let heap_limit = CSTATS.desired_heap_limit.load(Ordering::Relaxed);
+
+    if heap_limit < heap_usage {
+        return true;
+    }
+
+    let pure_alloc_rate = hbstats.alloc_per_ms_smooth as isize - reclm_per_ms_smooth as isize;
+    if pure_alloc_rate < 0 {
+        return heap_usage >= heap_limit;
+    }
+
+    // Calculate how much time we have before (conceptual) OOM.
+    let pure_alloc_rate = pure_alloc_rate as usize;
+    if pure_alloc_rate == 0 {
+        return false;
+    }
+    let oom_time_ms = (heap_limit - heap_usage) / pure_alloc_rate;
+
+    // We need to start collection if we expect OOM before it ends.
+    oom_time_ms <= CSTATS.coll_time_ms_smooth.load(Ordering::Relaxed)
 }
 
 #[cfg(feature = "logging")]

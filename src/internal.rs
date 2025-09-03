@@ -50,6 +50,9 @@ pub struct Global {
 
     /// The global flag indicating whether the collector is online.
     collector_init: CachePadded<AtomicBool>,
+
+    /// The global flag indicating whether the collection is enabled.
+    pub(crate) collection_enabled: CachePadded<AtomicBool>,
 }
 
 /// FIXME: This may be very inaccurate for some types that internally allocate unmanaged memory.
@@ -116,6 +119,7 @@ impl Global {
             marked_objs: from_fn(|_| from_fn(|_| Queue::new())),
             mark_tasks: Injector::new(),
             collector_init: CachePadded::new(AtomicBool::new(false)),
+            collection_enabled: CachePadded::new(AtomicBool::new(true)),
         }
     }
 
@@ -174,11 +178,44 @@ impl Global {
         }
     }
 
+    pub fn enable_collection(&self, set: bool) {
+        self.collection_enabled.store(set, Ordering::SeqCst);
+    }
+
+    pub fn estimate_total_alloc(&self) -> usize {
+        self.stats.total_allocated.load(Ordering::Acquire)
+    }
+
+    pub fn estimate_total_reclm(&self) -> usize {
+        self.stats.total_reclaimed.load(Ordering::Acquire)
+    }
+
     pub fn estimate_heap_usage(&self) -> usize {
-        let allocated = self.stats.total_allocated.load(Ordering::Acquire);
-        let reclaimed = self.stats.total_reclaimed.load(Ordering::Acquire);
+        let allocated = self.estimate_total_alloc();
+        let reclaimed = self.estimate_total_reclm();
         allocated.saturating_sub(reclaimed)
     }
+
+    // TODO: Remove later...
+    // pub fn mark_stack_sizes(&self) -> Vec<usize> {
+    //     std::iter::once(self.mark_tasks.len())
+    //         .chain(
+    //             self.locals
+    //                 .iter_all()
+    //                 .map(|local| local.mark_tasks_stealer.len()),
+    //         )
+    //         .collect()
+    // }
+
+    // pub fn phase(&self) -> String {
+    //     let epoch = self.load_epoch();
+    //     let p = match epoch.phase() {
+    //         Phase::N => "normal",
+    //         Phase::RT => "root tracing",
+    //         Phase::CT => "completion tracing",
+    //     };
+    //     format!("#{} {p}", epoch.timestamp())
+    // }
 }
 
 /// Participant for garbage collection.
@@ -441,7 +478,7 @@ impl Local {
         let alloc_count = self.alloc_count.get() + 1;
         self.alloc_count.set(alloc_count);
         if alloc_count.is_multiple_of(ALLOC_HELPING_PERIOD) {
-            guard.help_collect();
+            guard.schedule_helping_collect();
         }
 
         ptr
@@ -543,7 +580,7 @@ impl Local {
 
     #[inline]
     pub(crate) fn schedule_mark<T: 'static + TraceObj>(&self, obj: &ManObj<T>, guard: &Guard) {
-        let task = Task::new(|| obj.mark(&pin()));
+        let task = Task::new(|guard| obj.mark(guard));
         let mark_task = unsafe {
             self.record_mt_modification();
             &*self.mark_tasks.get()
@@ -557,7 +594,7 @@ impl Local {
         let sched_count = self.sched_count.get() + 1;
         self.sched_count.set(sched_count);
         if sched_count.is_multiple_of(SCHED_HELPING_PERIOD) {
-            guard.help_draining_mark_tasks();
+            guard.schedule_helping_collect();
         }
     }
 

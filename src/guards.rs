@@ -34,9 +34,7 @@ impl Handle {
     /// Pins the handle.
     #[inline]
     pub fn pin(&self) -> Guard {
-        let guard = Guard {
-            local: self.local.clone(),
-        };
+        let guard = Guard::new(self.local.clone());
         self.local().pin_inner();
         guard
     }
@@ -55,10 +53,18 @@ impl Handle {
 }
 
 pub struct Guard {
-    pub(crate) local: Rc<Entry<Local>>,
+    local: Rc<Entry<Local>>,
+    should_help: Cell<bool>,
 }
 
 impl Guard {
+    fn new(local: Rc<Entry<Local>>) -> Self {
+        Self {
+            local,
+            should_help: Cell::new(false),
+        }
+    }
+
     /// Unpins and then immediately re-pins the thread.
     ///
     /// This method is useful when you don't want delay the advancement of the global epoch by
@@ -66,6 +72,7 @@ impl Guard {
     /// the call (the latter is enforced by `&mut self`). The thread will only be repinned if this
     /// is the only active guard for the current thread.
     pub fn repin(&mut self) {
+        self.help_collect_if_scheduled();
         self.local().repin();
     }
 
@@ -108,6 +115,17 @@ impl Guard {
 
     pub(crate) fn try_pop_mark_task(&self) -> Option<Task> {
         self.local().try_pop_mark_task()
+    }
+
+    pub(crate) fn schedule_helping_collect(&self) {
+        self.should_help.set(true);
+    }
+
+    pub(crate) fn help_collect_if_scheduled(&self) {
+        if self.should_help.get() {
+            self.should_help.set(false);
+            self.help_collect();
+        }
     }
 
     /// Helps the ongoing collection works if possible.
@@ -194,26 +212,11 @@ impl Guard {
     }
 
     #[inline]
-    pub(crate) fn help_draining_mark_tasks(&self) {
-        if self.phase() != Phase::RT && self.phase() != Phase::CT {
-            return;
-        }
-
-        if !self.is_tracing_synced() {
-            return;
-        }
-
-        call_without_recursion(&self.local().is_helping_draining_mark_tasks, || {
-            self.help_draining_mark_tasks_inner()
-        });
-    }
-
-    #[inline]
     pub fn help_draining_mark_tasks_inner(&self) {
         let mt_len = unsafe { &*self.local().mark_tasks.get() }.len();
         for _ in 0..((mt_len / 2).max(OBJ_BATCH_SIZE / 2)) {
             if let Some(task) = self.try_pop_mark_task() {
-                task.call();
+                task.call(self);
                 continue;
             }
             break;
@@ -254,6 +257,7 @@ impl Guard {
 impl Drop for Guard {
     #[inline]
     fn drop(&mut self) {
+        self.help_collect_if_scheduled();
         self.local().unpin_inner();
     }
 }

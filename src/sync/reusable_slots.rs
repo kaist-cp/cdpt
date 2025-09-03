@@ -1,19 +1,21 @@
 use std::{
     ops::Deref,
     ptr::null_mut,
-    sync::atomic::{AtomicBool, AtomicPtr, Ordering},
+    sync::atomic::{AtomicBool, AtomicPtr, AtomicUsize, Ordering},
 };
 
 pub(crate) struct Node<T> {
     using: AtomicBool,
+    active_count: *const AtomicUsize,
     next: AtomicPtr<Self>,
     item: T,
 }
 
 impl<T: Default> Node<T> {
-    pub(crate) fn new_using() -> Self {
+    pub(crate) fn new_using(active_count: &AtomicUsize) -> Self {
         Self {
             using: AtomicBool::new(true),
+            active_count: active_count,
             next: AtomicPtr::new(null_mut()),
             item: T::default(),
         }
@@ -26,6 +28,7 @@ pub(crate) struct Entry<T: 'static> {
 
 impl<T: 'static> Drop for Entry<T> {
     fn drop(&mut self) {
+        unsafe { &*self.node.active_count }.fetch_sub(1, Ordering::Relaxed);
         self.node.using.store(false, Ordering::Release);
     }
 }
@@ -40,12 +43,14 @@ impl<T: 'static> Deref for Entry<T> {
 
 pub(crate) struct ReusableSlots<T> {
     head: AtomicPtr<Node<T>>,
+    active_count: AtomicUsize,
 }
 
 impl<T> Default for ReusableSlots<T> {
     fn default() -> Self {
         Self {
             head: AtomicPtr::new(null_mut()),
+            active_count: AtomicUsize::new(0),
         }
     }
 }
@@ -57,7 +62,7 @@ impl<T: 'static + Default> ReusableSlots<T> {
             let curr = prev.load(Ordering::Acquire);
             if curr.is_null() {
                 // We are at the end of the list. Let's try inserting a new slot.
-                let new_node = Box::into_raw(Box::new(Node::new_using()));
+                let new_node = Box::into_raw(Box::new(Node::new_using(&self.active_count)));
                 match prev.compare_exchange(
                     null_mut(),
                     new_node,
@@ -65,6 +70,7 @@ impl<T: 'static + Default> ReusableSlots<T> {
                     Ordering::Relaxed,
                 ) {
                     Ok(_) => {
+                        self.active_count.fetch_add(1, Ordering::Relaxed);
                         return Entry {
                             node: unsafe { &*new_node },
                         };
@@ -84,6 +90,7 @@ impl<T: 'static + Default> ReusableSlots<T> {
                     .compare_exchange(false, true, Ordering::AcqRel, Ordering::Relaxed)
                     .is_ok()
                 {
+                    self.active_count.fetch_add(1, Ordering::Relaxed);
                     return Entry { node: curr_node };
                 }
             }
@@ -106,6 +113,10 @@ impl<T: 'static + Default> ReusableSlots<T> {
             curr: self.head.load(Ordering::Acquire),
             cond: |node| node.using.load(Ordering::Acquire),
         }
+    }
+
+    pub(crate) fn active_count(&self) -> usize {
+        self.active_count.load(Ordering::Relaxed)
     }
 }
 
