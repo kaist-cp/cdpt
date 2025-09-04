@@ -178,8 +178,11 @@ fn record_collection_stats(start: Instant, recl_at_start: usize) {
     let extra = if new_reclm_rate == 0 {
         global().locals.active_count() * 1024 * 1024 * 1 // 1MB per thread
     } else {
+        // We want the extra heap headroom to be at least a few MB.
+        // It prevents redundant collection attempts for some workloads with small heaps.
         ((heap_usage * hbstats.alloc_per_ms_smooth / new_reclm_rate / EXTRA_TUNING_FACTOR) as f64)
-            .sqrt() as usize
+            .sqrt()
+            .max(1024.0 * 1024.0 * 4.0) as usize
     };
     let desired_heap_limit = heap_usage + extra;
 
