@@ -157,7 +157,9 @@ fn record_collection_stats(start: Instant, recl_at_start: usize) {
     let recl_at_end = global().estimate_total_reclm();
 
     let prev_coll_time_ms = CSTATS.coll_time_ms_smooth.load(Ordering::Relaxed);
-    let curr_coll_time_ms = (end - start).as_millis() as usize;
+    // For some workloads with small heaps, `(end - start).as_millis()` may be 0,
+    // generating a nonsense reclamation rate. So, we want it to be at least 1.
+    let curr_coll_time_ms = (end - start).as_millis().max(1) as usize;
     let new_coll_time_ms = smooth(
         COLL_TIME_MS_SMOOTH_FACTOR,
         prev_coll_time_ms,
