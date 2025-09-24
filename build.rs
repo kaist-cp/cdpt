@@ -5,6 +5,8 @@ extern crate cc;
 // only in MacOS-based systems.
 #[cfg(any(target_os = "macos", target_os = "ios"))]
 fn main() {
+    println!("cargo::rustc-check-cfg=cfg(register_pointer_values)");
+
     const ALLOWED_TYPES: [&'static str; 5] = [
         "x86_unified_thread_state_t",
         "arm_unified_thread_state_t",
@@ -19,24 +21,23 @@ fn main() {
         "mach_port_deallocate",
     ];
 
-    const ALLOWED_CONSTANTS: [&'static str; 2] = ["x86_THREAD_STATE64", "ARM_THREAD_STATE64"];
+    const ALLOWED_VARS: [&'static str; 3] = [
+        "x86_THREAD_STATE64",
+        "ARM_THREAD_STATE64",
+        "mach_task_self_",
+    ];
 
     use bindgen;
     use std::path::PathBuf;
     use std::{env, fs};
 
-    let libdir_path = PathBuf::from("apple")
-        // Canonicalize the path as `rustc-link-search` requires an absolute
-        // path.
+    let headers_path = PathBuf::from("mach.h")
         .canonicalize()
         .expect("cannot canonicalize path");
-    let libdir_path_str = libdir_path.to_str().expect("Path is not a valid string");
-
-    let headers_path = libdir_path.join("mach.h");
     let headers_path_str = headers_path.to_str().expect("Path is not a valid string");
 
     // Tell cargo to invalidate the built crate whenever the header changes.
-    println!("cargo:rerun-if-changed={}", libdir_path_str);
+    println!("cargo:rerun-if-changed={}", headers_path_str);
 
     // The bindgen::Builder is the main entry point
     // to bindgen, and lets you build up options for
@@ -49,7 +50,7 @@ fn main() {
     for f in ALLOWED_FUNCTIONS {
         builder = builder.allowlist_function(f);
     }
-    for c in ALLOWED_CONSTANTS {
+    for c in ALLOWED_VARS {
         builder = builder.allowlist_var(c);
     }
 

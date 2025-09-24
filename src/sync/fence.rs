@@ -303,12 +303,10 @@ mod apple {
         #![allow(unused)]
         #![allow(non_snake_case)]
 
-        use core::mem;
-        use core::slice;
+        use core::{mem, ptr, slice};
 
         use libc::{
-            KERN_SUCCESS, mach_task_self, task_threads, thread_act_t, uintptr_t, vm_address_t,
-            vm_deallocate,
+            KERN_SUCCESS, task_threads, thread_act_t, uintptr_t, vm_address_t, vm_deallocate,
         };
 
         // Include Raw FFI for `is_supported` and `flush_process_write_buffers`.
@@ -360,62 +358,63 @@ mod apple {
         /// and is equivalent to `membarrier` on latest Linux and `FlushProcessWriteBuffers` on Windows.
         #[inline]
         pub unsafe fn flush_process_write_buffers() {
-            let mut thread_count: mach_msg_type_number_t = mem::zeroed();
-            let mut thread_acts: *mut thread_act_t = mem::zeroed();
+            let mut thread_count: mach_msg_type_number_t = 0;
+            let mut thread_acts: *mut thread_act_t = ptr::null_mut();
 
-            assert_success(
-                task_threads(mach_task_self(), &mut thread_acts, &mut thread_count),
-                "Failed to fetch thread information!",
-            );
+            let ret = unsafe { task_threads(mach_task_self_, &mut thread_acts, &mut thread_count) };
+            assert_success(ret, "Failed to fetch thread information!");
 
-            let thread_acts_arr = slice::from_raw_parts_mut(thread_acts, thread_count as usize);
-            let mut sp = mem::zeroed();
-            let mut register_values: [uintptr_t; 128] = mem::zeroed();
+            let thread_acts_arr =
+                unsafe { slice::from_raw_parts_mut(thread_acts, thread_count as usize) };
+            let mut register_values: [uintptr_t; 128] = unsafe { mem::zeroed() };
 
             for act in thread_acts_arr {
-                cfg_if! {
-                    if #[cfg(register_pointer_values)] {
-                        let mut registers = 128;
-                        assert_success(
-                            thread_get_register_pointer_values(*act, &mut sp, &mut registers, register_values.as_mut_ptr()),
-                            "`thread_get_register_pointer_values` system call failed!"
-                        );
-                    } else if #[cfg(target_arch = "x86_64")] {
-                        let mut thread_state: x86_thread_state64_t = mem::zeroed();
-                        let mut count = thread_state64_count();
-                        assert_success(
-                            thread_get_state(*act, x86_THREAD_STATE64 as i32, (&mut thread_state) as *mut _ as _, &mut count),
-                            "`thread_get_state` system call for x86 failed!"
-                        );
-                    } else if #[cfg(target_arch = "aarch64")] {
-                        let mut thread_state: arm_thread_state64_t = mem::zeroed();
-                        let mut count = thread_state64_count();
-                        assert_success(
-                            thread_get_state(*act, ARM_THREAD_STATE64 as i32, (&mut thread_state) as *mut _ as _, &mut count),
-                            "`thread_get_state` system call for AARCH64 failed!"
-                        );
-                    } else {
-                        // This path should not be reachable!
-                        // Because we check if the heavy barrier is supported
-                        // by `is_supported` function before using `flush_process_write_buffers`.
-                        unreachable!()
-                    }
-                };
+                unsafe {
+                    cfg_if! {
+                        if #[cfg(register_pointer_values)] {
+                            let mut registers = 128;
+                            let mut sp = mem::zeroed();
+                            assert_success(
+                                thread_get_register_pointer_values(*act, &mut sp, &mut registers, register_values.as_mut_ptr()),
+                                "`thread_get_register_pointer_values` system call failed!"
+                            );
+                        } else if #[cfg(target_arch = "x86_64")] {
+                            let mut thread_state: x86_thread_state64_t = mem::zeroed();
+                            let mut count = thread_state64_count();
+                            assert_success(
+                                thread_get_state(*act, x86_THREAD_STATE64 as i32, (&mut thread_state) as *mut _ as _, &mut count),
+                                "`thread_get_state` system call for x86 failed!"
+                            );
+                        } else if #[cfg(target_arch = "aarch64")] {
+                            let mut thread_state: arm_thread_state64_t = mem::zeroed();
+                            let mut count = thread_state64_count();
+                            assert_success(
+                                thread_get_state(*act, ARM_THREAD_STATE64 as i32, (&mut thread_state) as *mut _ as _, &mut count),
+                                "`thread_get_state` system call for AARCH64 failed!"
+                            );
+                        } else {
+                            // This path should not be reachable!
+                            // Because we check if the heavy barrier is supported
+                            // by `is_supported` function before using `flush_process_write_buffers`.
+                            unreachable!()
+                        }
+                    };
 
-                assert_success(
-                    mach_port_deallocate(mach_task_self(), *act),
-                    "Failed to decrement the port right's reference count!",
-                );
+                    assert_success(
+                        mach_port_deallocate(mach_task_self_, *act),
+                        "Failed to decrement the port right's reference count!",
+                    );
+                }
             }
 
-            assert_success(
+            let ret = unsafe {
                 vm_deallocate(
-                    mach_task_self(),
+                    mach_task_self_,
                     thread_acts as vm_address_t,
                     thread_count as usize * mem::size_of::<thread_act_t>(),
-                ),
-                "Failed to deallocate the used thread list!",
-            );
+                )
+            };
+            assert_success(ret, "Failed to deallocate the used thread list!");
         }
     }
 
