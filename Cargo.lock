@@ -157,6 +157,7 @@ dependencies = [
  "crossbeam",
  "fastrand",
  "libc",
+ "rustc-hash",
  "windows-sys",
 ]
 
