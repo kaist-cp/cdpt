@@ -222,7 +222,7 @@ fn root_tracing(handle: &Handle, logger: &Logger) {
     //   recognized (i.e., greyed).
     //   1. For cooperative mutators, they marked their HPs by themselves.
     //   2. For uncooperative mutators, the collector has just marked.
-    // => All mutators are grey (not black due to insertion barrier).
+    // => All mutators are black thanks to Yuasa's deletion barrier.
     // * For RCs, deletion barriers by mutators and scanning by the
     //   collectors guarantee that no live objects are missed.
 
