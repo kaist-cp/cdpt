@@ -1,6 +1,6 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use gc_design::{AtomicShared, Guard, Handle, Local, TraceObj, TracePtr, handle};
+use cdpt::{AtomicShared, Guard, Handle, Local, TraceObj, TracePtr, handle};
 
 struct Node<T: 'static + Send + Sync> {
     item: T,

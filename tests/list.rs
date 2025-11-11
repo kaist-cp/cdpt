@@ -1,4 +1,4 @@
-use gc_design::{AtomicShared, Guard, Handle, Local, TraceObj, TracePtr, pin};
+use cdpt::{AtomicShared, Guard, Handle, Local, TraceObj, TracePtr, pin};
 
 use std::cmp::Ordering::{Equal, Greater, Less};
 use std::sync::atomic::Ordering;
@@ -314,7 +314,7 @@ where
 mod tests {
     use super::*;
     use fastrand::shuffle;
-    use gc_design::handle;
+    use cdpt::handle;
     use std::thread::scope;
 
     const THREADS: i32 = 30;
