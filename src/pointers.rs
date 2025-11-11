@@ -471,7 +471,7 @@ impl<T: 'static + Send + Sync + TraceObj> AtomicShared<T> {
         // First loop to handle the `Rooted` case.
         if unlikely(old.meta() == PtrMeta::Rooted) {
             // If the source is rooted, we increment the root count before trying update.
-            let mut new_rooted = new.as_shared(guard);
+            let mut new_rooted = new.as_shared();
 
             while old.meta() == PtrMeta::Rooted {
                 match self.internal_cmpxchg_rooted(old, new_rooted, order, Ordering::Relaxed, guard)
@@ -523,7 +523,7 @@ impl<T: 'static + Send + Sync + TraceObj> AtomicShared<T> {
         // First block to handle the `Rooted` case.
         if unlikely(old.meta() == PtrMeta::Rooted) {
             // If the source is rooted, we increment the root count before trying update.
-            let new_rooted = new.as_shared(guard);
+            let new_rooted = new.as_shared();
 
             match self.internal_cmpxchg_rooted(old, new_rooted, success, failure, guard) {
                 Ok(current) => return Ok(Local::from_raw(current, guard)),
@@ -870,7 +870,7 @@ impl<'g, G: Protector, T: 'static + Send + Sync + TraceObj> Local<'g, G, T> {
     }
 
     #[inline(always)]
-    pub fn as_atomic_shared(&self, _: &Guard) -> AtomicShared<T> {
+    pub fn as_atomic_shared(&self) -> AtomicShared<T> {
         let ptr = self.as_man_ptr();
         if ptr.is_null() {
             return AtomicShared::null();
@@ -882,9 +882,9 @@ impl<'g, G: Protector, T: 'static + Send + Sync + TraceObj> Local<'g, G, T> {
     }
 
     #[inline(always)]
-    pub fn as_shared(&self, guard: &Guard) -> Shared<T> {
+    pub fn as_shared(&self) -> Shared<T> {
         Shared {
-            inner: self.as_atomic_shared(guard),
+            inner: self.as_atomic_shared(),
         }
     }
 
