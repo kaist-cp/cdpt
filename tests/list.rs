@@ -313,8 +313,8 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use fastrand::shuffle;
     use cdpt::handle;
+    use fastrand::shuffle;
     use std::thread::scope;
 
     const THREADS: i32 = 30;
