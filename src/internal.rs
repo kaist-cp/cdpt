@@ -2,7 +2,7 @@ use crate::collector::collector_loop;
 use crate::epoch::{AtomicEpoch, Color, Epoch, Phase};
 use crate::guards::{Guard, Handle};
 use crate::pointers::{ManObj, ManPtr, MarkObj, TraceObj};
-use crate::sync::{Entry, Queue, ReusableSlots, fence};
+use crate::sync::{Entry, Queue, ReusableSlots};
 use crate::task::Task;
 use crate::{global, pin};
 use crossbeam::deque::{Injector, Stealer, Worker};
@@ -18,7 +18,7 @@ use std::mem::{MaybeUninit, take};
 use std::ops::DerefMut;
 use std::ptr;
 use std::rc::Rc;
-use std::sync::atomic::{self, AtomicBool, AtomicPtr, AtomicUsize, Ordering};
+use std::sync::atomic::{self, AtomicBool, AtomicPtr, AtomicUsize, Ordering, fence};
 use std::thread::spawn;
 
 const OBJ_BATCHES_SHARD: usize = 8;
@@ -355,7 +355,7 @@ impl Local {
         loop {
             // Now we must store `new_epoch` into `self.epoch` and execute a light fence.
             self.epoch.store(curr_epoch.pinned(), Ordering::Relaxed);
-            fence::light();
+            fence(Ordering::SeqCst);
 
             let new_epoch = global().load_epoch();
             if curr_epoch == new_epoch {

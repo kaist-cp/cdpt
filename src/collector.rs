@@ -4,7 +4,7 @@ use std::{
     mem::take,
     sync::{
         LazyLock, RwLock,
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicUsize, Ordering, fence},
     },
     thread::{sleep, spawn},
     time::{Duration, Instant},
@@ -15,7 +15,6 @@ use crate::{
     epoch::{Color, Phase},
     global,
     internal::ObjBatch,
-    sync::fence,
     task::Task,
     tls::handle,
 };
@@ -358,7 +357,7 @@ fn phase_trans(new: Phase) {
     let epoch = global().load_epoch();
     let new_epoch = epoch.with_timestamp(epoch.timestamp() + 1).with_phase(new);
     global().epoch.store(new_epoch, Ordering::Release);
-    fence::heavy();
+    fence(Ordering::SeqCst);
     wait_all_mutators_unpin(new_epoch.timestamp());
 }
 
@@ -372,7 +371,7 @@ fn next_normal(handle: &Handle, logger: &Logger) {
         .with_phase(Phase::N)
         .with_color(prev_epoch.color().flip());
     global().epoch.store(new_epoch, Ordering::Release);
-    fence::heavy();
+    fence(Ordering::SeqCst);
 
     // Reclaim unmarked objects from the previous cycle.
     logger.measure("sweep", || sweep(prev_epoch.color(), handle, logger));

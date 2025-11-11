@@ -1,4 +1,3 @@
-pub mod fence;
 mod queue;
 mod reusable_slots;
 

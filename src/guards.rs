@@ -5,7 +5,7 @@ use crate::{
     epoch::{Color, Epoch, Phase},
     internal::{Local, OBJ_BATCH_SIZE},
     pointers::ManObj,
-    sync::{Entry, fence},
+    sync::Entry,
     task::Task,
     tls::global,
 };
@@ -13,7 +13,7 @@ use crossbeam::epoch::pin as ebr_pin;
 use std::{
     cell::{Cell, LazyCell},
     rc::Rc,
-    sync::atomic::Ordering,
+    sync::atomic::{Ordering, fence},
 };
 
 const HELP_NORMAL_MAX_TRIAL: usize = 2;
@@ -101,7 +101,7 @@ impl Guard {
     }
 
     pub(crate) fn global_phase(&self) -> Phase {
-        fence::light();
+        fence(Ordering::SeqCst);
         global().load_epoch().phase()
     }
 

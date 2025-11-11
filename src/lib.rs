@@ -1,8 +1,6 @@
 #![feature(cold_path)]
 #![feature(likely_unlikely)]
 #![feature(vec_push_within_capacity)]
-#[macro_use]
-extern crate cfg_if;
 
 mod collector;
 mod epoch;

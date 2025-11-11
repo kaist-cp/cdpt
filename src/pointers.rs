@@ -411,17 +411,6 @@ impl<T: 'static + Send + Sync + TraceObj> Default for AtomicShared<T> {
     }
 }
 
-impl<'g, G, T> From<Local<'g, G, T>> for AtomicShared<T>
-where
-    G: Protector,
-    T: 'static + Send + Sync + TraceObj,
-{
-    #[inline(always)]
-    fn from(value: Local<'g, G, T>) -> Self {
-        value.as_atomic_shared()
-    }
-}
-
 impl<T: 'static + Send + Sync + TraceObj> AtomicShared<T> {
     #[inline(always)]
     pub fn new(item: T, guard: &Guard) -> Self {
@@ -482,7 +471,7 @@ impl<T: 'static + Send + Sync + TraceObj> AtomicShared<T> {
         // First loop to handle the `Rooted` case.
         if unlikely(old.meta() == PtrMeta::Rooted) {
             // If the source is rooted, we increment the root count before trying update.
-            let mut new_rooted = new.as_shared();
+            let mut new_rooted = new.as_shared(guard);
 
             while old.meta() == PtrMeta::Rooted {
                 match self.internal_cmpxchg_rooted(old, new_rooted, order, Ordering::Relaxed, guard)
@@ -534,7 +523,7 @@ impl<T: 'static + Send + Sync + TraceObj> AtomicShared<T> {
         // First block to handle the `Rooted` case.
         if unlikely(old.meta() == PtrMeta::Rooted) {
             // If the source is rooted, we increment the root count before trying update.
-            let new_rooted = new.as_shared();
+            let new_rooted = new.as_shared(guard);
 
             match self.internal_cmpxchg_rooted(old, new_rooted, success, failure, guard) {
                 Ok(current) => return Ok(Local::from_raw(current, guard)),
@@ -881,7 +870,7 @@ impl<'g, G: Protector, T: 'static + Send + Sync + TraceObj> Local<'g, G, T> {
     }
 
     #[inline(always)]
-    pub fn as_atomic_shared(&self) -> AtomicShared<T> {
+    pub fn as_atomic_shared(&self, _: &Guard) -> AtomicShared<T> {
         let ptr = self.as_man_ptr();
         if ptr.is_null() {
             return AtomicShared::null();
@@ -893,9 +882,9 @@ impl<'g, G: Protector, T: 'static + Send + Sync + TraceObj> Local<'g, G, T> {
     }
 
     #[inline(always)]
-    pub fn as_shared(&self) -> Shared<T> {
+    pub fn as_shared(&self, guard: &Guard) -> Shared<T> {
         Shared {
-            inner: self.as_atomic_shared(),
+            inner: self.as_atomic_shared(guard),
         }
     }
 
