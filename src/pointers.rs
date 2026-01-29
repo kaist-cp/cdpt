@@ -349,6 +349,9 @@ pub trait TracePtr {
     fn shade(&self, guard: &Guard);
 }
 
+/// # Safety
+///
+/// TODO
 pub unsafe trait TraceObj {
     /// Calls `unroot` for all outgoing `AtomicShared` and `Shared`.
     fn unroot_outgoings(&self, guard: &Guard);
@@ -757,6 +760,9 @@ impl<T: Send + Sync + TraceObj> Shared<T> {
         unsafe { self.as_man_ptr().as_ref() }.map(|obj| &obj.item)
     }
 
+    /// # Safety
+    ///
+    /// TODO
     #[inline(always)]
     pub unsafe fn deref(&self) -> &T {
         unsafe { &self.as_man_ptr().deref().item }
@@ -926,11 +932,17 @@ impl<'g, T: 'static + Send + Sync + TraceObj> Local<'g, Guard, T> {
         unsafe { self.as_man_ptr().as_ref() }.map(|obj| &obj.item)
     }
 
+    /// # Safety
+    ///
+    /// TODO
     #[inline(always)]
     pub unsafe fn deref(&self) -> &'g T {
         unsafe { &self.as_man_ptr().deref().item }
     }
 
+    /// # Safety
+    ///
+    /// TODO
     #[inline(always)]
     pub unsafe fn deref_mut(&mut self) -> &'g mut T {
         unsafe { &mut self.as_man_ptr().deref_mut().item }
@@ -943,6 +955,9 @@ impl<'g, T: 'static + Send + Sync + TraceObj> Local<'g, Handle, T> {
         unsafe { self.as_man_ptr().as_ref() }.map(|obj| &obj.item)
     }
 
+    /// # Safety
+    ///
+    /// TODO
     #[inline(always)]
     pub unsafe fn deref(&self) -> &T {
         unsafe { &self.as_man_ptr().deref().item }

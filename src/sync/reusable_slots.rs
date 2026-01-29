@@ -15,7 +15,7 @@ impl<T: Default> Node<T> {
     pub(crate) fn new_using(active_count: &AtomicUsize) -> Self {
         Self {
             using: AtomicBool::new(true),
-            active_count: active_count,
+            active_count,
             next: AtomicPtr::new(null_mut()),
             item: T::default(),
         }

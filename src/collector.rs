@@ -175,7 +175,7 @@ fn record_collection_stats(start: Instant, recl_at_start: usize) {
     // Calculate the desired heap limit (Membalancer).
     let heap_usage = alloc_at_end - recl_at_end;
     let extra = if new_reclm_rate == 0 {
-        global().locals.active_count() * 1024 * 1024 * 1 // 1MB per thread
+        global().locals.active_count() * 1024 * 1024 // 1MB per thread
     } else {
         // We want the extra heap headroom to be at least a few MB.
         // It prevents redundant collection attempts for some workloads with small heaps.
