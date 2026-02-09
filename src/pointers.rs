@@ -574,7 +574,7 @@ impl<T: 'static + Send + Sync + TraceObj> AtomicSharedOption<T> {
         unsafe { ptr.as_local_with_tag(guard) }
     }
 
-    fn internal_swap<'g>(&self, new: ManPtr<T>, order: Ordering, guard: &'g Guard) -> ManPtr<T> {
+    fn internal_swap(&self, new: ManPtr<T>, order: Ordering, guard: &Guard) -> ManPtr<T> {
         let mut old = ManPtr::<T>::from(self.link.load(Ordering::Relaxed));
 
         // First loop to handle the `Rooted` case.
@@ -607,6 +607,7 @@ impl<T: 'static + Send + Sync + TraceObj> AtomicSharedOption<T> {
         }
     }
 
+    #[allow(clippy::type_complexity)]
     pub fn compare_exchange<'l1, 'l2, 'g, G1, G2>(
         &self,
         current: Option<&Local<'l1, G1, T>>,
@@ -624,6 +625,7 @@ impl<T: 'static + Send + Sync + TraceObj> AtomicSharedOption<T> {
             .map_err(|pt| pt.0)
     }
 
+    #[allow(clippy::type_complexity)]
     pub fn compare_exchange_with_tag<'l1, 'l2, 'g, G1, G2>(
         &self,
         current_tag: (Option<&Local<'l1, G1, T>>, usize),
@@ -1114,6 +1116,7 @@ impl<T: 'static + Send + Sync + TraceObj> AtomicShared<T> {
         }
     }
 
+    #[allow(clippy::type_complexity)]
     pub fn compare_exchange_with_tag<'l1, 'l2, 'g, G1, G2>(
         &self,
         current_tag: (&Local<'l1, G1, T>, usize),
@@ -1263,9 +1266,7 @@ impl<T: Send + Sync + TraceObj> Shared<T> {
     }
 
     pub(crate) fn try_inc_raw(ptr: ManPtr<T>, _: &Guard) -> Option<Self> {
-        let Some(obj) = (unsafe { ptr.as_ref() }) else {
-            return None;
-        };
+        let obj = (unsafe { ptr.as_ref() })?;
         obj.header.increment_root_count(Ordering::Release);
         Some(Self {
             // As we are returning an owned `Shared`, it must have `PtrMeta::Rooted`.
@@ -1556,7 +1557,7 @@ where
     T: 'static + Send + Sync + TraceObj + PartialEq,
 {
     fn eq(&self, other: &Self) -> bool {
-        &**self == &**other
+        **self == **other
     }
 }
 
@@ -1573,7 +1574,7 @@ where
     T: 'static + Send + Sync + TraceObj + PartialOrd,
 {
     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-        (&**self).partial_cmp(&**other)
+        (**self).partial_cmp(&**other)
     }
 }
 
@@ -1583,7 +1584,7 @@ where
     T: 'static + Send + Sync + TraceObj + Ord,
 {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        (&**self).cmp(&**other)
+        (**self).cmp(&**other)
     }
 }
 
