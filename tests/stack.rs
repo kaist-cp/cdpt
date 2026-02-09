@@ -1,10 +1,10 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use cdpt::{AtomicShared, Guard, Handle, Local, TraceObj, TracePtr, handle};
+use cdpt::{AtomicSharedOption, Guard, Handle, Local, TraceObj, TracePtr, handle};
 
 struct Node<T: 'static + Send + Sync> {
     item: T,
-    next: AtomicShared<Self>,
+    next: AtomicSharedOption<Self>,
 }
 
 unsafe impl<T: Send + Sync> TraceObj for Node<T> {
@@ -29,18 +29,18 @@ impl<'h, T: Send + Sync> ItemRef<'h, T> {
     }
 
     pub fn borrow(&self) -> &T {
-        self.node.as_ref().map(|node| &node.item).unwrap()
+        &self.node.item
     }
 }
 
 struct Stack<T: 'static + Send + Sync> {
-    top: AtomicShared<Node<T>>,
+    top: AtomicSharedOption<Node<T>>,
 }
 
 impl<T: Send + Sync> Stack<T> {
     fn new() -> Self {
         Self {
-            top: AtomicShared::null(),
+            top: AtomicSharedOption::none(),
         }
     }
 
@@ -55,10 +55,16 @@ impl<T: Send + Sync> Stack<T> {
             };
             if self
                 .top
-                .compare_exchange(&old, &new, Ordering::AcqRel, Ordering::Relaxed, &guard)
+                .compare_exchange(
+                    old.as_ref(),
+                    new.as_ref(),
+                    Ordering::AcqRel,
+                    Ordering::Relaxed,
+                    &guard,
+                )
                 .is_ok()
             {
-                return Some(ItemRef::new(old, handle));
+                return Some(ItemRef::new(old.unwrap(), handle));
             }
         }
     }
@@ -68,19 +74,23 @@ impl<T: Send + Sync> Stack<T> {
         let new = Local::new(
             Node {
                 item,
-                next: AtomicShared::null(),
+                next: AtomicSharedOption::none(),
             },
             &guard,
         );
 
         loop {
             let old = self.top.load(Ordering::Acquire, &guard);
-            unsafe { new.deref() }
-                .next
-                .store(&old, Ordering::Relaxed, &guard);
+            new.next.store(old.as_ref(), Ordering::Relaxed, &guard);
             if self
                 .top
-                .compare_exchange(&old, &new, Ordering::AcqRel, Ordering::Relaxed, &guard)
+                .compare_exchange(
+                    old.as_ref(),
+                    Some(&new),
+                    Ordering::AcqRel,
+                    Ordering::Relaxed,
+                    &guard,
+                )
                 .is_ok()
             {
                 return;

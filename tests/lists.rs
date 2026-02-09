@@ -1,14 +1,17 @@
-use cdpt::{AtomicShared, Guard, Handle, Local, TraceObj, TracePtr, pin};
+use cdpt::{AtomicShared, AtomicSharedOption, Guard, Handle, Local, TraceObj, TracePtr, pin};
 
 use std::cmp::Ordering::{Equal, Greater, Less};
 use std::sync::atomic::Ordering;
+
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
 
 struct Node<K, V>
 where
     K: 'static + Send + Sync,
     V: 'static + Send + Sync,
 {
-    next: AtomicShared<Self>,
+    next: AtomicSharedOption<Self>,
     key: K,
     value: V,
 }
@@ -44,7 +47,7 @@ where
     #[inline]
     fn new(key: K, value: V) -> Self {
         Self {
-            next: AtomicShared::null(),
+            next: AtomicSharedOption::none(),
             key,
             value,
         }
@@ -54,7 +57,7 @@ where
     /// We never deref key and value of this head node.
     fn head() -> Self {
         Self {
-            next: AtomicShared::null(),
+            next: AtomicSharedOption::none(),
             key: K::default(),
             value: V::default(),
         }
@@ -67,7 +70,7 @@ where
     V: 'static + Send + Sync,
 {
     prev: Local<'g, Guard, Node<K, V>>,
-    curr: Local<'g, Guard, Node<K, V>>,
+    curr: Option<Local<'g, Guard, Node<K, V>>>,
 }
 
 impl<'g, K, V> Cursor<'g, K, V>
@@ -79,7 +82,7 @@ where
     #[inline]
     pub fn head(head: &AtomicShared<Node<K, V>>, guard: &'g Guard) -> Cursor<'g, K, V> {
         let prev = head.load(Ordering::Relaxed, guard);
-        let curr = unsafe { prev.deref() }.next.load(Ordering::Acquire, guard);
+        let curr = prev.next.load(Ordering::Acquire, guard);
         Self { prev, curr }
     }
 }
@@ -104,7 +107,7 @@ where
     }
 
     pub fn borrow(&self) -> &V {
-        self.node.as_ref().map(|node| &node.value).unwrap()
+        &self.node.value
     }
 }
 
@@ -130,17 +133,16 @@ where
             let Some(curr_node) = cursor.curr.as_ref() else {
                 break false;
             };
-            let next = curr_node.next.load(Ordering::Acquire, guard);
+            let (next, next_tag) = curr_node.next.load_with_tag(Ordering::Acquire, guard);
 
-            if next.tag() != 0 {
-                // We add a 0 tag here so that `self.curr`s tag is always 0.
-                cursor.curr = next.with_tag(0);
+            if next_tag != 0 {
+                cursor.curr = next;
                 continue;
             }
 
             match curr_node.key.cmp(key) {
                 Less => {
-                    cursor.prev = cursor.curr;
+                    cursor.prev = cursor.curr.unwrap();
                     cursor.curr = next;
                     prev_next = next;
                 }
@@ -150,16 +152,17 @@ where
         };
 
         // If prev and curr WERE adjacent, no need to clean up
-        if Local::ptr_eq(&prev_next, &cursor.curr) {
+        if Local::opt_ptr_eq(prev_next.as_ref(), cursor.curr.as_ref()) {
             return Ok((found, cursor));
         }
 
         // cleanup tagged nodes between anchor and curr
-        unsafe { cursor.prev.deref() }
+        cursor
+            .prev
             .next
-            .compare_exchange(
-                &prev_next,
-                &cursor.curr,
+            .compare_exchange_with_tag(
+                (prev_next.as_ref(), 0),
+                (cursor.curr.as_ref(), 0),
                 Ordering::Release,
                 Ordering::Relaxed,
                 guard,
@@ -167,6 +170,72 @@ where
             .map_err(|_| ())?;
 
         Ok((found, cursor))
+    }
+
+    #[inline]
+    fn find_harris_michael<'g>(
+        &self,
+        key: &K,
+        guard: &'g Guard,
+    ) -> Result<(bool, Cursor<'g, K, V>), ()> {
+        let mut cursor = Cursor::head(&self.head, guard);
+        loop {
+            let Some(curr_node) = cursor.curr.as_ref() else {
+                break Ok((false, cursor));
+            };
+            let (next, next_tag) = curr_node.next.load_with_tag(Ordering::Acquire, guard);
+
+            if next_tag != 0 {
+                cursor
+                    .prev
+                    .next
+                    .compare_exchange(
+                        cursor.curr.as_ref(),
+                        next.as_ref(),
+                        Ordering::Release,
+                        Ordering::Relaxed,
+                        guard,
+                    )
+                    .map_err(|_| ())?;
+                cursor.curr = next;
+                continue;
+            }
+
+            match curr_node.key.cmp(key) {
+                Less => {
+                    cursor.prev = cursor.curr.unwrap();
+                    cursor.curr = next;
+                }
+                Equal => return Ok((true, cursor)),
+                Greater => return Ok((false, cursor)),
+            }
+        }
+    }
+
+    /// Gotta go fast. Doesn't fail.
+    #[inline]
+    fn find_harris_herlihy_shavit<'g>(
+        &self,
+        key: &K,
+        guard: &'g Guard,
+    ) -> Result<(bool, Cursor<'g, K, V>), ()> {
+        let mut cursor = Cursor::head(&self.head, guard);
+        Ok(loop {
+            let Some(curr_node) = cursor.curr.as_ref() else {
+                break (false, cursor);
+            };
+            let (next, next_tag) = curr_node.next.load_with_tag(Ordering::Acquire, guard);
+            match curr_node.key.cmp(key) {
+                Less => {
+                    cursor.curr = next;
+                    // NOTE: unnecessary (this function is expected to be used only for `get`)
+                    cursor.prev = cursor.curr.unwrap();
+                    continue;
+                }
+                Equal => break (next_tag == 0, cursor),
+                Greater => break (false, cursor),
+            }
+        })
     }
 
     #[inline]
@@ -178,7 +247,7 @@ where
         loop {
             if let Ok((found, cursor)) = find(self, key, &guard) {
                 if found {
-                    return Some(VHolder::new(cursor.curr, handle));
+                    return Some(VHolder::new(cursor.curr.unwrap(), handle));
                 } else {
                     return None;
                 }
@@ -194,7 +263,7 @@ where
         let guard = handle.pin();
         let node = Local::new(Node::new(key, value), &guard);
         loop {
-            let (found, cursor) = match find(self, unsafe { &node.deref().key }, &guard) {
+            let (found, cursor) = match find(self, &node.key, &guard) {
                 Ok(result) => result,
                 Err(_) => continue,
             };
@@ -202,13 +271,12 @@ where
                 return false;
             }
 
-            unsafe { node.deref() }
-                .next
-                .store(&cursor.curr, Ordering::Relaxed, &guard);
+            node.next
+                .store(cursor.curr.as_ref(), Ordering::Relaxed, &guard);
 
-            match unsafe { cursor.prev.deref() }.next.compare_exchange(
-                &cursor.curr,
-                &node,
+            match cursor.prev.next.compare_exchange_with_tag(
+                (cursor.curr.as_ref(), 0),
+                (Some(&node), 0),
                 Ordering::Release,
                 Ordering::Relaxed,
                 &guard,
@@ -234,21 +302,22 @@ where
                 return None;
             }
 
-            let curr_node = unsafe { cursor.curr.deref() };
-            let next = curr_node.next.fetch_tag_or(1, Ordering::AcqRel, &guard);
-            if next.tag() == 1 {
+            let curr_node = cursor.curr.as_ref().unwrap();
+
+            let (next, next_tag) = curr_node.next.fetch_tag_or(1, Ordering::AcqRel, &guard);
+            if next_tag == 1 {
                 continue;
             }
 
-            let _ = unsafe { cursor.prev.deref() }.next.compare_exchange(
-                &cursor.curr,
-                &next,
+            let _ = cursor.prev.next.compare_exchange_with_tag(
+                (cursor.curr.as_ref(), 0),
+                (next.as_ref(), next_tag),
                 Ordering::Release,
                 Ordering::Relaxed,
                 &guard,
             );
 
-            return Some(VHolder::new(cursor.curr, handle));
+            return Some(VHolder::new(cursor.curr.unwrap(), handle));
         }
     }
 
@@ -265,6 +334,34 @@ where
     #[inline]
     pub fn harris_remove<'h>(&self, key: &K, handle: &'h Handle) -> Option<VHolder<'h, K, V>> {
         self.remove(key, Self::find_harris, handle)
+    }
+
+    #[inline]
+    pub fn harris_michael_get<'h>(&self, key: &K, handle: &'h Handle) -> Option<VHolder<'h, K, V>> {
+        self.get(key, Self::find_harris_michael, handle)
+    }
+
+    #[inline]
+    pub fn harris_michael_insert(&self, key: K, value: V, handle: &Handle) -> bool {
+        self.insert(key, value, Self::find_harris_michael, handle)
+    }
+
+    #[inline]
+    pub fn harris_michael_remove<'h>(
+        &self,
+        key: &K,
+        handle: &'h Handle,
+    ) -> Option<VHolder<'h, K, V>> {
+        self.remove(key, Self::find_harris_michael, handle)
+    }
+
+    #[inline]
+    pub fn harris_herlihy_shavit_get<'h>(
+        &self,
+        key: &K,
+        handle: &'h Handle,
+    ) -> Option<VHolder<'h, K, V>> {
+        self.get(key, Self::find_harris_herlihy_shavit, handle)
     }
 }
 
@@ -307,6 +404,141 @@ where
     #[inline(always)]
     fn remove<'h>(&self, key: &K, handle: &'h Handle) -> Option<VHolder<'h, K, V>> {
         self.inner.harris_remove(key, handle)
+    }
+}
+
+pub struct HMList<K, V>
+where
+    K: 'static + Send + Sync,
+    V: 'static + Send + Sync,
+{
+    inner: List<K, V>,
+}
+
+impl<K, V> ConcurrentMap<K, V> for HMList<K, V>
+where
+    K: Send + Sync + Ord + Default,
+    V: Send + Sync + Default,
+{
+    fn new() -> Self {
+        HMList { inner: List::new() }
+    }
+
+    #[inline(always)]
+    fn get<'h>(&self, key: &K, handle: &'h Handle) -> Option<VHolder<'h, K, V>> {
+        self.inner.harris_michael_get(key, handle)
+    }
+    #[inline(always)]
+    fn insert(&self, key: K, value: V, handle: &Handle) -> bool {
+        self.inner.harris_michael_insert(key, value, handle)
+    }
+    #[inline(always)]
+    fn remove<'h>(&self, key: &K, handle: &'h Handle) -> Option<VHolder<'h, K, V>> {
+        self.inner.harris_michael_remove(key, handle)
+    }
+}
+
+pub struct HHSList<K, V>
+where
+    K: 'static + Send + Sync,
+    V: 'static + Send + Sync,
+{
+    inner: List<K, V>,
+}
+
+impl<K, V> ConcurrentMap<K, V> for HHSList<K, V>
+where
+    K: Send + Sync + Ord + Default,
+    V: Send + Sync + Default,
+{
+    fn new() -> Self {
+        HHSList { inner: List::new() }
+    }
+
+    #[inline(always)]
+    fn get<'h>(&self, key: &K, handle: &'h Handle) -> Option<VHolder<'h, K, V>> {
+        self.inner.harris_herlihy_shavit_get(key, handle)
+    }
+    #[inline(always)]
+    fn insert(&self, key: K, value: V, handle: &Handle) -> bool {
+        self.inner.harris_insert(key, value, handle)
+    }
+    #[inline(always)]
+    fn remove<'h>(&self, key: &K, handle: &'h Handle) -> Option<VHolder<'h, K, V>> {
+        self.inner.harris_remove(key, handle)
+    }
+}
+
+pub struct HashMap<K, V>
+where
+    K: 'static + Send + Sync + Ord + Default,
+    V: 'static + Send + Sync + Default,
+{
+    buckets: Vec<HHSList<K, V>>,
+}
+
+impl<K, V> HashMap<K, V>
+where
+    K: 'static + Send + Sync + Ord + Default + Hash,
+    V: 'static + Send + Sync + Default,
+{
+    pub fn with_capacity(n: usize) -> Self {
+        let mut buckets = Vec::with_capacity(n);
+        for _ in 0..n {
+            buckets.push(HHSList::new());
+        }
+
+        HashMap { buckets }
+    }
+
+    #[inline]
+    pub fn get_bucket(&self, index: usize) -> &HHSList<K, V> {
+        unsafe { self.buckets.get_unchecked(index % self.buckets.len()) }
+    }
+
+    #[inline]
+    fn hash(k: &K) -> usize {
+        let mut s = DefaultHasher::new();
+        k.hash(&mut s);
+        s.finish() as usize
+    }
+
+    pub fn get<'h>(&self, k: &K, handle: &'h Handle) -> Option<VHolder<'h, K, V>> {
+        let i = Self::hash(k);
+        self.get_bucket(i).get(k, handle)
+    }
+
+    pub fn insert(&self, k: K, v: V, handle: &Handle) -> bool {
+        let i = Self::hash(&k);
+        self.get_bucket(i).insert(k, v, handle)
+    }
+
+    pub fn remove<'h>(&self, k: &K, handle: &'h Handle) -> Option<VHolder<'h, K, V>> {
+        let i = Self::hash(k);
+        self.get_bucket(i).remove(k, handle)
+    }
+}
+
+impl<K, V> ConcurrentMap<K, V> for HashMap<K, V>
+where
+    K: 'static + Send + Sync + Ord + Default + Hash,
+    V: 'static + Send + Sync + Default,
+{
+    fn new() -> Self {
+        Self::with_capacity(30000)
+    }
+
+    #[inline(always)]
+    fn get<'h>(&self, key: &K, handle: &'h Handle) -> Option<VHolder<'h, K, V>> {
+        self.get(key, handle)
+    }
+    #[inline(always)]
+    fn insert(&self, key: K, value: V, handle: &Handle) -> bool {
+        self.insert(key, value, handle)
+    }
+    #[inline(always)]
+    fn remove<'h>(&self, key: &K, handle: &'h Handle) -> Option<VHolder<'h, K, V>> {
+        self.remove(key, handle)
     }
 }
 
@@ -375,5 +607,20 @@ mod tests {
     #[test]
     fn smoke_harris() {
         smoke::<HList<i32, String>>();
+    }
+
+    #[test]
+    fn smoke_harris_michael() {
+        smoke::<HMList<i32, String>>();
+    }
+
+    #[test]
+    fn smoke_harris_herlihy_shavit() {
+        smoke::<HHSList<i32, String>>();
+    }
+
+    #[test]
+    fn smoke_hash_map() {
+        smoke::<HashMap<i32, String>>();
     }
 }
