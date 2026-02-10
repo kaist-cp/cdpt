@@ -117,7 +117,7 @@ fn smoke() {
     const THREADS: usize = 30;
     const COUNT: usize = 10000;
 
-    use std::sync::atomic::{Ordering, fence};
+    use std::sync::atomic::Ordering;
     use std::thread::scope;
 
     let stack = &Stack::new();
@@ -138,12 +138,12 @@ fn smoke() {
                         found[*item.borrow()].store(true, Ordering::Release);
                     }
                 }
-                fence(Ordering::SeqCst);
             });
         }
     });
 
-    fence(Ordering::SeqCst);
+    // Note: `scope` checks the number of running threads with `Acquire` ordering.
+    // Therefore, the following relaxed loads will see the latest values without additional fences.
     for bit in found {
         assert!(bit.load(Ordering::Relaxed));
     }
