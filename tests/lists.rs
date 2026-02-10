@@ -525,7 +525,6 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serial_test::serial;
 
     // Smoke tests
     #[test]
@@ -637,29 +636,25 @@ mod tests {
     // With address sanitizer: RUSTFLAGS="-Z sanitizer=address" cargo +nightly test --release -- --ignored
     #[test]
     #[ignore]
-    #[serial]
     fn stress_harris() {
         map_common::stress_test_list::<HList<i32, String>>();
     }
 
     #[test]
     #[ignore]
-    #[serial]
     fn stress_harris_michael() {
         map_common::stress_test_list::<HMList<i32, String>>();
     }
 
     #[test]
     #[ignore]
-    #[serial]
     fn stress_harris_herlihy_shavit() {
         map_common::stress_test_list::<HHSList<i32, String>>();
     }
 
     #[test]
     #[ignore]
-    #[serial]
     fn stress_hash_map() {
-        map_common::stress_test_list::<HashMap<i32, String>>();
+        map_common::stress_test::<HashMap<i32, String>>();
     }
 }

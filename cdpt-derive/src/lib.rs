@@ -126,81 +126,76 @@ fn gen_trace_for_type(
 
             if ident == "Option"
                 && let PathArguments::AngleBracketed(args) = &last.arguments
-                    && let Some(GenericArgument::Type(inner)) = args.args.first()
-                        && let Some(inner_trace) =
-                            gen_trace_for_type(inner, &quote! { __inner }, method)
-                        {
-                            return Some(quote_spanned! { ty.span() =>
-                                if let Some(__inner) = &#expr {
-                                    #inner_trace
-                                }
-                            });
-                        }
+                && let Some(GenericArgument::Type(inner)) = args.args.first()
+                && let Some(inner_trace) = gen_trace_for_type(inner, &quote! { __inner }, method)
+            {
+                return Some(quote_spanned! { ty.span() =>
+                    if let Some(__inner) = &#expr {
+                        #inner_trace
+                    }
+                });
+            }
 
             if (ident == "Box" || ident == "Vec" || ident == "VecDeque" || ident == "ArrayVec")
                 && let PathArguments::AngleBracketed(args) = &last.arguments
-                    && let Some(GenericArgument::Type(inner)) = args.args.first()
-                        && let Some(inner_trace) =
-                            gen_trace_for_type(inner, &quote! { __inner }, method)
-                        {
-                            return Some(quote_spanned! { ty.span() =>
-                                for __inner in &#expr {
-                                    #inner_trace
-                                }
-                            });
-                        }
+                && let Some(GenericArgument::Type(inner)) = args.args.first()
+                && let Some(inner_trace) = gen_trace_for_type(inner, &quote! { __inner }, method)
+            {
+                return Some(quote_spanned! { ty.span() =>
+                    for __inner in &#expr {
+                        #inner_trace
+                    }
+                });
+            }
 
             if ident == "Arc"
                 && let PathArguments::AngleBracketed(args) = &last.arguments
-                    && let Some(GenericArgument::Type(inner)) = args.args.first()
-                        && let Some(inner_trace) =
-                            gen_trace_for_type(inner, &quote! { __inner }, method)
-                        {
-                            return Some(quote_spanned! { ty.span() =>
-                                {
-                                    let __inner = &#expr;
-                                    #inner_trace
-                                }
-                            });
-                        }
+                && let Some(GenericArgument::Type(inner)) = args.args.first()
+                && let Some(inner_trace) = gen_trace_for_type(inner, &quote! { __inner }, method)
+            {
+                return Some(quote_spanned! { ty.span() =>
+                    {
+                        let __inner = &#expr;
+                        #inner_trace
+                    }
+                });
+            }
 
             if ident == "Result"
-                && let PathArguments::AngleBracketed(args) = &last.arguments {
-                    let mut result_trace = quote! {};
-                    if let Some(GenericArgument::Type(ok_ty)) = args.args.first() {
-                        if let Some(ok_trace) = gen_trace_for_type(ok_ty, &quote! { __ok }, method)
-                        {
-                            result_trace.extend(quote! {
-                                cdpt::export::Result::Ok(__ok) => { #ok_trace }
-                            });
-                        } else {
-                            result_trace.extend(quote! {
-                                cdpt::export::Result::Ok(_) => {}
-                            });
-                        }
-                    }
-                    if let Some(GenericArgument::Type(err_ty)) = args.args.get(1) {
-                        if let Some(err_trace) =
-                            gen_trace_for_type(err_ty, &quote! { __err }, method)
-                        {
-                            result_trace.extend(quote! {
-                                cdpt::export::Result::Err(__err) => { #err_trace }
-                            });
-                        } else {
-                            result_trace.extend(quote! {
-                                cdpt::export::Result::Err(_) => {}
-                            });
-                        }
-                    }
-
-                    if !result_trace.is_empty() {
-                        return Some(quote_spanned! { ty.span() =>
-                            match &#expr {
-                                #result_trace
-                            }
+                && let PathArguments::AngleBracketed(args) = &last.arguments
+            {
+                let mut result_trace = quote! {};
+                if let Some(GenericArgument::Type(ok_ty)) = args.args.first() {
+                    if let Some(ok_trace) = gen_trace_for_type(ok_ty, &quote! { __ok }, method) {
+                        result_trace.extend(quote! {
+                            cdpt::export::Result::Ok(__ok) => { #ok_trace }
+                        });
+                    } else {
+                        result_trace.extend(quote! {
+                            cdpt::export::Result::Ok(_) => {}
                         });
                     }
                 }
+                if let Some(GenericArgument::Type(err_ty)) = args.args.get(1) {
+                    if let Some(err_trace) = gen_trace_for_type(err_ty, &quote! { __err }, method) {
+                        result_trace.extend(quote! {
+                            cdpt::export::Result::Err(__err) => { #err_trace }
+                        });
+                    } else {
+                        result_trace.extend(quote! {
+                            cdpt::export::Result::Err(_) => {}
+                        });
+                    }
+                }
+
+                if !result_trace.is_empty() {
+                    return Some(quote_spanned! { ty.span() =>
+                        match &#expr {
+                            #result_trace
+                        }
+                    });
+                }
+            }
         }
         Type::Tuple(t) => {
             let elems = t.elems.iter().enumerate().filter_map(|(i, elem)| {

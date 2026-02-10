@@ -545,7 +545,6 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serial_test::serial;
 
     // Smoke test
     #[test]
@@ -582,7 +581,6 @@ mod tests {
     // To run with address sanitizer: RUSTFLAGS="-Z sanitizer=address" cargo +nightly test -- --ignored
     #[test]
     #[ignore]
-    #[serial]
     fn stress_nm_tree() {
         map_common::stress_test::<NMTreeMap<i32, String>>();
     }

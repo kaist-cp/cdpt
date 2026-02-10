@@ -23,7 +23,6 @@ cc = "1.2.30"
 
 [dev-dependencies]
 bitflags = "2.5"
-serial_test = "3"
 
 [features]
 logging = []

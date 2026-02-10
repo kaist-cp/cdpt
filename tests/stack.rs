@@ -350,7 +350,6 @@ fn concurrent_push_pop_balanced() {
 
 #[test]
 #[ignore]
-#[serial_test::serial]
 fn stress_push_pop() {
     use std::thread::scope;
 
@@ -386,7 +385,6 @@ fn stress_push_pop() {
 
 #[test]
 #[ignore]
-#[serial_test::serial]
 fn stress_heavy_contention() {
     use std::thread::scope;
 
@@ -432,7 +430,6 @@ fn stress_heavy_contention() {
 
 #[test]
 #[ignore]
-#[serial_test::serial]
 fn stress_burst_operations() {
     use std::thread::scope;
 

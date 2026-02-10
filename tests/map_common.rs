@@ -311,7 +311,7 @@ impl StressConfig {
         Self {
             threads: available_parallelism().map(|t| t.get()).unwrap_or(16),
             ops_per_thread: 10 * 1000 * 1000, // 10M
-            key_range: 100,                   // Smaller range for O(n) traversal
+            key_range: 50,                    // Smaller range for O(n) traversal
         }
     }
 
