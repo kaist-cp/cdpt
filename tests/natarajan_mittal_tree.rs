@@ -90,6 +90,7 @@ where
     }
 }
 
+#[derive(TraceObj)]
 pub struct Node<K, V>
 where
     K: 'static + Sync + Send,
@@ -116,22 +117,6 @@ where
     K: 'static + Sync + Send,
     V: 'static + Sync + Send,
 {
-}
-
-unsafe impl<K, V> TraceObj for Node<K, V>
-where
-    K: 'static + Sync + Send,
-    V: 'static + Sync + Send,
-{
-    fn unroot_outgoings(&self, guard: &Guard) {
-        self.left.unroot(guard);
-        self.right.unroot(guard);
-    }
-
-    fn shade_outgoings(&self, guard: &Guard) {
-        self.left.shade(guard);
-        self.right.shade(guard);
-    }
 }
 
 impl<K, V> Node<K, V>

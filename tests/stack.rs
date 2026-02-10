@@ -2,19 +2,10 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use cdpt::{AtomicSharedOption, Guard, Handle, Local, TraceObj, TracePtr, handle};
 
+#[derive(TraceObj)]
 struct Node<T: 'static + Send + Sync> {
     item: T,
     next: AtomicSharedOption<Self>,
-}
-
-unsafe impl<T: Send + Sync> TraceObj for Node<T> {
-    fn unroot_outgoings(&self, guard: &Guard) {
-        self.next.unroot(guard);
-    }
-
-    fn shade_outgoings(&self, guard: &Guard) {
-        self.next.shade(guard);
-    }
 }
 
 pub struct ItemRef<'h, T: 'static + Send + Sync> {

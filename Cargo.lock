@@ -60,6 +60,7 @@ dependencies = [
  "bindgen",
  "bitflags",
  "cc",
+ "cdpt-derive",
  "cfg-if",
  "crossbeam",
  "fastrand",
@@ -68,6 +69,15 @@ dependencies = [
  "serial_test",
  "static_assertions",
  "windows-sys",
+]
+
+[[package]]
+name = "cdpt-derive"
+version = "0.1.0"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn",
 ]
 
 [[package]]

@@ -9,6 +9,7 @@ use std::sync::atomic::Ordering;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 
+#[derive(TraceObj)]
 struct Node<K, V>
 where
     K: 'static + Send + Sync,
@@ -17,20 +18,6 @@ where
     next: AtomicSharedOption<Self>,
     key: K,
     value: V,
-}
-
-unsafe impl<K, V> TraceObj for Node<K, V>
-where
-    K: Send + Sync,
-    V: Send + Sync,
-{
-    fn unroot_outgoings(&self, guard: &Guard) {
-        self.next.unroot(guard);
-    }
-
-    fn shade_outgoings(&self, guard: &Guard) {
-        self.next.shade(guard);
-    }
 }
 
 struct List<K, V>

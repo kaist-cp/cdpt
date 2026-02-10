@@ -81,6 +81,7 @@ where
     }
 }
 
+#[derive(TraceObj)]
 pub struct Node<K, V>
 where
     K: 'static + Sync + Send,
@@ -94,6 +95,7 @@ where
     right: AtomicSharedOption<Node<K, V>>,
 }
 
+#[derive(TraceObj)]
 pub enum Update<K, V>
 where
     K: 'static + Sync + Send,
@@ -110,62 +112,6 @@ where
         l: Shared<Node<K, V>>,
         pupdate: Option<Shared<Update<K, V>>>,
     },
-}
-
-unsafe impl<K, V> TraceObj for Node<K, V>
-where
-    K: 'static + Sync + Send,
-    V: 'static + Sync + Send,
-{
-    fn unroot_outgoings(&self, guard: &Guard) {
-        self.update.unroot(guard);
-        self.left.unroot(guard);
-        self.right.unroot(guard);
-    }
-
-    fn shade_outgoings(&self, guard: &Guard) {
-        self.update.shade(guard);
-        self.left.shade(guard);
-        self.right.shade(guard);
-    }
-}
-
-unsafe impl<K, V> TraceObj for Update<K, V>
-where
-    K: 'static + Sync + Send,
-    V: 'static + Sync + Send,
-{
-    fn unroot_outgoings(&self, guard: &Guard) {
-        match self {
-            Update::Insert { p, new_internal, l } => {
-                p.unroot(guard);
-                new_internal.unroot(guard);
-                l.unroot(guard);
-            }
-            Update::Delete { gp, p, l, pupdate } => {
-                gp.unroot(guard);
-                p.unroot(guard);
-                l.unroot(guard);
-                pupdate.unroot(guard);
-            }
-        }
-    }
-
-    fn shade_outgoings(&self, guard: &Guard) {
-        match self {
-            Update::Insert { p, new_internal, l } => {
-                p.shade(guard);
-                new_internal.shade(guard);
-                l.shade(guard);
-            }
-            Update::Delete { gp, p, l, pupdate } => {
-                gp.shade(guard);
-                p.shade(guard);
-                l.shade(guard);
-                pupdate.shade(guard);
-            }
-        }
-    }
 }
 
 impl<K, V> Node<K, V>

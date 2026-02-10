@@ -14,6 +14,11 @@ mod sync;
 mod task;
 mod tls;
 
+pub use cdpt_derive::TraceObj;
 pub use guards::{Guard, Handle};
 pub use pointers::{AtomicShared, AtomicSharedOption, Local, Shared, TraceObj, TracePtr};
 pub use tls::*;
+
+pub mod export {
+    pub use std::result::Result;
+}
