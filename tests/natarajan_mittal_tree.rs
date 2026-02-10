@@ -1,6 +1,9 @@
+mod map_common;
+
 #[macro_use]
 extern crate bitflags;
 use cdpt::{AtomicShared, AtomicSharedOption, Guard, Handle, Local, TraceObj, TracePtr, pin};
+use map_common::{ConcurrentMap, ValueRef};
 
 use std::cell::{LazyCell, UnsafeCell};
 use std::cmp;
@@ -186,8 +189,14 @@ where
             node: node.protect(handle),
         }
     }
+}
 
-    pub fn borrow(&self) -> &V {
+impl<K, V> ValueRef<V> for VHolder<'_, K, V>
+where
+    K: Send + Sync,
+    V: Send + Sync,
+{
+    fn borrow(&self) -> &V {
         self.node.value.as_ref().unwrap()
     }
 }
@@ -523,22 +532,13 @@ where
     }
 }
 
-pub trait ConcurrentMap<K, V>
-where
-    K: Send + Sync,
-    V: Send + Sync,
-{
-    fn new() -> Self;
-    fn get<'h>(&self, key: &K, handle: &'h Handle) -> Option<VHolder<'h, K, V>>;
-    fn insert(&self, key: K, value: V, handle: &Handle) -> bool;
-    fn remove<'h>(&self, key: &K, handle: &'h Handle) -> Option<VHolder<'h, K, V>>;
-}
-
 impl<K, V> ConcurrentMap<K, V> for NMTreeMap<K, V>
 where
     K: 'static + Sync + Send + Clone + Ord,
     V: 'static + Sync + Send + Clone,
 {
+    type ValueRef<'h> = VHolder<'h, K, V>;
+
     fn new() -> Self {
         Self::new()
     }
@@ -560,67 +560,45 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use cdpt::handle;
-    use fastrand::shuffle;
-    use std::thread::scope;
+    use serial_test::serial;
 
-    const THREADS: i32 = 30;
-    const ELEMENTS_PER_THREADS: i32 = 1000;
-
-    fn smoke<M: ConcurrentMap<i32, String> + Send + Sync>() {
-        let map = &M::new();
-
-        scope(|s| {
-            for t in 0..THREADS {
-                s.spawn(move || {
-                    let handle = handle();
-                    let mut keys: Vec<i32> =
-                        (0..ELEMENTS_PER_THREADS).map(|k| k * THREADS + t).collect();
-                    shuffle(&mut keys);
-                    for i in keys {
-                        assert!(map.insert(i, i.to_string(), &handle));
-                    }
-                });
-            }
-        });
-
-        scope(|s| {
-            for t in 0..(THREADS / 2) {
-                s.spawn(move || {
-                    let handle = handle();
-                    let mut keys: Vec<i32> =
-                        (0..ELEMENTS_PER_THREADS).map(|k| k * THREADS + t).collect();
-                    shuffle(&mut keys);
-                    for i in keys {
-                        assert_eq!(
-                            Some(&i.to_string()),
-                            map.remove(&i, &handle).as_ref().map(|v| v.borrow())
-                        );
-                    }
-                });
-            }
-        });
-
-        scope(|s| {
-            for t in (THREADS / 2)..THREADS {
-                s.spawn(move || {
-                    let handle = handle();
-                    let mut keys: Vec<i32> =
-                        (0..ELEMENTS_PER_THREADS).map(|k| k * THREADS + t).collect();
-                    shuffle(&mut keys);
-                    for i in keys {
-                        assert_eq!(
-                            Some(&i.to_string()),
-                            map.get(&i, &handle).as_ref().map(|v| v.borrow())
-                        );
-                    }
-                });
-            }
-        });
-    }
-
+    // Smoke test
     #[test]
     fn smoke_nm_tree() {
-        smoke::<NMTreeMap<i32, String>>();
+        map_common::smoke::<NMTreeMap<i32, String>>();
+    }
+
+    // Basic operation tests
+    #[test]
+    fn basic_operations_nm_tree() {
+        map_common::test_basic_operations::<NMTreeMap<i32, String>>();
+    }
+
+    // Multiple elements tests
+    #[test]
+    fn multiple_elements_nm_tree() {
+        map_common::test_multiple_elements::<NMTreeMap<i32, String>>();
+    }
+
+    // Reverse order insert tests
+    #[test]
+    fn reverse_order_insert_nm_tree() {
+        map_common::test_reverse_order_insert::<NMTreeMap<i32, String>>();
+    }
+
+    // Concurrent insert/remove tests
+    #[test]
+    fn concurrent_insert_remove_nm_tree() {
+        map_common::test_concurrent_insert_remove::<NMTreeMap<i32, String>>();
+    }
+
+    // Stress tests (disabled by default)
+    // To run: cargo test -- --ignored
+    // To run with address sanitizer: RUSTFLAGS="-Z sanitizer=address" cargo +nightly test -- --ignored
+    #[test]
+    #[ignore]
+    #[serial]
+    fn stress_nm_tree() {
+        map_common::stress_test::<NMTreeMap<i32, String>>();
     }
 }

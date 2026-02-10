@@ -1,8 +1,11 @@
+mod map_common;
+
 #[macro_use]
 extern crate bitflags;
 use cdpt::{
     AtomicShared, AtomicSharedOption, Guard, Handle, Local, Shared, TraceObj, TracePtr, pin,
 };
+use map_common::{ConcurrentMap, ValueRef};
 
 use std::sync::atomic::Ordering;
 
@@ -214,8 +217,14 @@ where
             node: node.protect(handle),
         }
     }
+}
 
-    pub fn borrow(&self) -> &V {
+impl<K, V> ValueRef<V> for VHolder<'_, K, V>
+where
+    K: Send + Sync,
+    V: Send + Sync,
+{
+    fn borrow(&self) -> &V {
         self.node.value.as_ref().unwrap()
     }
 }
@@ -565,22 +574,13 @@ where
     }
 }
 
-pub trait ConcurrentMap<K, V>
-where
-    K: Send + Sync,
-    V: Send + Sync,
-{
-    fn new() -> Self;
-    fn get<'h>(&self, key: &K, handle: &'h Handle) -> Option<VHolder<'h, K, V>>;
-    fn insert(&self, key: K, value: V, handle: &Handle) -> bool;
-    fn remove<'h>(&self, key: &K, handle: &'h Handle) -> Option<VHolder<'h, K, V>>;
-}
-
 impl<K, V> ConcurrentMap<K, V> for EFRBTree<K, V>
 where
     K: 'static + Sync + Send + Ord + Clone,
     V: 'static + Sync + Send + Clone,
 {
+    type ValueRef<'h> = VHolder<'h, K, V>;
+
     fn new() -> Self {
         EFRBTree::new()
     }
@@ -604,67 +604,45 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use cdpt::handle;
-    use fastrand::shuffle;
-    use std::thread::scope;
+    use serial_test::serial;
 
-    const THREADS: i32 = 30;
-    const ELEMENTS_PER_THREADS: i32 = 1000;
-
-    fn smoke<M: ConcurrentMap<i32, String> + Send + Sync>() {
-        let map = &M::new();
-
-        scope(|s| {
-            for t in 0..THREADS {
-                s.spawn(move || {
-                    let handle = handle();
-                    let mut keys: Vec<i32> =
-                        (0..ELEMENTS_PER_THREADS).map(|k| k * THREADS + t).collect();
-                    shuffle(&mut keys);
-                    for i in keys {
-                        assert!(map.insert(i, i.to_string(), &handle));
-                    }
-                });
-            }
-        });
-
-        scope(|s| {
-            for t in 0..(THREADS / 2) {
-                s.spawn(move || {
-                    let handle = handle();
-                    let mut keys: Vec<i32> =
-                        (0..ELEMENTS_PER_THREADS).map(|k| k * THREADS + t).collect();
-                    shuffle(&mut keys);
-                    for i in keys {
-                        assert_eq!(
-                            Some(&i.to_string()),
-                            map.remove(&i, &handle).as_ref().map(|v| v.borrow())
-                        );
-                    }
-                });
-            }
-        });
-
-        scope(|s| {
-            for t in (THREADS / 2)..THREADS {
-                s.spawn(move || {
-                    let handle = handle();
-                    let mut keys: Vec<i32> =
-                        (0..ELEMENTS_PER_THREADS).map(|k| k * THREADS + t).collect();
-                    shuffle(&mut keys);
-                    for i in keys {
-                        assert_eq!(
-                            Some(&i.to_string()),
-                            map.get(&i, &handle).as_ref().map(|v| v.borrow())
-                        );
-                    }
-                });
-            }
-        });
-    }
-
+    // Smoke test
     #[test]
     fn smoke_efrb_tree() {
-        smoke::<EFRBTree<i32, String>>();
+        map_common::smoke::<EFRBTree<i32, String>>();
+    }
+
+    // Basic operation tests
+    #[test]
+    fn basic_operations_efrb_tree() {
+        map_common::test_basic_operations::<EFRBTree<i32, String>>();
+    }
+
+    // Multiple elements tests
+    #[test]
+    fn multiple_elements_efrb_tree() {
+        map_common::test_multiple_elements::<EFRBTree<i32, String>>();
+    }
+
+    // Reverse order insert tests
+    #[test]
+    fn reverse_order_insert_efrb_tree() {
+        map_common::test_reverse_order_insert::<EFRBTree<i32, String>>();
+    }
+
+    // Concurrent insert/remove tests
+    #[test]
+    fn concurrent_insert_remove_efrb_tree() {
+        map_common::test_concurrent_insert_remove::<EFRBTree<i32, String>>();
+    }
+
+    // Stress tests (disabled by default)
+    // To run: cargo test -- --ignored
+    // To run with address sanitizer: RUSTFLAGS="-Z sanitizer=address" cargo +nightly test -- --ignored
+    #[test]
+    #[ignore]
+    #[serial]
+    fn stress_efrb_tree() {
+        map_common::stress_test::<EFRBTree<i32, String>>();
     }
 }

@@ -1,4 +1,7 @@
+mod map_common;
+
 use cdpt::{AtomicShared, AtomicSharedOption, Guard, Handle, Local, TraceObj, TracePtr, pin};
+use map_common::{ConcurrentMap, ValueRef};
 
 use std::cmp::Ordering::{Equal, Greater, Less};
 use std::sync::atomic::Ordering;
@@ -105,8 +108,14 @@ where
             node: node.protect(handle),
         }
     }
+}
 
-    pub fn borrow(&self) -> &V {
+impl<K, V> ValueRef<V> for VHolder<'_, K, V>
+where
+    K: Send + Sync,
+    V: Send + Sync,
+{
+    fn borrow(&self) -> &V {
         &self.node.value
     }
 }
@@ -227,9 +236,8 @@ where
             let (next, next_tag) = curr_node.next.load_with_tag(Ordering::Acquire, guard);
             match curr_node.key.cmp(key) {
                 Less => {
-                    cursor.curr = next;
-                    // NOTE: unnecessary (this function is expected to be used only for `get`)
                     cursor.prev = cursor.curr.unwrap();
+                    cursor.curr = next;
                     continue;
                 }
                 Equal => break (next_tag == 0, cursor),
@@ -365,17 +373,6 @@ where
     }
 }
 
-pub trait ConcurrentMap<K, V>
-where
-    K: Send + Sync,
-    V: Send + Sync,
-{
-    fn new() -> Self;
-    fn get<'h>(&self, key: &K, handle: &'h Handle) -> Option<VHolder<'h, K, V>>;
-    fn insert(&self, key: K, value: V, handle: &Handle) -> bool;
-    fn remove<'h>(&self, key: &K, handle: &'h Handle) -> Option<VHolder<'h, K, V>>;
-}
-
 pub struct HList<K, V>
 where
     K: 'static + Send + Sync,
@@ -389,6 +386,8 @@ where
     K: Send + Sync + Ord + Default,
     V: Send + Sync + Default,
 {
+    type ValueRef<'h> = VHolder<'h, K, V>;
+
     fn new() -> Self {
         HList { inner: List::new() }
     }
@@ -420,6 +419,8 @@ where
     K: Send + Sync + Ord + Default,
     V: Send + Sync + Default,
 {
+    type ValueRef<'h> = VHolder<'h, K, V>;
+
     fn new() -> Self {
         HMList { inner: List::new() }
     }
@@ -451,6 +452,8 @@ where
     K: Send + Sync + Ord + Default,
     V: Send + Sync + Default,
 {
+    type ValueRef<'h> = VHolder<'h, K, V>;
+
     fn new() -> Self {
         HHSList { inner: List::new() }
     }
@@ -502,21 +505,6 @@ where
         k.hash(&mut s);
         s.finish() as usize
     }
-
-    pub fn get<'h>(&self, k: &K, handle: &'h Handle) -> Option<VHolder<'h, K, V>> {
-        let i = Self::hash(k);
-        self.get_bucket(i).get(k, handle)
-    }
-
-    pub fn insert(&self, k: K, v: V, handle: &Handle) -> bool {
-        let i = Self::hash(&k);
-        self.get_bucket(i).insert(k, v, handle)
-    }
-
-    pub fn remove<'h>(&self, k: &K, handle: &'h Handle) -> Option<VHolder<'h, K, V>> {
-        let i = Self::hash(k);
-        self.get_bucket(i).remove(k, handle)
-    }
 }
 
 impl<K, V> ConcurrentMap<K, V> for HashMap<K, V>
@@ -524,103 +512,167 @@ where
     K: 'static + Send + Sync + Ord + Default + Hash,
     V: 'static + Send + Sync + Default,
 {
+    type ValueRef<'h> = VHolder<'h, K, V>;
+
     fn new() -> Self {
         Self::with_capacity(30000)
     }
 
     #[inline(always)]
     fn get<'h>(&self, key: &K, handle: &'h Handle) -> Option<VHolder<'h, K, V>> {
-        self.get(key, handle)
+        let i = Self::hash(key);
+        self.get_bucket(i).get(key, handle)
     }
     #[inline(always)]
     fn insert(&self, key: K, value: V, handle: &Handle) -> bool {
-        self.insert(key, value, handle)
+        let i = Self::hash(&key);
+        self.get_bucket(i).insert(key, value, handle)
     }
     #[inline(always)]
     fn remove<'h>(&self, key: &K, handle: &'h Handle) -> Option<VHolder<'h, K, V>> {
-        self.remove(key, handle)
+        let i = Self::hash(key);
+        self.get_bucket(i).remove(key, handle)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use cdpt::handle;
-    use fastrand::shuffle;
-    use std::thread::scope;
+    use serial_test::serial;
 
-    const THREADS: i32 = 30;
-    const ELEMENTS_PER_THREADS: i32 = 1000;
-
-    fn smoke<M: ConcurrentMap<i32, String> + Send + Sync>() {
-        let map = &M::new();
-
-        scope(|s| {
-            for t in 0..THREADS {
-                s.spawn(move || {
-                    let handle = handle();
-                    let mut keys: Vec<i32> =
-                        (0..ELEMENTS_PER_THREADS).map(|k| k * THREADS + t).collect();
-                    shuffle(&mut keys);
-                    for i in keys {
-                        assert!(map.insert(i, i.to_string(), &handle));
-                    }
-                });
-            }
-        });
-
-        scope(|s| {
-            for t in 0..(THREADS / 2) {
-                s.spawn(move || {
-                    let handle = handle();
-                    let mut keys: Vec<i32> =
-                        (0..ELEMENTS_PER_THREADS).map(|k| k * THREADS + t).collect();
-                    shuffle(&mut keys);
-                    for i in keys {
-                        assert_eq!(
-                            Some(&i.to_string()),
-                            map.remove(&i, &handle).as_ref().map(|v| v.borrow())
-                        );
-                    }
-                });
-            }
-        });
-
-        scope(|s| {
-            for t in (THREADS / 2)..THREADS {
-                s.spawn(move || {
-                    let handle = handle();
-                    let mut keys: Vec<i32> =
-                        (0..ELEMENTS_PER_THREADS).map(|k| k * THREADS + t).collect();
-                    shuffle(&mut keys);
-                    for i in keys {
-                        assert_eq!(
-                            Some(&i.to_string()),
-                            map.get(&i, &handle).as_ref().map(|v| v.borrow())
-                        );
-                    }
-                });
-            }
-        });
-    }
-
+    // Smoke tests
     #[test]
     fn smoke_harris() {
-        smoke::<HList<i32, String>>();
+        map_common::smoke::<HList<i32, String>>();
     }
 
     #[test]
     fn smoke_harris_michael() {
-        smoke::<HMList<i32, String>>();
+        map_common::smoke::<HMList<i32, String>>();
     }
 
     #[test]
     fn smoke_harris_herlihy_shavit() {
-        smoke::<HHSList<i32, String>>();
+        map_common::smoke::<HHSList<i32, String>>();
     }
 
     #[test]
     fn smoke_hash_map() {
-        smoke::<HashMap<i32, String>>();
+        map_common::smoke::<HashMap<i32, String>>();
+    }
+
+    // Basic operation tests
+    #[test]
+    fn basic_operations_harris() {
+        map_common::test_basic_operations::<HList<i32, String>>();
+    }
+
+    #[test]
+    fn basic_operations_harris_michael() {
+        map_common::test_basic_operations::<HMList<i32, String>>();
+    }
+
+    #[test]
+    fn basic_operations_harris_herlihy_shavit() {
+        map_common::test_basic_operations::<HHSList<i32, String>>();
+    }
+
+    #[test]
+    fn basic_operations_hash_map() {
+        map_common::test_basic_operations::<HashMap<i32, String>>();
+    }
+
+    // Multiple elements tests
+    #[test]
+    fn multiple_elements_harris() {
+        map_common::test_multiple_elements::<HList<i32, String>>();
+    }
+
+    #[test]
+    fn multiple_elements_harris_michael() {
+        map_common::test_multiple_elements::<HMList<i32, String>>();
+    }
+
+    #[test]
+    fn multiple_elements_harris_herlihy_shavit() {
+        map_common::test_multiple_elements::<HHSList<i32, String>>();
+    }
+
+    #[test]
+    fn multiple_elements_hash_map() {
+        map_common::test_multiple_elements::<HashMap<i32, String>>();
+    }
+
+    // Reverse order insert tests
+    #[test]
+    fn reverse_order_insert_harris() {
+        map_common::test_reverse_order_insert::<HList<i32, String>>();
+    }
+
+    #[test]
+    fn reverse_order_insert_harris_michael() {
+        map_common::test_reverse_order_insert::<HMList<i32, String>>();
+    }
+
+    #[test]
+    fn reverse_order_insert_harris_herlihy_shavit() {
+        map_common::test_reverse_order_insert::<HHSList<i32, String>>();
+    }
+
+    #[test]
+    fn reverse_order_insert_hash_map() {
+        map_common::test_reverse_order_insert::<HashMap<i32, String>>();
+    }
+
+    // Concurrent insert/remove tests
+    #[test]
+    fn concurrent_insert_remove_harris() {
+        map_common::test_concurrent_insert_remove::<HList<i32, String>>();
+    }
+
+    #[test]
+    fn concurrent_insert_remove_harris_michael() {
+        map_common::test_concurrent_insert_remove::<HMList<i32, String>>();
+    }
+
+    #[test]
+    fn concurrent_insert_remove_harris_herlihy_shavit() {
+        map_common::test_concurrent_insert_remove::<HHSList<i32, String>>();
+    }
+
+    #[test]
+    fn concurrent_insert_remove_hash_map() {
+        map_common::test_concurrent_insert_remove::<HashMap<i32, String>>();
+    }
+
+    // Stress tests (disabled by default)
+    // Recommended: cargo test --release -- --ignored
+    // With address sanitizer: RUSTFLAGS="-Z sanitizer=address" cargo +nightly test --release -- --ignored
+    #[test]
+    #[ignore]
+    #[serial]
+    fn stress_harris() {
+        map_common::stress_test_list::<HList<i32, String>>();
+    }
+
+    #[test]
+    #[ignore]
+    #[serial]
+    fn stress_harris_michael() {
+        map_common::stress_test_list::<HMList<i32, String>>();
+    }
+
+    #[test]
+    #[ignore]
+    #[serial]
+    fn stress_harris_herlihy_shavit() {
+        map_common::stress_test_list::<HHSList<i32, String>>();
+    }
+
+    #[test]
+    #[ignore]
+    #[serial]
+    fn stress_hash_map() {
+        map_common::stress_test_list::<HashMap<i32, String>>();
     }
 }
