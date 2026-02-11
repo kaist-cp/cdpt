@@ -1,3 +1,4 @@
+#[path = "common/mod.rs"]
 mod map_common;
 
 use cdpt::{AtomicShared, AtomicSharedOption, Guard, Handle, Local, TraceObj, TracePtr, pin};
@@ -522,6 +523,10 @@ where
     }
 }
 
+fn main() {
+    map_common::stress_test::<HashMap<i32, String>>();
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -632,8 +637,9 @@ mod tests {
     }
 
     // Stress tests (disabled by default)
-    // Recommended: cargo test --release -- --ignored
-    // With address sanitizer: RUSTFLAGS="-Z sanitizer=address" cargo +nightly test --release -- --ignored
+    // Recommended: cargo test --release --all-targets -- --ignored
+    // With address sanitizer: RUSTFLAGS="-Z sanitizer=address" cargo +nightly test --release --all-targets -- --ignored
+    // (Set `--target` for your machine: https://doc.rust-lang.org/beta/unstable-book/compiler-flags/sanitizer.html)
     #[test]
     #[ignore]
     fn stress_harris() {

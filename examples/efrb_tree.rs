@@ -1,3 +1,4 @@
+#[path = "common/mod.rs"]
 mod map_common;
 
 #[macro_use]
@@ -547,6 +548,10 @@ where
     }
 }
 
+fn main() {
+    map_common::stress_test::<EFRBTree<i32, String>>();
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -582,8 +587,9 @@ mod tests {
     }
 
     // Stress tests (disabled by default)
-    // To run: cargo test -- --ignored
-    // To run with address sanitizer: RUSTFLAGS="-Z sanitizer=address" cargo +nightly test -- --ignored
+    // To run: cargo test --release --all-targets -- --ignored
+    // To run with address sanitizer: RUSTFLAGS="-Z sanitizer=address" cargo +nightly test --release --all-targets -- --ignored
+    // (Set `--target` for your machine: https://doc.rust-lang.org/beta/unstable-book/compiler-flags/sanitizer.html)
     #[test]
     #[ignore]
     fn stress_efrb_tree() {

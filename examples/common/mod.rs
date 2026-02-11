@@ -330,13 +330,14 @@ impl StressConfig {
 ///
 /// **Recommended:** Run stress tests with release profile for reasonable performance:
 /// ```sh
-/// cargo test --release -- --ignored
+/// cargo test --release --all-targets -- --ignored
 /// ```
 ///
 /// To run with address sanitizer (requires nightly):
 /// ```sh
-/// RUSTFLAGS="-Z sanitizer=address" cargo +nightly test --release -- --ignored
+/// RUSTFLAGS="-Z sanitizer=address" cargo +nightly test --release --all-targets -- --ignored
 /// ```
+/// (Set `--target` for your machine: https://doc.rust-lang.org/beta/unstable-book/compiler-flags/sanitizer.html)
 pub fn stress_test_with_config<M>(config: StressConfig)
 where
     M: ConcurrentMap<i32, String>,
