@@ -17,7 +17,7 @@ use std::{
     sync::atomic::{AtomicPtr, AtomicUsize, Ordering},
 };
 
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct ObjMeta(usize);
 
 impl From<usize> for ObjMeta {
@@ -156,7 +156,7 @@ unsafe impl<T: TraceObj> TraceObj for ManObj<T> {
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum PtrMeta {
     Rooted,
     Unrooted(Color),
@@ -1605,3 +1605,166 @@ where
 // `Local<'g, Guard, T>`, which is protected by a coarse-grained phase-critical section,
 // can be cloned (copied) without additional costs because `Guard::Shield` is just `()`.
 impl<'g, G: Protector, T: Send + Sync + TraceObj> Copy for Local<'g, G, T> where G::Shield: Copy {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::epoch::Color;
+
+    // ---- ObjMeta tests ----
+
+    #[test]
+    fn obj_meta_new_and_accessors() {
+        let meta = ObjMeta::new(Color::C0, 0);
+        assert_eq!(meta.marked(), Color::C0);
+        assert_eq!(meta.root_count(), 0);
+
+        let meta = ObjMeta::new(Color::C1, 5);
+        assert_eq!(meta.marked(), Color::C1);
+        assert_eq!(meta.root_count(), 5);
+    }
+
+    #[test]
+    fn obj_meta_with_marked() {
+        let meta = ObjMeta::new(Color::C0, 10);
+        let flipped = meta.with_marked(Color::C1);
+        assert_eq!(flipped.marked(), Color::C1);
+        assert_eq!(flipped.root_count(), 10);
+    }
+
+    #[test]
+    fn obj_meta_default() {
+        let meta = ObjMeta::default();
+        assert_eq!(meta.marked(), Color::C0);
+        assert_eq!(meta.root_count(), 0);
+    }
+
+    // ---- AtomicObjMeta tests ----
+
+    #[test]
+    fn atomic_obj_meta_load() {
+        let ameta = AtomicObjMeta::new(Color::C1, 3);
+        let loaded = ameta.load(Ordering::SeqCst);
+        assert_eq!(loaded.marked(), Color::C1);
+        assert_eq!(loaded.root_count(), 3);
+    }
+
+    #[test]
+    fn atomic_obj_meta_increment_root_count() {
+        let ameta = AtomicObjMeta::new(Color::C0, 1);
+        let prev = ameta.increment_root_count(Ordering::SeqCst);
+        assert_eq!(prev, 1);
+        assert_eq!(ameta.load(Ordering::SeqCst).root_count(), 2);
+    }
+
+    #[test]
+    fn atomic_obj_meta_decrement_root_count() {
+        let ameta = AtomicObjMeta::new(Color::C0, 3);
+        let prev = ameta.decrement_root_count(Ordering::SeqCst);
+        assert_eq!(prev, 3);
+        assert_eq!(ameta.load(Ordering::SeqCst).root_count(), 2);
+    }
+
+    #[test]
+    fn atomic_obj_meta_increment_preserves_color() {
+        let ameta = AtomicObjMeta::new(Color::C1, 5);
+        ameta.increment_root_count(Ordering::SeqCst);
+        let loaded = ameta.load(Ordering::SeqCst);
+        assert_eq!(loaded.marked(), Color::C1);
+        assert_eq!(loaded.root_count(), 6);
+    }
+
+    // ---- PtrMeta tests ----
+
+    #[test]
+    fn ptr_meta_equality() {
+        assert_eq!(PtrMeta::Rooted, PtrMeta::Rooted);
+        assert_eq!(PtrMeta::Unrooted(Color::C0), PtrMeta::Unrooted(Color::C0));
+        assert_eq!(PtrMeta::Unrooted(Color::C1), PtrMeta::Unrooted(Color::C1));
+        assert_ne!(PtrMeta::Rooted, PtrMeta::Unrooted(Color::C0));
+        assert_ne!(PtrMeta::Unrooted(Color::C0), PtrMeta::Unrooted(Color::C1));
+    }
+
+    // ---- ManPtr tests ----
+
+    #[test]
+    fn man_ptr_null_base_is_null() {
+        let ptr = ManPtr::<()>::null_base();
+        assert!(ptr.is_null());
+    }
+
+    #[test]
+    fn man_ptr_null_rooted() {
+        let ptr = ManPtr::<()>::null_rooted();
+        assert!(ptr.is_null());
+        assert_eq!(ptr.meta(), PtrMeta::Rooted);
+    }
+
+    #[test]
+    fn man_ptr_null_rooted_with_tag() {
+        let ptr = ManPtr::<()>::null_rooted_with_tag(1);
+        assert!(ptr.is_null());
+        assert_eq!(ptr.meta(), PtrMeta::Rooted);
+        assert_eq!(ptr.tag(), 1);
+    }
+
+    #[test]
+    fn man_ptr_meta_roundtrip() {
+        let base = ManPtr::<()>::null_base();
+
+        let rooted = base.with_meta(PtrMeta::Rooted);
+        assert_eq!(rooted.meta(), PtrMeta::Rooted);
+
+        let c0 = base.with_meta(PtrMeta::Unrooted(Color::C0));
+        assert_eq!(c0.meta(), PtrMeta::Unrooted(Color::C0));
+
+        let c1 = base.with_meta(PtrMeta::Unrooted(Color::C1));
+        assert_eq!(c1.meta(), PtrMeta::Unrooted(Color::C1));
+    }
+
+    #[test]
+    fn man_ptr_without_meta() {
+        let base = ManPtr::<()>::null_base();
+        let rooted = base.with_meta(PtrMeta::Rooted);
+        let cleared = rooted.without_meta();
+        assert_eq!(cleared.meta(), PtrMeta::Unrooted(Color::C0));
+    }
+
+    #[test]
+    fn man_ptr_tag_roundtrip() {
+        let ptr = ManPtr::<()>::null_rooted();
+        assert_eq!(ptr.tag(), 0);
+
+        // Tag bits are limited to the low bits of the alignment.
+        // For ManObj<()>, the alignment determines available tag bits.
+        let tagged = ptr.with_tag(1);
+        assert_eq!(tagged.tag(), 1);
+    }
+
+    #[test]
+    fn man_ptr_tag_preserves_meta() {
+        let ptr = ManPtr::<()>::null_rooted();
+        let tagged = ptr.with_tag(1);
+        assert_eq!(tagged.meta(), PtrMeta::Rooted);
+    }
+
+    #[test]
+    fn man_ptr_equality() {
+        let a = ManPtr::<()>::null_base();
+        let b = ManPtr::<()>::null_base();
+        assert!(a == b);
+
+        let c = a.with_meta(PtrMeta::Rooted);
+        assert!(a != c);
+    }
+
+    #[test]
+    fn man_ptr_clone_copy() {
+        let ptr = ManPtr::<()>::null_rooted();
+        let cloned = ptr.clone();
+        assert!(ptr == cloned);
+
+        let copied = ptr;
+        assert!(ptr == copied);
+    }
+}

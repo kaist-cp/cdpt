@@ -136,7 +136,7 @@ fn gen_trace_for_type(
                 });
             }
 
-            if (ident == "Box" || ident == "Vec" || ident == "VecDeque" || ident == "ArrayVec")
+            if (ident == "Vec" || ident == "VecDeque" || ident == "ArrayVec")
                 && let PathArguments::AngleBracketed(args) = &last.arguments
                 && let Some(GenericArgument::Type(inner)) = args.args.first()
                 && let Some(inner_trace) = gen_trace_for_type(inner, &quote! { __inner }, method)
@@ -148,17 +148,14 @@ fn gen_trace_for_type(
                 });
             }
 
-            if ident == "Arc"
+            if (ident == "Box" || ident == "Arc")
                 && let PathArguments::AngleBracketed(args) = &last.arguments
                 && let Some(GenericArgument::Type(inner)) = args.args.first()
-                && let Some(inner_trace) = gen_trace_for_type(inner, &quote! { __inner }, method)
             {
-                return Some(quote_spanned! { ty.span() =>
-                    {
-                        let __inner = &#expr;
-                        #inner_trace
-                    }
-                });
+                let derefed = quote! { (*#expr) };
+                if let Some(inner_trace) = gen_trace_for_type(inner, &derefed, method) {
+                    return Some(inner_trace);
+                }
             }
 
             if ident == "Result"
@@ -211,6 +208,15 @@ fn gen_trace_for_type(
         }
         Type::Array(a) => {
             if let Some(inner_trace) = gen_trace_for_type(&a.elem, &quote! { __inner }, method) {
+                return Some(quote_spanned! { ty.span() =>
+                    for __inner in &#expr {
+                        #inner_trace
+                    }
+                });
+            }
+        }
+        Type::Slice(s) => {
+            if let Some(inner_trace) = gen_trace_for_type(&s.elem, &quote! { __inner }, method) {
                 return Some(quote_spanned! { ty.span() =>
                     for __inner in &#expr {
                         #inner_trace
