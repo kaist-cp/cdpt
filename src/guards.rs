@@ -19,7 +19,16 @@ use std::{
 const HELP_NORMAL_MAX_TRIAL: usize = 2;
 const HELP_TRACING_MAX_TRIAL: usize = 4;
 
-/// A handle to a garbage collector.
+/// A thread-local handle to the garbage collector.
+///
+/// Obtain one via [`handle()`](crate::handle). A `Handle` is cheap to clone
+/// (reference-counted) and is used for two purposes:
+///
+/// 1. **Pinning** — call [`pin()`](Handle::pin) to enter a phase-critical section
+///    and get a [`Guard`].
+/// 2. **HP protection** — pass a `Handle` to [`Local::protect`](crate::Local::protect)
+///    to create a [`Local<Handle, T>`](crate::Local) whose lifetime extends beyond
+///    a single [`Guard`], protected by a hazard pointer instead.
 #[derive(Clone)]
 pub struct Handle {
     pub(crate) local: Rc<Entry<Local>>,
@@ -31,7 +40,11 @@ impl Handle {
         &self.local
     }
 
-    /// Pins the handle.
+    /// Pins the current thread, entering a *phase-critical section*.
+    ///
+    /// Returns a [`Guard`] whose lifetime defines the critical section. Within
+    /// it you may allocate managed objects, load atomic pointers, and freely
+    /// dereference any [`Local`](crate::Local) obtained from those loads.
     #[inline]
     pub fn pin(&self) -> Guard {
         let guard = Guard::new(self.local.clone());
@@ -52,6 +65,35 @@ impl Handle {
     }
 }
 
+/// An RAII guard representing an active *phase-critical section*.
+///
+/// While a `Guard` is alive, the current thread is *pinned* to the global epoch.
+/// This guarantees that all managed pointers reachable at the time of pinning
+/// remain valid for the guard's lifetime, enabling safe, lock-free traversals
+/// of the managed heap.
+///
+/// **Not a lock.** Despite the name "critical section", a `Guard` does *not*
+/// block other threads. Any number of mutators may hold their own `Guard`s
+/// concurrently. The section only serves as a synchronization point between
+/// mutators and the collector: it tells the collector that this thread is
+/// actively accessing the managed heap during a particular epoch, so that
+/// phase transitions can be coordinated safely (similar to RCU's read-side
+/// critical section).
+///
+/// # Typical usage
+///
+/// ```ignore
+/// let guard = cdpt::pin();            // enter critical section
+/// let local = some_atomic.load(Ordering::Acquire, &guard);
+/// println!("{}", *local);             // safe dereference
+/// // guard dropped here → critical section ends
+/// ```
+///
+/// **Keep critical sections short.** A long-lived `Guard` delays epoch
+/// advancement and prevents garbage collection from making progress.
+/// If you need a reference that outlives the guard, promote it to a
+/// hazard-pointer–protected [`Local<Handle, T>`](crate::Local) via
+/// [`Local::protect`](crate::Local::protect).
 pub struct Guard {
     local: Rc<Entry<Local>>,
     should_help: Cell<bool>,
@@ -65,12 +107,12 @@ impl Guard {
         }
     }
 
-    /// Unpins and then immediately re-pins the thread.
+    /// Unpins and immediately re-pins the thread, refreshing the local epoch.
     ///
-    /// This method is useful when you don't want delay the advancement of the global epoch by
-    /// holding an old epoch. For safety, you should not maintain any guard-based reference across
-    /// the call (the latter is enforced by `&mut self`). The thread will only be repinned if this
-    /// is the only active guard for the current thread.
+    /// Call this in long-running loops to avoid blocking global epoch advancement.
+    /// Takes `&mut self` to statically prevent any `Local<Guard, T>` from being
+    /// held across the call — all such references must be re-acquired afterwards.
+    /// Only effective when this is the sole active guard for the current thread.
     pub fn repin(&mut self) {
         self.help_collect_if_scheduled();
         self.local().repin();
@@ -128,7 +170,10 @@ impl Guard {
         }
     }
 
-    /// Helps the ongoing collection works if possible.
+    /// Voluntarily assists the collector with pending work (sweeping or tracing).
+    ///
+    /// Called automatically on an intensive memory allocation, but can be invoked
+    /// explicitly in long-running operations to help GC make progress.
     pub fn help_collect(&self) {
         match self.phase() {
             Phase::N => self.help_normal(),
