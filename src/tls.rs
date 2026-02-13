@@ -3,6 +3,15 @@ use std::sync::OnceLock;
 use crate::guards::{Guard, Handle};
 use crate::internal::{Global, Local};
 
+/// Returns the singleton [`Global`] instance for the garbage collector.
+///
+/// Use this to configure the collector or query heap statistics:
+///
+/// ```ignore
+/// let g = cdpt::global();
+/// println!("heap usage: {} bytes", g.estimate_heap_usage());
+/// g.enable_collection(false);  // pause GC
+/// ```
 pub fn global() -> &'static Global {
     /// The global data for the default garbage collector.
     static GLOBAL: OnceLock<Global> = OnceLock::new();
@@ -16,26 +25,27 @@ thread_local! {
 
 /// Returns a thread-local [`Handle`] for the garbage collector.
 ///
-/// Each thread gets its own `Handle` automatically. Use it to [`pin()`](Handle::pin)
-/// into a phase-critical section or to [`protect`](crate::Local::protect) a local
-/// pointer beyond the lifetime of a [`Guard`].
+/// Each thread gets its own `Handle` automatically. Use it to:
+/// - Call [`pin()`](Handle::pin) to access the managed heap.
+/// - Pass to [`Local::protect`](crate::Local::protect) to keep a reference
+///   alive after its [`Guard`] is dropped.
 ///
 /// # Example
 ///
 /// ```ignore
 /// let handle = cdpt::handle();
 /// let guard = handle.pin();
-/// // ... access managed pointers within this critical section ...
+/// // ... allocate, load, and dereference managed pointers ...
 /// ```
 pub fn handle() -> Handle {
     HANDLE.with(|primary| primary.clone())
 }
 
-/// Pins the current thread and returns a [`Guard`].
+/// Shorthand for [`handle().pin()`](Handle::pin).
 ///
-/// This is a shorthand for `handle().pin()`. Within the returned guard's
-/// lifetime (a *phase-critical section*), all reachable managed pointers are
-/// safe to dereference.
+/// Returns a [`Guard`] that lets you allocate, load, and dereference managed
+/// pointers. Drop the guard when you are done to let the collector make
+/// progress.
 pub fn pin() -> Guard {
     HANDLE.with(|primary| primary.pin())
 }

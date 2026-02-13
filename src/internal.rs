@@ -28,7 +28,20 @@ const ALLOC_HELPING_PERIOD: usize = 64;
 const SCHED_HELPING_PERIOD: usize = 32;
 const LOCAL_MARK_TASKS_CAP: usize = 4096;
 
-/// The global data for a garbage collector.
+/// Global state of the garbage collector, providing configuration and
+/// profiling.
+///
+/// Obtain the singleton instance via [`global()`](crate::global). Most
+/// users only need [`pin()`](crate::pin) and [`handle()`](crate::handle);
+/// use `Global` when you need to toggle collection or monitor heap usage.
+///
+/// # Heap size estimation
+///
+/// The `estimate_*` methods track bytes allocated and reclaimed based on
+/// [`std::mem::size_of`] of each managed object. This means heap allocations
+/// owned *inside* a managed type (e.g., a `String`'s buffer) are **not**
+/// accounted for — the reported sizes reflect only the shallow size of
+/// each object.
 pub struct Global {
     /// The intrusive linked list of `Local`s.
     pub(crate) locals: CachePadded<ReusableSlots<Local>>,
@@ -178,44 +191,35 @@ impl Global {
         }
     }
 
+    /// Enables or disables garbage collection.
+    ///
+    /// When disabled, the collector thread will not reclaim any objects.
+    /// Collection is enabled by default.
     pub fn enable_collection(&self, set: bool) {
         self.collection_enabled.store(set, Ordering::SeqCst);
     }
 
+    /// Returns the total bytes allocated on the managed heap since program
+    /// start. See [struct-level docs](Global#heap-size-estimation) for
+    /// accuracy caveats.
     pub fn estimate_total_alloc(&self) -> usize {
         self.stats.total_allocated.load(Ordering::Acquire)
     }
 
+    /// Returns the total bytes reclaimed by the collector since program
+    /// start. See [struct-level docs](Global#heap-size-estimation) for
+    /// accuracy caveats.
     pub fn estimate_total_reclm(&self) -> usize {
         self.stats.total_reclaimed.load(Ordering::Acquire)
     }
 
+    /// Returns the estimated current managed-heap size in bytes
+    /// (allocated − reclaimed, saturating at zero).
     pub fn estimate_heap_usage(&self) -> usize {
         let allocated = self.estimate_total_alloc();
         let reclaimed = self.estimate_total_reclm();
         allocated.saturating_sub(reclaimed)
     }
-
-    // TODO: Remove later...
-    // pub fn mark_stack_sizes(&self) -> Vec<usize> {
-    //     std::iter::once(self.mark_tasks.len())
-    //         .chain(
-    //             self.locals
-    //                 .iter_all()
-    //                 .map(|local| local.mark_tasks_stealer.len()),
-    //         )
-    //         .collect()
-    // }
-
-    // pub fn phase(&self) -> String {
-    //     let epoch = self.load_epoch();
-    //     let p = match epoch.phase() {
-    //         Phase::N => "normal",
-    //         Phase::RT => "root tracing",
-    //         Phase::CT => "completion tracing",
-    //     };
-    //     format!("#{} {p}", epoch.timestamp())
-    // }
 }
 
 /// Participant for garbage collection.

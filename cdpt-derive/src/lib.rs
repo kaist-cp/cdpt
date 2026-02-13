@@ -3,6 +3,42 @@ use quote::{quote, quote_spanned};
 use syn::spanned::Spanned;
 use syn::{Data, DeriveInput, Fields, GenericArgument, PathArguments, Type, parse_macro_input};
 
+/// Derives the [`TraceObj`](./trait.TraceObj.html) trait for a struct or enum.
+///
+/// This generates implementations of `TraceObj` (with `unroot_outgoings` and
+/// `shade_outgoings`) and a no-op `Drop`, by scanning fields for managed
+/// pointer types.
+///
+/// # Recognized field types
+///
+/// The macro automatically traces fields of these types (including nested
+/// wrappers like `Option<Shared<T>>`, `Vec<AtomicSharedOption<T>>`, etc.):
+///
+/// - `Shared<T>`
+/// - `AtomicShared<T>`
+/// - `AtomicSharedOption<T>`
+///
+/// Fields of other types are silently skipped (they are assumed to contain no
+/// managed pointers). Supported wrappers: `Option`, `Vec`, `VecDeque`,
+/// `ArrayVec`, `Box`, `Arc`, `Result`, tuples, arrays, slices, and references.
+///
+/// # Safety note
+///
+/// Scanning managed pointers behind interior mutability (e.g., `Mutex<Shared<T>>`)
+/// is unsafe (see [`TraceObj`](./trait.TraceObj.html#safety)), so those pointers
+/// will not be scanned. Use `AtomicShared` or `AtomicSharedOption` for concurrently
+/// mutable edges.
+///
+/// # Example
+///
+/// ```
+/// #[derive(TraceObj)]
+/// struct Node {
+///     value: usize,                       // skipped (no managed pointers)
+///     next: AtomicSharedOption<Node>,     // traced
+///     children: Vec<Shared<Node>>,        // traced
+/// }
+/// ```
 #[proc_macro_derive(TraceObj)]
 pub fn derive_trace_obj(input: TokenStream) -> TokenStream {
     let input = parse_macro_input!(input as DeriveInput);

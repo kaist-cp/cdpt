@@ -1,4 +1,14 @@
-//! Basic managed pointer types.
+//! Managed pointer types for building GC-integrated data structures.
+//!
+//! This module provides four pointer types, each suited to a different role:
+//!
+//! - [`Local`] — the only dereferenceable pointer; scoped to a [`Guard`] or
+//!   [`Handle`](crate::Handle).
+//! - [`Shared`] — an immutable, `Send + Sync`, root-counted reference (like `Arc<T>`).
+//! - [`AtomicShared`] — a non-nullable atomic pointer for concurrently mutable edges.
+//! - [`AtomicSharedOption`] — like `AtomicShared`, but nullable.
+//!
+//! See the [crate-level docs](crate) for a quick-start guide and comparison table.
 
 use crate::{
     epoch::{Color, Phase},
@@ -390,35 +400,35 @@ impl<T: 'static + Sync + Send + TraceObj> ManPtr<T> {
 
 /// Per-field tracing interface for GC-managed pointer fields.
 ///
-/// Implemented by [`Shared`], [`AtomicShared`], [`AtomicSharedOption`], and
-/// their `Option` wrappers. You typically don't call these methods directly —
+/// Implemented by [`Shared`], [`AtomicShared`], [`AtomicSharedOption`].
+/// You typically don't call these methods directly —
 /// they are invoked by the `#[derive(TraceObj)]` macro's generated code.
 pub trait TracePtr {
     /// Decrements the root count when the parent object is *boxed* (becomes a
-    /// heap edge rather than a root). Applies Yuasa's deletion barrier if
-    /// tracing is active.
+    /// heap edge rather than a root).
     fn unroot(&self, guard: &Guard);
 
     /// Shades the pointee and flips this pointer's color to black during tracing.
     fn shade(&self, guard: &Guard);
 }
 
-/// Trait for types that can be managed by the garbage collector.
+/// Any type stored in the managed heap must implement this trait.
 ///
-/// Derive this with `#[derive(TraceObj)]` — manual implementations are rarely
-/// needed. The derive macro generates `unroot_outgoings` and `shade_outgoings`
-/// by enumerating all [`Shared`], [`AtomicShared`], and [`AtomicSharedOption`]
-/// fields.
+/// Use `#[derive(TraceObj)]` — manual implementations are rarely needed. The
+/// derive macro automatically enumerates all [`Shared`], [`AtomicShared`], and
+/// [`AtomicSharedOption`] fields (including those inside `Option`, `Vec`, `Box`,
+/// tuples, etc.) and generates the required tracing methods.
 ///
 /// # Safety
 ///
 /// Implementations **must not** scan through interiorly mutable wrappers
 /// (e.g., `Mutex<Shared<T>>`). If a field is behind interior mutability, a
 /// mutator could move the pointer out concurrently, causing the collector to
-/// miss a root. Use [`AtomicShared`] for concurrently mutable edges instead.
+/// miss a root. Use [`AtomicShared`] or [`AtomicSharedOption`] for concurrently
+/// mutable edges instead.
 ///
 /// The user-defined type `T` must also satisfy `Send + Sync`.
-pub unsafe trait TraceObj : Sync + Send {
+pub unsafe trait TraceObj: Sync + Send {
     /// Calls [`TracePtr::unroot`] on every outgoing managed pointer field.
     ///
     /// Invoked when the parent object is boxed onto the heap (its outgoing
@@ -567,7 +577,9 @@ impl<T: 'static + Send + Sync + TraceObj> Default for AtomicSharedOption<T> {
 }
 
 impl<T: 'static + Send + Sync + TraceObj> AtomicSharedOption<T> {
-    /// Allocates a managed object and returns an atomic pointer to it.
+    /// Allocates a new managed object and wraps it in a nullable atomic pointer.
+    ///
+    /// The returned pointer holds a root count of 1 on the new object.
     #[inline(always)]
     pub fn some(item: T, guard: &Guard) -> Self {
         let ptr = ManPtr::alloc_rooted(item, guard.alloc_color(), 1, guard);
@@ -607,8 +619,10 @@ impl<T: 'static + Send + Sync + TraceObj> AtomicSharedOption<T> {
         }
     }
 
-    /// Atomically loads the pointer, returning a guard-scoped [`Local`]
-    /// reference (or `None` if null).
+    /// Reads the current pointer value.
+    ///
+    /// Returns `None` if null, or a guard-scoped [`Local`] that you can
+    /// dereference to access the managed object.
     #[inline(always)]
     pub fn load<'g>(&self, order: Ordering, guard: &'g Guard) -> Option<Local<'g, Guard, T>> {
         self.load_with_tag(order, guard).0
@@ -627,8 +641,10 @@ impl<T: 'static + Send + Sync + TraceObj> AtomicSharedOption<T> {
         unsafe { ptr.as_local_with_tag(guard) }
     }
 
-    /// Atomically stores a new pointer, applying write barriers as needed.
-    /// The previous value is dropped (root count decremented / deletion barrier).
+    /// Replaces the pointer with `new` (or null if `None`).
+    ///
+    /// The previous target is released automatically (root count decremented,
+    /// write barriers applied).
     pub fn store<'l, G: Protector>(
         &self,
         new: Option<&Local<'l, G, T>>,
@@ -649,8 +665,7 @@ impl<T: 'static + Send + Sync + TraceObj> AtomicSharedOption<T> {
         self.swap_with_tag(new, tag, order, guard);
     }
 
-    /// Atomically takes the value (sets this to null), returning the previous
-    /// pointer as a [`Local`].
+    /// Removes and returns the current value, leaving this pointer null.
     pub fn take<'g>(&self, order: Ordering, guard: &'g Guard) -> Option<Local<'g, Guard, T>> {
         self.take_with_tag(order, guard).0
     }
@@ -664,7 +679,7 @@ impl<T: 'static + Send + Sync + TraceObj> AtomicSharedOption<T> {
         self.swap_with_tag(None::<&Local<'g, Guard, T>>, 0, order, guard)
     }
 
-    /// Atomically swaps the pointer, returning the previous value.
+    /// Replaces the pointer with `new` and returns the old value.
     pub fn swap<'l, 'g, G: Protector>(
         &self,
         new: Option<&Local<'l, G, T>>,
@@ -884,7 +899,10 @@ impl<T: 'static + Send + Sync + TraceObj> AtomicSharedOption<T> {
     }
 
     /// Atomically ANDs the tag bits, returning the previous (pointer, tag) pair.
-    /// Only the low tag bits are affected; the address is unchanged.
+    ///
+    /// Tag bits are low bits available due to pointer alignment, commonly used
+    /// to mark nodes (e.g., logical deletion in lock-free data structures).
+    /// Only the tag bits are affected; the pointed-to address is unchanged.
     #[inline(always)]
     pub fn fetch_tag_and<'g>(
         &self,
@@ -1003,20 +1021,6 @@ impl<T: Send + Sync + TraceObj> TracePtr for AtomicSharedOption<T> {
                 Ok(_) => break,
                 Err(current) => ptr = ManPtr::<T>::from(current),
             }
-        }
-    }
-}
-
-impl<T: Send + Sync + TraceObj> TracePtr for Option<AtomicSharedOption<T>> {
-    fn unroot(&self, guard: &Guard) {
-        if let Some(p) = self {
-            p.unroot(guard);
-        }
-    }
-
-    fn shade(&self, guard: &Guard) {
-        if let Some(p) = self {
-            p.shade(guard);
         }
     }
 }
@@ -1151,8 +1155,9 @@ impl<T: 'static + Send + Sync + TraceObj> AtomicShared<T> {
         }
     }
 
-    /// Atomically loads the pointer, returning a guard-scoped [`Local`].
-    /// Never returns `None` since `AtomicShared` is non-nullable.
+    /// Reads the current pointer value as a guard-scoped [`Local`].
+    ///
+    /// Unlike [`AtomicSharedOption::load`], this never returns `None`.
     #[inline(always)]
     pub fn load<'g>(&self, order: Ordering, guard: &'g Guard) -> Local<'g, Guard, T> {
         let r = self.inner.load(order, guard);
@@ -1161,6 +1166,7 @@ impl<T: 'static + Send + Sync + TraceObj> AtomicShared<T> {
         unsafe { r.unwrap_unchecked() }
     }
 
+    /// Like [`load`](Self::load), but also returns the tag bits.
     #[inline(always)]
     pub fn load_with_tag<'g>(
         &self,
@@ -1173,11 +1179,12 @@ impl<T: 'static + Send + Sync + TraceObj> AtomicShared<T> {
         unsafe { (r.0.unwrap_unchecked(), r.1) }
     }
 
-    /// Atomically stores a new pointer, applying write barriers as needed.
+    /// Replaces the pointer with `new`, applying write barriers as needed.
     pub fn store<'l, G: Protector>(&self, new: &Local<'l, G, T>, order: Ordering, guard: &Guard) {
         self.inner.store(Some(new), order, guard);
     }
 
+    /// Like [`store`](Self::store), but also sets the tag bits.
     pub fn store_with_tag<'l, G: Protector>(
         &self,
         new: &Local<'l, G, T>,
@@ -1188,6 +1195,7 @@ impl<T: 'static + Send + Sync + TraceObj> AtomicShared<T> {
         self.inner.store_with_tag(Some(new), tag, order, guard);
     }
 
+    /// Replaces the pointer with `new` and returns the old value.
     pub fn take<'g>(&self, order: Ordering, guard: &'g Guard) -> Local<'g, Guard, T> {
         let r = self.inner.take(order, guard);
         debug_assert!(r.is_some());
@@ -1195,6 +1203,7 @@ impl<T: 'static + Send + Sync + TraceObj> AtomicShared<T> {
         unsafe { r.unwrap_unchecked() }
     }
 
+    /// Like [`take`](Self::take), but also returns the tag bits.
     pub fn take_with_tag<'g>(
         &self,
         order: Ordering,
@@ -1206,6 +1215,7 @@ impl<T: 'static + Send + Sync + TraceObj> AtomicShared<T> {
         unsafe { (r.0.unwrap_unchecked(), r.1) }
     }
 
+    /// Replaces the pointer with `new` and returns the old value.
     pub fn swap<'l, 'g, G: Protector>(
         &self,
         new: &Local<'l, G, T>,
@@ -1218,6 +1228,7 @@ impl<T: 'static + Send + Sync + TraceObj> AtomicShared<T> {
         unsafe { r.unwrap_unchecked() }
     }
 
+    /// Like [`swap`](Self::swap), but also sets/returns tag bits.
     pub fn swap_with_tag<'l, 'g, G: Protector>(
         &self,
         new: &Local<'l, G, T>,
@@ -1259,6 +1270,8 @@ impl<T: 'static + Send + Sync + TraceObj> AtomicShared<T> {
         }
     }
 
+    /// Like [`compare_exchange`](Self::compare_exchange), but also compares/sets
+    /// tag bits.
     #[allow(clippy::type_complexity)]
     pub fn compare_exchange_with_tag<'l1, 'l2, 'g, G1, G2>(
         &self,
@@ -1289,6 +1302,7 @@ impl<T: 'static + Send + Sync + TraceObj> AtomicShared<T> {
         }
     }
 
+    /// Atomically ANDs the tag bits, returning the previous (pointer, tag) pair.
     #[inline(always)]
     pub fn fetch_tag_and<'g>(
         &self,
@@ -1302,6 +1316,7 @@ impl<T: 'static + Send + Sync + TraceObj> AtomicShared<T> {
         unsafe { (r.0.unwrap_unchecked(), r.1) }
     }
 
+    /// Atomically ORs the tag bits, returning the previous (pointer, tag) pair.
     #[inline(always)]
     pub fn fetch_tag_or<'g>(
         &self,
@@ -1315,6 +1330,7 @@ impl<T: 'static + Send + Sync + TraceObj> AtomicShared<T> {
         unsafe { (r.0.unwrap_unchecked(), r.1) }
     }
 
+    /// Atomically XORs the tag bits, returning the previous (pointer, tag) pair.
     #[inline(always)]
     pub fn fetch_tag_xor<'g>(
         &self,
@@ -1338,20 +1354,6 @@ impl<T: Send + Sync + TraceObj> TracePtr for AtomicShared<T> {
     #[inline(always)]
     fn shade(&self, guard: &Guard) {
         self.inner.shade(guard);
-    }
-}
-
-impl<T: Send + Sync + TraceObj> TracePtr for Option<AtomicShared<T>> {
-    fn unroot(&self, guard: &Guard) {
-        if let Some(p) = self {
-            p.unroot(guard);
-        }
-    }
-
-    fn shade(&self, guard: &Guard) {
-        if let Some(p) = self {
-            p.shade(guard);
-        }
     }
 }
 
@@ -1388,7 +1390,7 @@ where
 ///
 /// ```
 /// use cdpt::{TraceObj, TracePtr, Shared};
-/// 
+///
 /// #[derive(TraceObj)]
 /// struct Node {
 ///     value: usize,
@@ -1423,6 +1425,9 @@ unsafe impl<T: Send + Sync + TraceObj> Send for Shared<T> {}
 
 impl<T: Send + Sync + TraceObj> Shared<T> {
     /// Allocates a new managed object and returns an immutable root reference.
+    ///
+    /// Requires a [`Guard`] for allocation. The returned `Shared` keeps the
+    /// object alive independently of any guard.
     #[inline(always)]
     pub fn new(item: T, guard: &Guard) -> Self {
         Self {
@@ -1444,7 +1449,10 @@ impl<T: Send + Sync + TraceObj> Shared<T> {
         ManPtr::from(self.inner.inner.link.load(Ordering::Relaxed))
     }
 
-    /// Borrows this `Shared` as a guard-scoped [`Local`] reference.
+    /// Creates a guard-scoped [`Local`] view of this `Shared`.
+    ///
+    /// Useful for passing to methods that expect a `Local`, such as
+    /// [`AtomicSharedOption::store`].
     #[inline(always)]
     pub fn as_local<'g>(&self, guard: &'g Guard) -> Local<'g, Guard, T> {
         // Safety: `Shared` (and its inner `AtomicShared`) always points to
@@ -1458,6 +1466,8 @@ impl<T: Send + Sync + TraceObj> Shared<T> {
         this.as_man_ptr().without_meta() == other.as_man_ptr().without_meta()
     }
 
+    /// Returns `true` if both options point to the same allocation (or are
+    /// both `None`).
     #[inline(always)]
     pub fn opt_ptr_eq(this: Option<&Self>, other: Option<&Self>) -> bool {
         match (this, other) {
@@ -1549,20 +1559,6 @@ impl<T: Send + Sync + TraceObj> TracePtr for Shared<T> {
     #[inline(always)]
     fn shade(&self, guard: &Guard) {
         self.inner.shade(guard);
-    }
-}
-
-impl<T: Send + Sync + TraceObj> TracePtr for Option<Shared<T>> {
-    fn unroot(&self, guard: &Guard) {
-        if let Some(p) = self {
-            p.unroot(guard);
-        }
-    }
-
-    fn shade(&self, guard: &Guard) {
-        if let Some(p) = self {
-            p.shade(guard);
-        }
     }
 }
 
@@ -1692,7 +1688,8 @@ impl<'g, G: Protector, T: 'static + Send + Sync + TraceObj> Local<'g, G, T> {
         ManPtr::from(self.ptr)
     }
 
-    /// Promotes this local reference into a root-counted [`AtomicShared`].
+    /// Converts this reference into a sendable [`AtomicShared`] that can be
+    /// stored in data structures or sent to other threads.
     ///
     /// Increments the target's root count so it stays alive independently of
     /// any guard or hazard pointer.
@@ -1709,7 +1706,8 @@ impl<'g, G: Protector, T: 'static + Send + Sync + TraceObj> Local<'g, G, T> {
         AtomicShared::from_raw(ptr.with_meta(PtrMeta::Rooted))
     }
 
-    /// Promotes this local reference into a root-counted [`Shared`].
+    /// Converts this reference into a [`Shared`] that can be stored as an
+    /// immutable field in managed objects or kept indefinitely.
     #[inline(always)]
     pub fn as_shared(&self) -> Shared<T> {
         Shared {
@@ -1724,6 +1722,8 @@ impl<'g, G: Protector, T: 'static + Send + Sync + TraceObj> Local<'g, G, T> {
         this.ptr == other.ptr
     }
 
+    /// Returns `true` if both options point to the same allocation (or are
+    /// both `None`).
     #[inline(always)]
     pub fn opt_ptr_eq<'h, H: Protector>(
         this: Option<&Self>,
