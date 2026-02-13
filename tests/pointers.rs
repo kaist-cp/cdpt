@@ -527,6 +527,7 @@ fn atomic_shared_option_compare_exchange_failure() {
 }
 
 #[test]
+#[cfg(feature = "tag")]
 fn atomic_shared_option_load_with_tag() {
     let guard = pin();
     let opt = AtomicSharedOption::some_with_tag(
@@ -545,6 +546,7 @@ fn atomic_shared_option_load_with_tag() {
 }
 
 #[test]
+#[cfg(feature = "tag")]
 fn atomic_shared_option_none_with_tag() {
     let guard = pin();
     let opt: AtomicSharedOption<SimpleNode> = AtomicSharedOption::none_with_tag(1);
@@ -777,6 +779,7 @@ fn atomic_shared_take() {
 }
 
 #[test]
+#[cfg(feature = "tag")]
 fn atomic_shared_load_with_tag() {
     let guard = pin();
     let a = AtomicShared::new_with_tag(

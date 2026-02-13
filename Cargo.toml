@@ -26,3 +26,16 @@ bitflags = "2.5"
 
 [features]
 logging = []
+tag = []
+
+[[example]]
+name = "lists"
+required-features = ["tag"]
+
+[[example]]
+name = "efrb_tree"
+required-features = ["tag"]
+
+[[example]]
+name = "natarajan_mittal_tree"
+required-features = ["tag"]

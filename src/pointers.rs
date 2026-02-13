@@ -27,6 +27,31 @@ use std::{
     sync::atomic::{AtomicPtr, AtomicUsize, Ordering},
 };
 
+/// Toggles a method's visibility between `pub` (when `feature = "tag"`) and
+/// `pub(crate)` (otherwise). Used for `*_with_tag` / `fetch_tag_*` APIs.
+macro_rules! tag_fn {
+    ($(#[$meta:meta])* fn $name:ident $($rest:tt)*) => {
+        $(#[$meta])*
+        #[cfg(feature = "tag")]
+        pub fn $name $($rest)*
+
+        $(#[$meta])*
+        #[cfg(not(feature = "tag"))]
+        #[allow(dead_code)]
+        pub(crate) fn $name $($rest)*
+    };
+    ($(#[$meta:meta])* const fn $name:ident $($rest:tt)*) => {
+        $(#[$meta])*
+        #[cfg(feature = "tag")]
+        pub const fn $name $($rest)*
+
+        $(#[$meta])*
+        #[cfg(not(feature = "tag"))]
+        #[allow(dead_code)]
+        pub(crate) const fn $name $($rest)*
+    };
+}
+
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct ObjMeta(usize);
 
@@ -588,14 +613,16 @@ impl<T: 'static + Send + Sync + TraceObj> AtomicSharedOption<T> {
         Self::from_raw(ptr)
     }
 
-    /// Like [`some`](Self::some), but stores extra bits in the pointer's low
-    /// tag bits (available due to alignment).
-    #[inline(always)]
-    pub fn some_with_tag(item: T, tag: usize, guard: &Guard) -> Self {
-        let ptr = ManPtr::alloc_rooted(item, guard.alloc_color(), 1, guard);
-        // Safety: `ptr` is freshly allocated.
-        unsafe { &ptr.deref().item }.unroot_outgoings(guard);
-        Self::from_raw(ptr.with_tag(tag))
+    tag_fn! {
+        /// Like [`some`](Self::some), but stores extra bits in the pointer's low
+        /// tag bits (available due to alignment).
+        #[inline(always)]
+        fn some_with_tag(item: T, tag: usize, guard: &Guard) -> Self {
+            let ptr = ManPtr::alloc_rooted(item, guard.alloc_color(), 1, guard);
+            // Safety: `ptr` is freshly allocated.
+            unsafe { &ptr.deref().item }.unroot_outgoings(guard);
+            Self::from_raw(ptr.with_tag(tag))
+        }
     }
 
     /// Creates a null (empty) atomic pointer. This is a `const` function, so
@@ -605,10 +632,12 @@ impl<T: 'static + Send + Sync + TraceObj> AtomicSharedOption<T> {
         Self::from_raw(ManPtr::null_rooted())
     }
 
-    /// Creates a null atomic pointer with the given tag bits set.
-    #[inline(always)]
-    pub const fn none_with_tag(tag: usize) -> Self {
-        Self::from_raw(ManPtr::null_rooted_with_tag(tag))
+    tag_fn! {
+        /// Creates a null atomic pointer with the given tag bits set.
+        #[inline(always)]
+        const fn none_with_tag(tag: usize) -> Self {
+            Self::from_raw(ManPtr::null_rooted_with_tag(tag))
+        }
     }
 
     #[inline(always)]
@@ -628,17 +657,19 @@ impl<T: 'static + Send + Sync + TraceObj> AtomicSharedOption<T> {
         self.load_with_tag(order, guard).0
     }
 
-    /// Like [`load`](Self::load), but also returns the tag bits.
-    #[inline(always)]
-    pub fn load_with_tag<'g>(
-        &self,
-        order: Ordering,
-        guard: &'g Guard,
-    ) -> (Option<Local<'g, Guard, T>>, usize) {
-        let ptr = ManPtr::from(self.link.load(order));
-        // Safety: If the pointer is not null, it points to a valid memory location.
-        // The validity should be guaranteed by the correctness of this garbage collector.
-        unsafe { ptr.as_local_with_tag(guard) }
+    tag_fn! {
+        /// Like [`load`](Self::load), but also returns the tag bits.
+        #[inline(always)]
+        fn load_with_tag<'g>(
+            &self,
+            order: Ordering,
+            guard: &'g Guard,
+        ) -> (Option<Local<'g, Guard, T>>, usize) {
+            let ptr = ManPtr::from(self.link.load(order));
+            // Safety: If the pointer is not null, it points to a valid memory location.
+            // The validity should be guaranteed by the correctness of this garbage collector.
+            unsafe { ptr.as_local_with_tag(guard) }
+        }
     }
 
     /// Replaces the pointer with `new` (or null if `None`).
@@ -654,15 +685,17 @@ impl<T: 'static + Send + Sync + TraceObj> AtomicSharedOption<T> {
         self.store_with_tag(new, 0, order, guard);
     }
 
-    /// Like [`store`](Self::store), but also sets the tag bits.
-    pub fn store_with_tag<'l, G: Protector>(
-        &self,
-        new: Option<&Local<'l, G, T>>,
-        tag: usize,
-        order: Ordering,
-        guard: &Guard,
-    ) {
-        self.swap_with_tag(new, tag, order, guard);
+    tag_fn! {
+        /// Like [`store`](Self::store), but also sets the tag bits.
+        fn store_with_tag<'l, G: Protector>(
+            &self,
+            new: Option<&Local<'l, G, T>>,
+            tag: usize,
+            order: Ordering,
+            guard: &Guard,
+        ) {
+            self.swap_with_tag(new, tag, order, guard);
+        }
     }
 
     /// Removes and returns the current value, leaving this pointer null.
@@ -670,13 +703,15 @@ impl<T: 'static + Send + Sync + TraceObj> AtomicSharedOption<T> {
         self.take_with_tag(order, guard).0
     }
 
-    /// Like [`take`](Self::take), but also returns the tag bits.
-    pub fn take_with_tag<'g>(
-        &self,
-        order: Ordering,
-        guard: &'g Guard,
-    ) -> (Option<Local<'g, Guard, T>>, usize) {
-        self.swap_with_tag(None::<&Local<'g, Guard, T>>, 0, order, guard)
+    tag_fn! {
+        /// Like [`take`](Self::take), but also returns the tag bits.
+        fn take_with_tag<'g>(
+            &self,
+            order: Ordering,
+            guard: &'g Guard,
+        ) -> (Option<Local<'g, Guard, T>>, usize) {
+            self.swap_with_tag(None::<&Local<'g, Guard, T>>, 0, order, guard)
+        }
     }
 
     /// Replaces the pointer with `new` and returns the old value.
@@ -689,18 +724,20 @@ impl<T: 'static + Send + Sync + TraceObj> AtomicSharedOption<T> {
         self.swap_with_tag(new, 0, order, guard).0
     }
 
-    /// Like [`swap`](Self::swap), but also sets/returns tag bits.
-    pub fn swap_with_tag<'l, 'g, G: Protector>(
-        &self,
-        new: Option<&Local<'l, G, T>>,
-        tag: usize,
-        order: Ordering,
-        guard: &'g Guard,
-    ) -> (Option<Local<'g, Guard, T>>, usize) {
-        let ptr = self.internal_swap(ManPtr::from(new).with_tag(tag), order, guard);
-        // Safety: If the pointer is not null, it points to a valid memory location.
-        // The validity should be guaranteed by the correctness of this garbage collector.
-        unsafe { ptr.as_local_with_tag(guard) }
+    tag_fn! {
+        /// Like [`swap`](Self::swap), but also sets/returns tag bits.
+        fn swap_with_tag<'l, 'g, G: Protector>(
+            &self,
+            new: Option<&Local<'l, G, T>>,
+            tag: usize,
+            order: Ordering,
+            guard: &'g Guard,
+        ) -> (Option<Local<'g, Guard, T>>, usize) {
+            let ptr = self.internal_swap(ManPtr::from(new).with_tag(tag), order, guard);
+            // Safety: If the pointer is not null, it points to a valid memory location.
+            // The validity should be guaranteed by the correctness of this garbage collector.
+            unsafe { ptr.as_local_with_tag(guard) }
+        }
     }
 
     fn internal_swap(&self, new: ManPtr<T>, order: Ordering, guard: &Guard) -> ManPtr<T> {
@@ -759,60 +796,62 @@ impl<T: 'static + Send + Sync + TraceObj> AtomicSharedOption<T> {
             .map_err(|pt| pt.0)
     }
 
-    /// Like [`compare_exchange`](Self::compare_exchange), but also compares/sets
-    /// tag bits.
-    #[allow(clippy::type_complexity)]
-    pub fn compare_exchange_with_tag<'l1, 'l2, 'g, G1, G2>(
-        &self,
-        current_tag: (Option<&Local<'l1, G1, T>>, usize),
-        new_tag: (Option<&Local<'l2, G2, T>>, usize),
-        success: Ordering,
-        failure: Ordering,
-        guard: &'g Guard,
-    ) -> Result<(Option<Local<'g, Guard, T>>, usize), (Option<Local<'g, Guard, T>>, usize)>
-    where
-        G1: Protector,
-        G2: Protector,
-    {
-        let mut old = ManPtr::<T>::from(self.link.load(Ordering::Relaxed));
+    tag_fn! {
+        /// Like [`compare_exchange`](Self::compare_exchange), but also compares/sets
+        /// tag bits.
+        #[allow(clippy::type_complexity)]
+        fn compare_exchange_with_tag<'l1, 'l2, 'g, G1, G2>(
+            &self,
+            current_tag: (Option<&Local<'l1, G1, T>>, usize),
+            new_tag: (Option<&Local<'l2, G2, T>>, usize),
+            success: Ordering,
+            failure: Ordering,
+            guard: &'g Guard,
+        ) -> Result<(Option<Local<'g, Guard, T>>, usize), (Option<Local<'g, Guard, T>>, usize)>
+        where
+            G1: Protector,
+            G2: Protector,
+        {
+            let mut old = ManPtr::<T>::from(self.link.load(Ordering::Relaxed));
 
-        if old.without_meta() != ManPtr::from(current_tag) {
-            // Trivial failure case of CAS.
-            // Safety: If the pointer is not null, it points to a valid memory location.
-            // The validity should be guaranteed by the correctness of this garbage collector.
-            return Err(unsafe { old.as_local_with_tag(guard) });
-        }
-
-        // First block to handle the `Rooted` case.
-        if unlikely(old.meta() == PtrMeta::Rooted) {
-            // If the source is rooted, we increment the root count before trying update.
-            let new_shared = Shared::try_inc_raw(ManPtr::from(new_tag.0), guard);
-            let new_rooted = ManPtr::from(new_tag).with_meta(PtrMeta::Rooted);
-
-            match self.internal_cmpxchg_rooted(old, new_rooted, success, failure, guard) {
-                Ok(current) => {
-                    // The `new` pointer is successfully inserted.
-                    // Skip decrementing the root count for the inserted one.
-                    forget(new_shared);
-                    return Ok(unsafe { current.as_local_with_tag(guard) });
-                }
-                Err(current) => match current.meta() {
-                    PtrMeta::Rooted => return Err(unsafe { current.as_local_with_tag(guard) }),
-                    PtrMeta::Unrooted(_) => old = current,
-                },
-            }
-
-            // We just want to re-check the trivial failure case.
             if old.without_meta() != ManPtr::from(current_tag) {
+                // Trivial failure case of CAS.
+                // Safety: If the pointer is not null, it points to a valid memory location.
+                // The validity should be guaranteed by the correctness of this garbage collector.
                 return Err(unsafe { old.as_local_with_tag(guard) });
             }
-        }
 
-        // If the source is unrooted, we focus on the `Unrooted` case only from now on.
-        // We can guarantee that an unrooted pointer will never be re-rooted later.
-        self.internal_cmpxchg_unrooted(old, ManPtr::from(new_tag), success, failure, guard)
-            .map(|current| unsafe { current.as_local_with_tag(guard) })
-            .map_err(|current| unsafe { current.as_local_with_tag(guard) })
+            // First block to handle the `Rooted` case.
+            if unlikely(old.meta() == PtrMeta::Rooted) {
+                // If the source is rooted, we increment the root count before trying update.
+                let new_shared = Shared::try_inc_raw(ManPtr::from(new_tag.0), guard);
+                let new_rooted = ManPtr::from(new_tag).with_meta(PtrMeta::Rooted);
+
+                match self.internal_cmpxchg_rooted(old, new_rooted, success, failure, guard) {
+                    Ok(current) => {
+                        // The `new` pointer is successfully inserted.
+                        // Skip decrementing the root count for the inserted one.
+                        forget(new_shared);
+                        return Ok(unsafe { current.as_local_with_tag(guard) });
+                    }
+                    Err(current) => match current.meta() {
+                        PtrMeta::Rooted => return Err(unsafe { current.as_local_with_tag(guard) }),
+                        PtrMeta::Unrooted(_) => old = current,
+                    },
+                }
+
+                // We just want to re-check the trivial failure case.
+                if old.without_meta() != ManPtr::from(current_tag) {
+                    return Err(unsafe { old.as_local_with_tag(guard) });
+                }
+            }
+
+            // If the source is unrooted, we focus on the `Unrooted` case only from now on.
+            // We can guarantee that an unrooted pointer will never be re-rooted later.
+            self.internal_cmpxchg_unrooted(old, ManPtr::from(new_tag), success, failure, guard)
+                .map(|current| unsafe { current.as_local_with_tag(guard) })
+                .map_err(|current| unsafe { current.as_local_with_tag(guard) })
+        }
     }
 
     fn internal_cmpxchg_rooted(
@@ -898,55 +937,61 @@ impl<T: 'static + Send + Sync + TraceObj> AtomicSharedOption<T> {
         }
     }
 
-    /// Atomically ANDs the tag bits, returning the previous (pointer, tag) pair.
-    ///
-    /// Tag bits are low bits available due to pointer alignment, commonly used
-    /// to mark nodes (e.g., logical deletion in lock-free data structures).
-    /// Only the tag bits are affected; the pointed-to address is unchanged.
-    #[inline(always)]
-    pub fn fetch_tag_and<'g>(
-        &self,
-        tag: usize,
-        order: Ordering,
-        guard: &'g Guard,
-    ) -> (Option<Local<'g, Guard, T>>, usize) {
-        // Safety: If the pointer is not null, it points to a valid memory location.
-        // The validity should be guaranteed by the correctness of this garbage collector.
-        unsafe {
-            ManPtr::from(self.link.fetch_and(tag & ManPtr::<T>::LOW_BITS, order))
-                .as_local_with_tag(guard)
+    tag_fn! {
+        /// Atomically ANDs the tag bits, returning the previous (pointer, tag) pair.
+        ///
+        /// Tag bits are low bits available due to pointer alignment, commonly used
+        /// to mark nodes (e.g., logical deletion in lock-free data structures).
+        /// Only the tag bits are affected; the pointed-to address is unchanged.
+        #[inline(always)]
+        fn fetch_tag_and<'g>(
+            &self,
+            tag: usize,
+            order: Ordering,
+            guard: &'g Guard,
+        ) -> (Option<Local<'g, Guard, T>>, usize) {
+            // Safety: If the pointer is not null, it points to a valid memory location.
+            // The validity should be guaranteed by the correctness of this garbage collector.
+            unsafe {
+                ManPtr::from(self.link.fetch_and(tag & ManPtr::<T>::LOW_BITS, order))
+                    .as_local_with_tag(guard)
+            }
         }
     }
 
-    /// Atomically ORs the tag bits, returning the previous (pointer, tag) pair.
-    #[inline(always)]
-    pub fn fetch_tag_or<'g>(
-        &self,
-        tag: usize,
-        order: Ordering,
-        guard: &'g Guard,
-    ) -> (Option<Local<'g, Guard, T>>, usize) {
-        // Safety: If the pointer is not null, it points to a valid memory location.
-        // The validity should be guaranteed by the correctness of this garbage collector.
-        unsafe {
-            ManPtr::from(self.link.fetch_or(tag & ManPtr::<T>::LOW_BITS, order))
-                .as_local_with_tag(guard)
+    tag_fn! {
+        /// Atomically ORs the tag bits, returning the previous (pointer, tag) pair.
+        #[inline(always)]
+        fn fetch_tag_or<'g>(
+            &self,
+            tag: usize,
+            order: Ordering,
+            guard: &'g Guard,
+        ) -> (Option<Local<'g, Guard, T>>, usize) {
+            // Safety: If the pointer is not null, it points to a valid memory location.
+            // The validity should be guaranteed by the correctness of this garbage collector.
+            unsafe {
+                ManPtr::from(self.link.fetch_or(tag & ManPtr::<T>::LOW_BITS, order))
+                    .as_local_with_tag(guard)
+            }
         }
     }
 
-    /// Atomically XORs the tag bits, returning the previous (pointer, tag) pair.
-    #[inline(always)]
-    pub fn fetch_tag_xor<'g>(
-        &self,
-        tag: usize,
-        order: Ordering,
-        guard: &'g Guard,
-    ) -> (Option<Local<'g, Guard, T>>, usize) {
-        // Safety: If the pointer is not null, it points to a valid memory location.
-        // The validity should be guaranteed by the correctness of this garbage collector.
-        unsafe {
-            ManPtr::from(self.link.fetch_xor(tag & ManPtr::<T>::LOW_BITS, order))
-                .as_local_with_tag(guard)
+    tag_fn! {
+        /// Atomically XORs the tag bits, returning the previous (pointer, tag) pair.
+        #[inline(always)]
+        fn fetch_tag_xor<'g>(
+            &self,
+            tag: usize,
+            order: Ordering,
+            guard: &'g Guard,
+        ) -> (Option<Local<'g, Guard, T>>, usize) {
+            // Safety: If the pointer is not null, it points to a valid memory location.
+            // The validity should be guaranteed by the correctness of this garbage collector.
+            unsafe {
+                ManPtr::from(self.link.fetch_xor(tag & ManPtr::<T>::LOW_BITS, order))
+                    .as_local_with_tag(guard)
+            }
         }
     }
 }
@@ -1140,11 +1185,13 @@ impl<T: 'static + Send + Sync + TraceObj> AtomicShared<T> {
         }
     }
 
-    /// Like [`new`](Self::new), but with initial tag bits.
-    #[inline(always)]
-    pub fn new_with_tag(item: T, tag: usize, guard: &Guard) -> Self {
-        Self {
-            inner: AtomicSharedOption::some_with_tag(item, tag, guard),
+    tag_fn! {
+        /// Like [`new`](Self::new), but with initial tag bits.
+        #[inline(always)]
+        fn new_with_tag(item: T, tag: usize, guard: &Guard) -> Self {
+            Self {
+                inner: AtomicSharedOption::some_with_tag(item, tag, guard),
+            }
         }
     }
 
@@ -1166,17 +1213,19 @@ impl<T: 'static + Send + Sync + TraceObj> AtomicShared<T> {
         unsafe { r.unwrap_unchecked() }
     }
 
-    /// Like [`load`](Self::load), but also returns the tag bits.
-    #[inline(always)]
-    pub fn load_with_tag<'g>(
-        &self,
-        order: Ordering,
-        guard: &'g Guard,
-    ) -> (Local<'g, Guard, T>, usize) {
-        let r = self.inner.load_with_tag(order, guard);
-        debug_assert!(r.0.is_some());
-        // Safety: There must be no possible path to write a `None` to the inner atomic.
-        unsafe { (r.0.unwrap_unchecked(), r.1) }
+    tag_fn! {
+        /// Like [`load`](Self::load), but also returns the tag bits.
+        #[inline(always)]
+        fn load_with_tag<'g>(
+            &self,
+            order: Ordering,
+            guard: &'g Guard,
+        ) -> (Local<'g, Guard, T>, usize) {
+            let r = self.inner.load_with_tag(order, guard);
+            debug_assert!(r.0.is_some());
+            // Safety: There must be no possible path to write a `None` to the inner atomic.
+            unsafe { (r.0.unwrap_unchecked(), r.1) }
+        }
     }
 
     /// Replaces the pointer with `new`, applying write barriers as needed.
@@ -1184,15 +1233,17 @@ impl<T: 'static + Send + Sync + TraceObj> AtomicShared<T> {
         self.inner.store(Some(new), order, guard);
     }
 
-    /// Like [`store`](Self::store), but also sets the tag bits.
-    pub fn store_with_tag<'l, G: Protector>(
-        &self,
-        new: &Local<'l, G, T>,
-        tag: usize,
-        order: Ordering,
-        guard: &Guard,
-    ) {
-        self.inner.store_with_tag(Some(new), tag, order, guard);
+    tag_fn! {
+        /// Like [`store`](Self::store), but also sets the tag bits.
+        fn store_with_tag<'l, G: Protector>(
+            &self,
+            new: &Local<'l, G, T>,
+            tag: usize,
+            order: Ordering,
+            guard: &Guard,
+        ) {
+            self.inner.store_with_tag(Some(new), tag, order, guard);
+        }
     }
 
     /// Replaces the pointer with `new` and returns the old value.
@@ -1203,16 +1254,18 @@ impl<T: 'static + Send + Sync + TraceObj> AtomicShared<T> {
         unsafe { r.unwrap_unchecked() }
     }
 
-    /// Like [`take`](Self::take), but also returns the tag bits.
-    pub fn take_with_tag<'g>(
-        &self,
-        order: Ordering,
-        guard: &'g Guard,
-    ) -> (Local<'g, Guard, T>, usize) {
-        let r = self.inner.take_with_tag(order, guard);
-        debug_assert!(r.0.is_some());
-        // Safety: There must be no possible path to write a `None` to the inner atomic.
-        unsafe { (r.0.unwrap_unchecked(), r.1) }
+    tag_fn! {
+        /// Like [`take`](Self::take), but also returns the tag bits.
+        fn take_with_tag<'g>(
+            &self,
+            order: Ordering,
+            guard: &'g Guard,
+        ) -> (Local<'g, Guard, T>, usize) {
+            let r = self.inner.take_with_tag(order, guard);
+            debug_assert!(r.0.is_some());
+            // Safety: There must be no possible path to write a `None` to the inner atomic.
+            unsafe { (r.0.unwrap_unchecked(), r.1) }
+        }
     }
 
     /// Replaces the pointer with `new` and returns the old value.
@@ -1228,18 +1281,20 @@ impl<T: 'static + Send + Sync + TraceObj> AtomicShared<T> {
         unsafe { r.unwrap_unchecked() }
     }
 
-    /// Like [`swap`](Self::swap), but also sets/returns tag bits.
-    pub fn swap_with_tag<'l, 'g, G: Protector>(
-        &self,
-        new: &Local<'l, G, T>,
-        tag: usize,
-        order: Ordering,
-        guard: &'g Guard,
-    ) -> (Local<'g, Guard, T>, usize) {
-        let r = self.inner.swap_with_tag(Some(new), tag, order, guard);
-        debug_assert!(r.0.is_some());
-        // Safety: There must be no possible path to write a `None` to the inner atomic.
-        unsafe { (r.0.unwrap_unchecked(), r.1) }
+    tag_fn! {
+        /// Like [`swap`](Self::swap), but also sets/returns tag bits.
+        fn swap_with_tag<'l, 'g, G: Protector>(
+            &self,
+            new: &Local<'l, G, T>,
+            tag: usize,
+            order: Ordering,
+            guard: &'g Guard,
+        ) -> (Local<'g, Guard, T>, usize) {
+            let r = self.inner.swap_with_tag(Some(new), tag, order, guard);
+            debug_assert!(r.0.is_some());
+            // Safety: There must be no possible path to write a `None` to the inner atomic.
+            unsafe { (r.0.unwrap_unchecked(), r.1) }
+        }
     }
 
     /// Atomically compares-and-swaps the pointer with GC write barriers.
@@ -1270,78 +1325,86 @@ impl<T: 'static + Send + Sync + TraceObj> AtomicShared<T> {
         }
     }
 
-    /// Like [`compare_exchange`](Self::compare_exchange), but also compares/sets
-    /// tag bits.
-    #[allow(clippy::type_complexity)]
-    pub fn compare_exchange_with_tag<'l1, 'l2, 'g, G1, G2>(
-        &self,
-        current_tag: (&Local<'l1, G1, T>, usize),
-        new_tag: (&Local<'l2, G2, T>, usize),
-        success: Ordering,
-        failure: Ordering,
-        guard: &'g Guard,
-    ) -> Result<(Local<'g, Guard, T>, usize), (Local<'g, Guard, T>, usize)>
-    where
-        G1: Protector,
-        G2: Protector,
-    {
-        let r = self.inner.compare_exchange_with_tag(
-            (Some(current_tag.0), current_tag.1),
-            (Some(new_tag.0), new_tag.1),
-            success,
-            failure,
-            guard,
-        );
-        match r {
-            Ok((l, _)) | Err((l, _)) => debug_assert!(l.is_some()),
+    tag_fn! {
+        /// Like [`compare_exchange`](Self::compare_exchange), but also compares/sets
+        /// tag bits.
+        #[allow(clippy::type_complexity)]
+        fn compare_exchange_with_tag<'l1, 'l2, 'g, G1, G2>(
+            &self,
+            current_tag: (&Local<'l1, G1, T>, usize),
+            new_tag: (&Local<'l2, G2, T>, usize),
+            success: Ordering,
+            failure: Ordering,
+            guard: &'g Guard,
+        ) -> Result<(Local<'g, Guard, T>, usize), (Local<'g, Guard, T>, usize)>
+        where
+            G1: Protector,
+            G2: Protector,
+        {
+            let r = self.inner.compare_exchange_with_tag(
+                (Some(current_tag.0), current_tag.1),
+                (Some(new_tag.0), new_tag.1),
+                success,
+                failure,
+                guard,
+            );
+            match r {
+                Ok((l, _)) | Err((l, _)) => debug_assert!(l.is_some()),
+            }
+            // Safety: There must be no possible path to write a `None` to the inner atomic.
+            unsafe {
+                r.map(|(l, t)| (l.unwrap_unchecked(), t))
+                    .map_err(|(l, t)| (l.unwrap_unchecked(), t))
+            }
         }
-        // Safety: There must be no possible path to write a `None` to the inner atomic.
-        unsafe {
-            r.map(|(l, t)| (l.unwrap_unchecked(), t))
-                .map_err(|(l, t)| (l.unwrap_unchecked(), t))
+    }
+
+    tag_fn! {
+        /// Atomically ANDs the tag bits, returning the previous (pointer, tag) pair.
+        #[inline(always)]
+        fn fetch_tag_and<'g>(
+            &self,
+            tag: usize,
+            order: Ordering,
+            guard: &'g Guard,
+        ) -> (Local<'g, Guard, T>, usize) {
+            let r = self.inner.fetch_tag_and(tag, order, guard);
+            debug_assert!(r.0.is_some());
+            // Safety: There must be no possible path to write a `None` to the inner atomic.
+            unsafe { (r.0.unwrap_unchecked(), r.1) }
         }
     }
 
-    /// Atomically ANDs the tag bits, returning the previous (pointer, tag) pair.
-    #[inline(always)]
-    pub fn fetch_tag_and<'g>(
-        &self,
-        tag: usize,
-        order: Ordering,
-        guard: &'g Guard,
-    ) -> (Local<'g, Guard, T>, usize) {
-        let r = self.inner.fetch_tag_and(tag, order, guard);
-        debug_assert!(r.0.is_some());
-        // Safety: There must be no possible path to write a `None` to the inner atomic.
-        unsafe { (r.0.unwrap_unchecked(), r.1) }
+    tag_fn! {
+        /// Atomically ORs the tag bits, returning the previous (pointer, tag) pair.
+        #[inline(always)]
+        fn fetch_tag_or<'g>(
+            &self,
+            tag: usize,
+            order: Ordering,
+            guard: &'g Guard,
+        ) -> (Local<'g, Guard, T>, usize) {
+            let r = self.inner.fetch_tag_or(tag, order, guard);
+            debug_assert!(r.0.is_some());
+            // Safety: There must be no possible path to write a `None` to the inner atomic.
+            unsafe { (r.0.unwrap_unchecked(), r.1) }
+        }
     }
 
-    /// Atomically ORs the tag bits, returning the previous (pointer, tag) pair.
-    #[inline(always)]
-    pub fn fetch_tag_or<'g>(
-        &self,
-        tag: usize,
-        order: Ordering,
-        guard: &'g Guard,
-    ) -> (Local<'g, Guard, T>, usize) {
-        let r = self.inner.fetch_tag_or(tag, order, guard);
-        debug_assert!(r.0.is_some());
-        // Safety: There must be no possible path to write a `None` to the inner atomic.
-        unsafe { (r.0.unwrap_unchecked(), r.1) }
-    }
-
-    /// Atomically XORs the tag bits, returning the previous (pointer, tag) pair.
-    #[inline(always)]
-    pub fn fetch_tag_xor<'g>(
-        &self,
-        tag: usize,
-        order: Ordering,
-        guard: &'g Guard,
-    ) -> (Local<'g, Guard, T>, usize) {
-        let r = self.inner.fetch_tag_xor(tag, order, guard);
-        debug_assert!(r.0.is_some());
-        // Safety: There must be no possible path to write a `None` to the inner atomic.
-        unsafe { (r.0.unwrap_unchecked(), r.1) }
+    tag_fn! {
+        /// Atomically XORs the tag bits, returning the previous (pointer, tag) pair.
+        #[inline(always)]
+        fn fetch_tag_xor<'g>(
+            &self,
+            tag: usize,
+            order: Ordering,
+            guard: &'g Guard,
+        ) -> (Local<'g, Guard, T>, usize) {
+            let r = self.inner.fetch_tag_xor(tag, order, guard);
+            debug_assert!(r.0.is_some());
+            // Safety: There must be no possible path to write a `None` to the inner atomic.
+            unsafe { (r.0.unwrap_unchecked(), r.1) }
+        }
     }
 }
 
