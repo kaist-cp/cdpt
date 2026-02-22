@@ -66,6 +66,9 @@ pub struct Global {
 
     /// The global flag indicating whether the collection is enabled.
     pub(crate) collection_enabled: CachePadded<AtomicBool>,
+
+    /// Flag to request an immediate collection cycle, bypassing the heuristic.
+    pub(crate) collection_requested: CachePadded<AtomicBool>,
 }
 
 /// FIXME: This may be very inaccurate for some types that internally allocate unmanaged memory.
@@ -133,6 +136,7 @@ impl Global {
             mark_tasks: Injector::new(),
             collector_init: CachePadded::new(AtomicBool::new(false)),
             collection_enabled: CachePadded::new(AtomicBool::new(true)),
+            collection_requested: CachePadded::new(AtomicBool::new(false)),
         }
     }
 
@@ -197,6 +201,15 @@ impl Global {
     /// Collection is enabled by default.
     pub fn enable_collection(&self, set: bool) {
         self.collection_enabled.store(set, Ordering::SeqCst);
+    }
+
+    /// Requests an immediate collection cycle, bypassing the normal heuristic.
+    ///
+    /// The collector thread will run one cycle as soon as possible, regardless
+    /// of current heap pressure. Useful in tests to force garbage collection
+    /// of recently dropped objects.
+    pub fn request_collection(&self) {
+        self.collection_requested.store(true, Ordering::SeqCst);
     }
 
     /// Returns the total bytes allocated on the managed heap since program

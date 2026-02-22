@@ -438,6 +438,15 @@ fn is_collection_necessary() -> bool {
         return false;
     }
 
+    // Check if an explicit collection was requested.
+    if global()
+        .collection_requested
+        .load(Ordering::SeqCst)
+    {
+        global().collection_requested.store(false, Ordering::SeqCst);
+        return true;
+    }
+
     let hbstats = HBSTATS.read().unwrap();
 
     let reclm_per_ms_smooth = CSTATS.reclm_per_ms_smooth.load(Ordering::Relaxed);
