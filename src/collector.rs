@@ -439,10 +439,7 @@ fn is_collection_necessary() -> bool {
     }
 
     // Check if an explicit collection was requested.
-    if global()
-        .collection_requested
-        .load(Ordering::SeqCst)
-    {
+    if global().collection_requested.load(Ordering::SeqCst) {
         global().collection_requested.store(false, Ordering::SeqCst);
         return true;
     }

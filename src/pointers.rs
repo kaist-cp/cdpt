@@ -307,9 +307,9 @@ impl<T: 'static + TraceObj> ManPtr<T> {
 
     #[inline(always)]
     pub(crate) const fn null_rooted_with_tag(tag: usize) -> Self {
+        // Rooted meta = 0b00 in the top two bits, so only the tag bits remain.
         Self {
-            data: ((0b10 << (usize::BITS - Self::META_WIDTH)) | (tag & Self::LOW_BITS)) as *const ()
-                as *mut (),
+            data: (tag & Self::LOW_BITS) as *const () as *mut (),
             _marker: PhantomData,
         }
     }
@@ -317,7 +317,7 @@ impl<T: 'static + TraceObj> ManPtr<T> {
     #[inline(always)]
     pub(crate) fn meta(self) -> PtrMeta {
         let bits = self.data.addr();
-        if bits & (1 << (usize::BITS - 1)) > 0 {
+        if bits & (1 << (usize::BITS - 1)) == 0 {
             PtrMeta::Rooted
         } else {
             PtrMeta::Unrooted(Color::from(bits & (1 << (usize::BITS - 2))))
@@ -329,9 +329,9 @@ impl<T: 'static + TraceObj> ManPtr<T> {
         let new_ptr = self.data.map_addr(|addr| {
             let wo_meta = addr & !Self::META_BITS;
             let meta = match meta {
-                PtrMeta::Rooted => 0b10,
-                PtrMeta::Unrooted(Color::C0) => 0b00,
-                PtrMeta::Unrooted(Color::C1) => 0b01,
+                PtrMeta::Rooted => 0b00,
+                PtrMeta::Unrooted(Color::C0) => 0b10,
+                PtrMeta::Unrooted(Color::C1) => 0b11,
             };
             (meta << (usize::BITS - Self::META_WIDTH)) | wo_meta
         });
@@ -590,6 +590,9 @@ pub struct AtomicSharedOption<T: 'static + Send + Sync + TraceObj> {
 }
 
 assert_eq_size!(AtomicSharedOption<()>, usize);
+// `none()` is zero-initialized because `PtrMeta::Rooted` encodes as 0b00 in the
+// top two bits, making `null_rooted()` an all-zero pointer.
+const_assert!(ManPtr::<()>::null_rooted().data.is_null());
 
 unsafe impl<T: Send + Sync + TraceObj> Sync for AtomicSharedOption<T> {}
 unsafe impl<T: Send + Sync + TraceObj> Send for AtomicSharedOption<T> {}
@@ -627,6 +630,10 @@ impl<T: 'static + Send + Sync + TraceObj> AtomicSharedOption<T> {
 
     /// Creates a null (empty) atomic pointer. This is a `const` function, so
     /// it can be used in static or field initializers.
+    ///
+    /// The returned value is **zero-initialized** (all bytes are `0x00`),
+    /// which means arrays of `AtomicSharedOption` can be safely created with
+    /// `zeroed()` or equivalent zero-fill operations.
     #[inline(always)]
     pub const fn none() -> Self {
         Self::from_raw(ManPtr::null_rooted())
@@ -775,8 +782,14 @@ impl<T: 'static + Send + Sync + TraceObj> AtomicSharedOption<T> {
 
     /// Atomically compares-and-swaps the pointer.
     ///
-    /// Returns `Ok(previous)` on success, `Err(actual)` on failure.
-    /// Both `current` and `new` may be `None` (null).  GC write barriers
+    /// On success, returns `Ok` with the **previous** value that was in the
+    /// atomic (i.e. the old value, which matches `current`). On failure,
+    /// returns `Err` with the **current actual** value.
+    ///
+    /// This follows the same convention as [`std::sync::atomic::AtomicPtr::compare_exchange`]:
+    /// both `Ok` and `Err` carry the value that was loaded from the atomic.
+    ///
+    /// Both `current` and `new` may be `None` (null). GC write barriers
     /// (insertion + deletion) are applied automatically.
     #[allow(clippy::type_complexity)]
     pub fn compare_exchange<'l1, 'l2, 'g, G1, G2>(
@@ -799,6 +812,9 @@ impl<T: 'static + Send + Sync + TraceObj> AtomicSharedOption<T> {
     tag_fn! {
         /// Like [`compare_exchange`](Self::compare_exchange), but also compares/sets
         /// tag bits.
+        ///
+        /// On success, returns `Ok` with the **previous** (pointer, tag) pair.
+        /// On failure, returns `Err` with the **current actual** (pointer, tag) pair.
         #[allow(clippy::type_complexity)]
         fn compare_exchange_with_tag<'l1, 'l2, 'g, G1, G2>(
             &self,
@@ -896,7 +912,9 @@ impl<T: 'static + Send + Sync + TraceObj> AtomicSharedOption<T> {
         guard: &Guard,
     ) -> Result<ManPtr<T>, ManPtr<T>> {
         debug_assert!(old.meta() != PtrMeta::Rooted);
-        debug_assert!(new.meta() != PtrMeta::Rooted);
+        // Note: `new.meta()` may appear Rooted here because `ManPtr::from(Local)`
+        // produces a bare pointer (meta bits = 0 = Rooted encoding). This is fine
+        // because we overwrite the meta to `Unrooted(old_color)` below.
 
         loop {
             let PtrMeta::Unrooted(old_color) = old.meta() else {
@@ -1299,7 +1317,11 @@ impl<T: 'static + Send + Sync + TraceObj> AtomicShared<T> {
 
     /// Atomically compares-and-swaps the pointer with GC write barriers.
     ///
-    /// Returns `Ok(previous)` on success, `Err(actual)` on failure.
+    /// On success, returns `Ok` with the **previous** value that was in the
+    /// atomic (i.e. the old value, which matches `current`). On failure,
+    /// returns `Err` with the **current actual** value.
+    ///
+    /// This follows the same convention as [`std::sync::atomic::AtomicPtr::compare_exchange`].
     pub fn compare_exchange<'l1, 'l2, 'g, G1, G2>(
         &self,
         current: &Local<'l1, G1, T>,
@@ -1328,6 +1350,9 @@ impl<T: 'static + Send + Sync + TraceObj> AtomicShared<T> {
     tag_fn! {
         /// Like [`compare_exchange`](Self::compare_exchange), but also compares/sets
         /// tag bits.
+        ///
+        /// On success, returns `Ok` with the **previous** (pointer, tag) pair.
+        /// On failure, returns `Err` with the **current actual** (pointer, tag) pair.
         #[allow(clippy::type_complexity)]
         fn compare_exchange_with_tag<'l1, 'l2, 'g, G1, G2>(
             &self,
@@ -2001,7 +2026,9 @@ mod tests {
         let base = ManPtr::<()>::null_base();
         let rooted = base.with_meta(PtrMeta::Rooted);
         let cleared = rooted.without_meta();
-        assert_eq!(cleared.meta(), PtrMeta::Unrooted(Color::C0));
+        // After clearing meta bits (setting top 2 bits to 0), the encoding is
+        // 0b00 which is `PtrMeta::Rooted`.
+        assert_eq!(cleared.meta(), PtrMeta::Rooted);
     }
 
     #[test]
@@ -2028,8 +2055,13 @@ mod tests {
         let b = ManPtr::<()>::null_base();
         assert!(a == b);
 
+        // Rooted meta is 0b00, same as null_base(), so they are equal.
         let c = a.with_meta(PtrMeta::Rooted);
-        assert!(a != c);
+        assert!(a == c);
+
+        // Unrooted meta is nonzero, so they differ.
+        let d = a.with_meta(PtrMeta::Unrooted(Color::C0));
+        assert!(a != d);
     }
 
     #[test]

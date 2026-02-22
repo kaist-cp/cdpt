@@ -367,6 +367,7 @@ fn atomic_shared_option_none() {
     let guard = pin();
     let opt: AtomicSharedOption<SimpleNode> = AtomicSharedOption::none();
     assert!(opt.load(Ordering::SeqCst, &guard).is_none());
+    unsafe { assert_eq!(std::ptr::read((&opt) as *const _ as *const usize), 0) };
 }
 
 #[test]
