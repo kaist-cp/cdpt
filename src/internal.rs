@@ -482,7 +482,7 @@ impl Local {
     }
 
     #[inline]
-    pub(crate) fn alloc<T: 'static + TraceObj>(
+    pub(crate) fn alloc<T: TraceObj>(
         &self,
         obj: ManObj<T>,
         guard: &Guard,
@@ -596,7 +596,7 @@ impl Local {
     }
 
     #[inline]
-    pub(crate) fn schedule_mark<T: 'static + TraceObj>(&self, obj: &ManObj<T>, guard: &Guard) {
+    pub(crate) fn schedule_mark<T: TraceObj>(&self, obj: &ManObj<T>, guard: &Guard) {
         let task = Task::new(|guard| obj.mark(guard));
         let mark_task = unsafe {
             self.record_mt_modification();
@@ -692,8 +692,8 @@ impl HazardPointer {
         Self { hid, local }
     }
 
-    pub(crate) fn protect<T: 'static + TraceObj>(&self, addr: ManPtr<T>) {
-        unsafe fn mark<T: 'static + TraceObj>(ptr: *mut ()) {
+    pub(crate) fn protect<T: TraceObj>(&self, addr: ManPtr<T>) {
+        unsafe fn mark<T: TraceObj>(ptr: *mut ()) {
             let ptr = ManPtr::<T>::from(ptr);
             unsafe { ptr.deref().mark(&pin()) };
         }

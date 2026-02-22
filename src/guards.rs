@@ -164,11 +164,11 @@ impl Guard {
         global().load_epoch().phase()
     }
 
-    pub(crate) fn alloc<T: 'static + TraceObj>(&self, obj: ManObj<T>) -> *mut ManObj<T> {
+    pub(crate) fn alloc<T: TraceObj>(&self, obj: ManObj<T>) -> *mut ManObj<T> {
         self.local().alloc(obj, self)
     }
 
-    pub(crate) fn schedule_mark<T: 'static + TraceObj>(&self, obj: &ManObj<T>) {
+    pub(crate) fn schedule_mark<T: TraceObj>(&self, obj: &ManObj<T>) {
         self.local().schedule_mark(obj, self);
     }
 

@@ -49,12 +49,12 @@ pub fn derive_trace_obj(input: TokenStream) -> TokenStream {
     let shade_body = gen_body(&input.data, "shade");
 
     let expanded = quote! {
-        unsafe impl #impl_generics cdpt::TraceObj for #name #ty_generics #where_clause {
-            fn unroot_outgoings(&self, guard: &cdpt::Guard) {
+        impl #impl_generics cdpt::TraceObj for #name #ty_generics #where_clause {
+            unsafe fn unroot_outgoings(&self, guard: &cdpt::Guard) {
                 #unroot_body
             }
 
-            fn shade_outgoings(&self, guard: &cdpt::Guard) {
+            unsafe fn shade_outgoings(&self, guard: &cdpt::Guard) {
                 #shade_body
             }
         }
