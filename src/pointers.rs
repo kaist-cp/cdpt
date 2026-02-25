@@ -17,15 +17,81 @@ use crate::{
     tls::pin,
 };
 use std::{
+    any::TypeId,
     borrow::Borrow,
+    collections::HashMap as StdHashMap,
     hash::Hash,
     hint::{cold_path, unlikely},
     marker::PhantomData,
     mem::forget,
     ops::Deref,
     ptr::{NonNull, null_mut},
-    sync::atomic::{AtomicPtr, AtomicUsize, Ordering},
+    sync::{
+        atomic::{AtomicPtr, AtomicUsize, Ordering},
+        Mutex, OnceLock,
+    },
 };
+
+// ── Type registry for type-erased shade functions ───────────────────────────
+
+/// Type-erased shade function: given a ManObj pointer, shade its outgoing edges.
+type ShadePointeeFn = unsafe fn(mobj_ptr: *mut (), guard: &Guard);
+
+struct TypeRegistry {
+    by_type: StdHashMap<TypeId, u8>,
+    fns: Vec<ShadePointeeFn>,
+}
+
+static TYPE_REGISTRY: OnceLock<Mutex<TypeRegistry>> = OnceLock::new();
+
+/// Fast lookup table for shade functions (256 entries = 2 KB, lock-free reads).
+static SHADE_FN_TABLE: [AtomicPtr<()>; 256] = {
+    const INIT: AtomicPtr<()> = AtomicPtr::new(std::ptr::null_mut());
+    [INIT; 256]
+};
+
+fn register_type<T: TraceObj>() -> u8 {
+    let tid = TypeId::of::<T>();
+
+    let registry = TYPE_REGISTRY.get_or_init(|| {
+        Mutex::new(TypeRegistry {
+            by_type: StdHashMap::new(),
+            fns: Vec::new(),
+        })
+    });
+    let mut reg = registry.lock().unwrap();
+
+    if let Some(&id) = reg.by_type.get(&tid) {
+        return id;
+    }
+
+    unsafe fn shade_erased<U: TraceObj>(mobj_ptr: *mut (), guard: &Guard) {
+        let mobj = unsafe { &*(mobj_ptr as *const ManObj<U>) };
+        if mobj.is_marked(guard) {
+            return;
+        }
+        guard.schedule_mark(mobj);
+    }
+
+    let id = reg.fns.len();
+    assert!(id < 256, "type registry overflow: more than 256 distinct managed types");
+    let id = id as u8;
+    let f: ShadePointeeFn = shade_erased::<T>;
+    reg.fns.push(f);
+    reg.by_type.insert(tid, id);
+
+    SHADE_FN_TABLE[id as usize].store(f as *mut (), Ordering::Release);
+    id
+}
+
+#[inline(always)]
+fn get_shade_fn(type_id: u8) -> ShadePointeeFn {
+    let ptr = SHADE_FN_TABLE[type_id as usize].load(Ordering::Acquire);
+    debug_assert!(!ptr.is_null());
+    unsafe { std::mem::transmute(ptr) }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 
 /// Toggles a method's visibility between `pub` (when `feature = "tag"`) and
 /// `pub(crate)` (otherwise). Used for `*_with_tag` / `fetch_tag_*` APIs.
@@ -63,28 +129,52 @@ impl From<usize> for ObjMeta {
 }
 
 impl ObjMeta {
-    const ROOT_COUNT_BITS: usize = ((1 << (usize::BITS - 1)) - 1);
+    // Bit layout (64-bit):
+    //   Bit 63:     color
+    //   Bits 48-55: type_id (8 bits, 256 types)
+    //   Bits 0-47:  root_count (48 bits)
+    const COLOR_SHIFT: u32 = 63;
+    const TYPE_ID_SHIFT: u32 = 48;
+    const TYPE_ID_MASK: usize = 0xFF << Self::TYPE_ID_SHIFT;
+    const ROOT_COUNT_MASK: usize = (1usize << 48) - 1;
+    const ROOT_COUNT_BITS: usize = Self::ROOT_COUNT_MASK;
 
     #[inline(always)]
     pub fn new(marked: Color, root_count: usize) -> Self {
-        debug_assert!(root_count <= Self::ROOT_COUNT_BITS);
-        let bits = ((marked as usize) << (usize::BITS - 1)) | root_count;
+        debug_assert!(root_count <= Self::ROOT_COUNT_MASK);
+        let bits = ((marked as usize) << Self::COLOR_SHIFT)
+            | (root_count & Self::ROOT_COUNT_MASK);
         Self(bits)
     }
 
     #[inline(always)]
+    pub fn new_with_type_id(marked: Color, root_count: usize, type_id: u8) -> Self {
+        debug_assert!(root_count <= Self::ROOT_COUNT_MASK);
+        let bits = ((marked as usize) << Self::COLOR_SHIFT)
+            | ((type_id as usize) << Self::TYPE_ID_SHIFT)
+            | (root_count & Self::ROOT_COUNT_MASK);
+        Self(bits)
+    }
+
+    #[inline(always)]
+    pub fn type_id(self) -> u8 {
+        ((self.0 & Self::TYPE_ID_MASK) >> Self::TYPE_ID_SHIFT) as u8
+    }
+
+    #[inline(always)]
     pub fn marked(self) -> Color {
-        (self.0 & !Self::ROOT_COUNT_BITS).into()
+        (self.0 >> Self::COLOR_SHIFT).into()
     }
 
     #[inline(always)]
     pub fn with_marked(self, color: Color) -> Self {
-        Self::new(color, self.root_count())
+        let cleared = self.0 & !(1usize << Self::COLOR_SHIFT);
+        Self(cleared | ((color as usize) << Self::COLOR_SHIFT))
     }
 
     #[inline(always)]
     pub fn root_count(self) -> usize {
-        self.0 & Self::ROOT_COUNT_BITS
+        self.0 & Self::ROOT_COUNT_MASK
     }
 }
 
@@ -146,7 +236,7 @@ impl From<ObjMeta> for AtomicObjMeta {
     }
 }
 
-#[repr(C)] // HACK: `header` must be the first field
+#[repr(C)]
 pub(crate) struct ManObj<T: TraceObj> {
     pub(crate) header: AtomicObjMeta,
     item: T,
@@ -155,8 +245,9 @@ pub(crate) struct ManObj<T: TraceObj> {
 impl<T: TraceObj> ManObj<T> {
     #[inline(always)]
     pub fn new(item: T, color: Color, root_count: usize) -> Self {
+        let type_id = register_type::<T>();
         Self {
-            header: AtomicObjMeta::new(color, root_count),
+            header: AtomicObjMeta::from(ObjMeta::new_with_type_id(color, root_count, type_id)),
             item,
         }
     }
@@ -594,9 +685,13 @@ impl<T: TraceObj> MarkObj for ManObj<T> {
 ///     next: AtomicSharedOption<Node>,  // nullable, concurrently mutable
 /// }
 /// ```
-pub struct AtomicSharedOption<T: TraceObj> {
+/// The `T` parameter is unconstrained on the struct, allowing types that
+/// contain `AtomicSharedOption<T>` to avoid requiring `T: TraceObj` on their
+/// own struct definitions. The `TraceObj` bound is instead required on all
+/// impl blocks that allocate or dereference managed objects.
+pub struct AtomicSharedOption<T> {
     link: AtomicPtr<()>,
-    _marker: PhantomData<ManPtr<T>>,
+    _marker: PhantomData<*mut T>,
 }
 
 assert_eq_size!(AtomicSharedOption<()>, usize);
@@ -604,13 +699,37 @@ assert_eq_size!(AtomicSharedOption<()>, usize);
 // top two bits, making `null_rooted()` an all-zero pointer.
 const_assert!(ManPtr::<()>::null_rooted().data.is_null());
 
-unsafe impl<T: TraceObj> Sync for AtomicSharedOption<T> {}
-unsafe impl<T: TraceObj> Send for AtomicSharedOption<T> {}
+// Safety: AtomicSharedOption only stores an `AtomicPtr<()>`. All access to the
+// managed `T` goes through methods that require `T: TraceObj` (which implies
+// `T: Send + Sync + 'static`), so there is no way to create an
+// AtomicSharedOption<T> pointing to a non-Send/Sync T.
+unsafe impl<T> Sync for AtomicSharedOption<T> {}
+unsafe impl<T> Send for AtomicSharedOption<T> {}
 
-impl<T: TraceObj> Default for AtomicSharedOption<T> {
+impl<T> Default for AtomicSharedOption<T> {
     #[inline(always)]
     fn default() -> Self {
         Self::none()
+    }
+}
+
+impl<T> AtomicSharedOption<T> {
+    /// Creates a null (empty) atomic pointer. This is a `const` function, so
+    /// it can be used in static or field initializers.
+    ///
+    /// The returned value is **zero-initialized** (all bytes are `0x00`),
+    /// which means arrays of `AtomicSharedOption` can be safely created with
+    /// `zeroed()` or equivalent zero-fill operations.
+    ///
+    /// This method does not require `T: TraceObj` because no managed object
+    /// is allocated — the pointer is simply null.
+    #[inline(always)]
+    pub const fn none() -> Self {
+        // Rooted meta = 0b00, null pointer = 0x0, so this is all-zero.
+        Self {
+            link: AtomicPtr::new(null_mut()),
+            _marker: PhantomData,
+        }
     }
 }
 
@@ -636,17 +755,6 @@ impl<T: TraceObj> AtomicSharedOption<T> {
             unsafe { ptr.deref().item.unroot_outgoings(guard) };
             Self::from_raw(ptr.with_tag(tag))
         }
-    }
-
-    /// Creates a null (empty) atomic pointer. This is a `const` function, so
-    /// it can be used in static or field initializers.
-    ///
-    /// The returned value is **zero-initialized** (all bytes are `0x00`),
-    /// which means arrays of `AtomicSharedOption` can be safely created with
-    /// `zeroed()` or equivalent zero-fill operations.
-    #[inline(always)]
-    pub const fn none() -> Self {
-        Self::from_raw(ManPtr::null_rooted())
     }
 
     tag_fn! {
@@ -1024,28 +1132,41 @@ impl<T: TraceObj> AtomicSharedOption<T> {
     }
 }
 
-impl<T: TraceObj> Drop for AtomicSharedOption<T> {
+impl<T> Drop for AtomicSharedOption<T> {
     #[inline(always)]
     fn drop(&mut self) {
-        let ptr = ManPtr::<T>::from(self.link.load(Ordering::Relaxed));
-        if let PtrMeta::Unrooted(_) = ptr.meta() {
+        let raw = self.link.load(Ordering::Relaxed);
+        let addr = raw as usize;
+
+        // Check meta: top bit set → Unrooted → no drop action needed.
+        if addr >> (usize::BITS - 1) != 0 {
             return;
         }
-        if ptr.is_null() {
-            return;
+
+        // Strip meta bits (top 2) and minimum tag bits (bottom 3, guaranteed by
+        // ManObj alignment >= 8 due to AtomicObjMeta being 8-byte aligned) to get
+        // the actual ManObj address.
+        const META_BITS: usize = 0b11 << (usize::BITS - 2);
+        const MIN_LOW_BITS: usize = 0b111; // align_of::<AtomicObjMeta>() - 1
+        let mobj_addr = addr & !META_BITS & !MIN_LOW_BITS;
+        if mobj_addr == 0 {
+            return; // Null pointer
         }
 
         // If it is rooted, we need to pin the thread before decrementing,
         // to safely execute deletion barrier if necessary.
         let guard = pin();
-        if unsafe { &*ptr.as_ptr() }
-            .header
-            .decrement_root_count(Ordering::Relaxed)
-            == 1
+
+        // Safety: `mobj_addr` points to a valid `ManObj<T>` which is `#[repr(C)]`
+        // with `header: AtomicObjMeta` at offset 0.
+        let header = unsafe { &*(mobj_addr as *const AtomicObjMeta) };
+        if header.decrement_root_count(Ordering::Relaxed) == 1
             && guard.global_phase() != Phase::N
         {
-            // Root-count deletion barrier.
-            ptr.shade_pointee(&guard);
+            // Look up the shade function via the type_id packed in the header.
+            let meta = header.load(Ordering::Relaxed);
+            let shade_fn = get_shade_fn(meta.type_id());
+            unsafe { shade_fn(mobj_addr as *mut (), &guard) };
         }
     }
 }
@@ -1875,6 +1996,16 @@ where
     G: Protector,
     T: TraceObj + Eq,
 {
+}
+
+impl<'g, G, T> std::fmt::Debug for Local<'g, G, T>
+where
+    G: Protector,
+    T: TraceObj + std::fmt::Debug,
+{
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Debug::fmt(&**self, f)
+    }
 }
 
 impl<'g, G, T> PartialOrd for Local<'g, G, T>
