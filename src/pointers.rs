@@ -988,6 +988,58 @@ impl<T: TraceObj> AtomicSharedOption<T> {
         }
     }
 
+    tag_fn! {
+        /// Weak variant of [`compare_exchange_with_tag`](Self::compare_exchange_with_tag).
+        ///
+        /// Unlike the strong variant, this does NOT retry when the CAS fails due
+        /// to a concurrent GC color-metadata change. Callers that already sit
+        /// inside their own retry loop should prefer this to avoid redundant
+        /// retries.
+        ///
+        /// On success, returns `Ok` with the **previous** (pointer, tag) pair.
+        /// On failure, returns `Err` with the **current actual** (pointer, tag)
+        /// pair. The failure may be spurious (only GC metadata changed).
+        #[allow(clippy::type_complexity)]
+        fn compare_exchange_weak_with_tag<'l1, 'l2, 'g, G1, G2>(
+            &self,
+            current_tag: (Option<&Local<'l1, G1, T>>, usize),
+            new_tag: (Option<&Local<'l2, G2, T>>, usize),
+            success: Ordering,
+            failure: Ordering,
+            guard: &'g Guard,
+        ) -> Result<(Option<Local<'g, Guard, T>>, usize), (Option<Local<'g, Guard, T>>, usize)>
+        where
+            G1: Protector,
+            G2: Protector,
+        {
+            let old = ManPtr::<T>::from(self.link.load(Ordering::Relaxed));
+
+            if old.without_meta() != ManPtr::from(current_tag) {
+                return Err(unsafe { old.as_local_with_tag(guard) });
+            }
+
+            if old.meta() == PtrMeta::Rooted {
+                cold_path();
+                let new_shared = Shared::try_inc_raw(ManPtr::from(new_tag.0), guard);
+                let new_rooted = ManPtr::from(new_tag).with_meta(PtrMeta::Rooted);
+
+                match self.internal_cmpxchg_rooted(old, new_rooted, success, failure, guard) {
+                    Ok(current) => {
+                        forget(new_shared);
+                        return Ok(unsafe { current.as_local_with_tag(guard) });
+                    }
+                    Err(current) => {
+                        return Err(unsafe { current.as_local_with_tag(guard) });
+                    }
+                }
+            }
+
+            self.internal_cmpxchg_unrooted_weak(old, ManPtr::from(new_tag), success, failure, guard)
+                .map(|current| unsafe { current.as_local_with_tag(guard) })
+                .map_err(|current| unsafe { current.as_local_with_tag(guard) })
+        }
+    }
+
     fn internal_cmpxchg_rooted(
         &self,
         old: ManPtr<T>,
@@ -1071,6 +1123,42 @@ impl<T: TraceObj> AtomicSharedOption<T> {
 
             return result;
         }
+    }
+
+    fn internal_cmpxchg_unrooted_weak(
+        &self,
+        old: ManPtr<T>,
+        new: ManPtr<T>,
+        success: Ordering,
+        failure: Ordering,
+        guard: &Guard,
+    ) -> Result<ManPtr<T>, ManPtr<T>> {
+        debug_assert!(old.meta() != PtrMeta::Rooted);
+
+        let PtrMeta::Unrooted(old_color) = old.meta() else {
+            unreachable!("An unrooted pointer is never re-rooted.");
+        };
+        if old.as_ptr() != new.as_ptr() && old_color == guard.black_color() {
+            new.shade_pointee(guard);
+        }
+        let new = new.with_meta(PtrMeta::Unrooted(old_color));
+
+        let result = self
+            .link
+            .compare_exchange(old.data, new.data, success, failure)
+            .map(ManPtr::from)
+            .map_err(ManPtr::from);
+
+        if let Ok(_) = &result {
+            if old.as_ptr() != new.as_ptr()
+                && old_color == guard.white_color()
+                && guard.global_phase() != Phase::N
+            {
+                old.shade_pointee(guard);
+            }
+        }
+
+        result
     }
 
     tag_fn! {
