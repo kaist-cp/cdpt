@@ -534,6 +534,15 @@ impl<T> ManPtr<T> {
         unsafe { &*self.as_ptr() }
     }
 
+    /// Extracts the color assuming the pointer is unrooted (bit 63 set).
+    ///
+    /// # Safety
+    /// The caller must ensure `self.meta() != PtrMeta::Rooted`.
+    #[inline(always)]
+    pub(crate) unsafe fn unrooted_color_unchecked(self) -> Color {
+        Color::from(self.data.addr() & (1 << (usize::BITS - 2)))
+    }
+
     #[inline(always)]
     pub(crate) unsafe fn as_ref<'l>(self) -> Option<&'l ManObj<T>> {
         unsafe { self.as_ptr().as_ref() }
@@ -1078,6 +1087,33 @@ impl<T: TraceObj> AtomicSharedOption<T> {
         }
     }
 
+    /// Cold path for the rooted CAS case (~0.009% of calls).
+    #[cold]
+    #[inline(never)]
+    #[allow(clippy::type_complexity)]
+    fn cmpxchg_weak_rooted_cold<'l2, 'g, G2>(
+        &self,
+        old: ManPtr<T>,
+        new_tag: (Option<&Local<'l2, G2, T>>, usize),
+        success: Ordering,
+        failure: Ordering,
+        guard: &'g Guard,
+    ) -> Result<(Option<Local<'g, Guard, T>>, usize), (Option<Local<'g, Guard, T>>, usize)>
+    where
+        G2: Protector,
+    {
+        let new_shared = Shared::try_inc_raw(ManPtr::from(new_tag.0), guard);
+        let new_rooted = ManPtr::from(new_tag).with_meta(PtrMeta::Rooted);
+
+        match self.internal_cmpxchg_rooted(old, new_rooted, success, failure, guard) {
+            Ok(current) => {
+                forget(new_shared);
+                Ok(unsafe { current.as_local_with_tag(guard) })
+            }
+            Err(current) => Err(unsafe { current.as_local_with_tag(guard) }),
+        }
+    }
+
     tag_fn! {
         /// Weak variant of [`compare_exchange_with_tag`](Self::compare_exchange_with_tag).
         ///
@@ -1090,6 +1126,7 @@ impl<T: TraceObj> AtomicSharedOption<T> {
         /// On failure, returns `Err` with the **current actual** (pointer, tag)
         /// pair. The failure may be spurious (only GC metadata changed).
         #[allow(clippy::type_complexity)]
+        #[inline(always)]
         fn compare_exchange_weak_with_tag<'l1, 'l2, 'g, G1, G2>(
             &self,
             current_tag: (Option<&Local<'l1, G1, T>>, usize),
@@ -1109,24 +1146,36 @@ impl<T: TraceObj> AtomicSharedOption<T> {
             }
 
             if old.meta() == PtrMeta::Rooted {
-                cold_path();
-                let new_shared = Shared::try_inc_raw(ManPtr::from(new_tag.0), guard);
-                let new_rooted = ManPtr::from(new_tag).with_meta(PtrMeta::Rooted);
-
-                match self.internal_cmpxchg_rooted(old, new_rooted, success, failure, guard) {
-                    Ok(current) => {
-                        forget(new_shared);
-                        return Ok(unsafe { current.as_local_with_tag(guard) });
-                    }
-                    Err(current) => {
-                        return Err(unsafe { current.as_local_with_tag(guard) });
-                    }
-                }
+                return self.cmpxchg_weak_rooted_cold(old, new_tag, success, failure, guard);
             }
 
-            self.internal_cmpxchg_unrooted_weak(old, ManPtr::from(new_tag), success, failure, guard)
-                .map(|current| unsafe { current.as_local_with_tag(guard) })
-                .map_err(|current| unsafe { current.as_local_with_tag(guard) })
+            // Hot path: unrooted weak CAS (99.99%+ of calls).
+            // Safety: meta != Rooted was just checked above.
+            let old_color = unsafe { old.unrooted_color_unchecked() };
+            let new = ManPtr::from(new_tag);
+            let ptrs_differ = old.as_ptr() != new.as_ptr();
+
+            // Dijkstra insertion barrier (fires ~0.8% of calls, only during GC tracing).
+            if ptrs_differ && old_color == guard.black_color() {
+                cold_path();
+                Self::dijkstra_insertion_barrier(new, guard);
+            }
+            let new = new.with_meta(PtrMeta::Unrooted(old_color));
+
+            match self.link.compare_exchange(old.data, new.data, success, failure) {
+                Ok(_) => {
+                    // Yuasa deletion barrier (fires ~0.3% of calls, only during GC tracing).
+                    if ptrs_differ
+                        && old_color == guard.white_color()
+                        && guard.global_phase_no_fence() != Phase::N
+                    {
+                        cold_path();
+                        Self::yuasa_deletion_barrier(old, guard);
+                    }
+                    Ok(unsafe { old.as_local_with_tag(guard) })
+                }
+                Err(current) => Err(unsafe { ManPtr::from(current).as_local_with_tag(guard) }),
+            }
         }
     }
 
@@ -1215,40 +1264,16 @@ impl<T: TraceObj> AtomicSharedOption<T> {
         }
     }
 
-    fn internal_cmpxchg_unrooted_weak(
-        &self,
-        old: ManPtr<T>,
-        new: ManPtr<T>,
-        success: Ordering,
-        failure: Ordering,
-        guard: &Guard,
-    ) -> Result<ManPtr<T>, ManPtr<T>> {
-        debug_assert!(old.meta() != PtrMeta::Rooted);
+    #[cold]
+    #[inline(never)]
+    fn dijkstra_insertion_barrier(new: ManPtr<T>, guard: &Guard) {
+        new.shade_pointee(guard);
+    }
 
-        let PtrMeta::Unrooted(old_color) = old.meta() else {
-            unreachable!("An unrooted pointer is never re-rooted.");
-        };
-        if old.as_ptr() != new.as_ptr() && old_color == guard.black_color() {
-            new.shade_pointee(guard);
-        }
-        let new = new.with_meta(PtrMeta::Unrooted(old_color));
-
-        let result = self
-            .link
-            .compare_exchange(old.data, new.data, success, failure)
-            .map(ManPtr::from)
-            .map_err(ManPtr::from);
-
-        if let Ok(_) = &result {
-            if old.as_ptr() != new.as_ptr()
-                && old_color == guard.white_color()
-                && guard.global_phase_with_fence() != Phase::N
-            {
-                old.shade_pointee(guard);
-            }
-        }
-
-        result
+    #[cold]
+    #[inline(never)]
+    fn yuasa_deletion_barrier(old: ManPtr<T>, guard: &Guard) {
+        old.shade_pointee(guard);
     }
 
     tag_fn! {

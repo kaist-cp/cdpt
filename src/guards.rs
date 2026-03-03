@@ -164,6 +164,17 @@ impl Guard {
         global().load_epoch().phase()
     }
 
+    /// Like [`global_phase`](Self::global_phase) but without a preceding SeqCst
+    /// fence. Safe to call immediately after a successful atomic RMW with at
+    /// least AcqRel success ordering — on x86/x86-64, lock-prefixed
+    /// instructions already provide full ordering, making the fence redundant.
+    #[inline(always)]
+    pub(crate) fn global_phase_no_fence(&self) -> Phase {
+        #[cfg(not(any(target_arch = "x86_64", target_arch = "x86")))]
+        fence(Ordering::SeqCst);
+        global().load_epoch().phase()
+    }
+
     pub(crate) fn alloc<T: TraceObj>(&self, obj: ManObj<T>) -> *mut ManObj<T> {
         self.local().alloc(obj, self)
     }
