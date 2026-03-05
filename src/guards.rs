@@ -12,6 +12,7 @@ use crate::{
 use crossbeam::epoch::pin as ebr_pin;
 use std::{
     cell::{Cell, LazyCell},
+    marker::PhantomData,
     rc::Rc,
     sync::atomic::{Ordering, fence},
 };

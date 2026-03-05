@@ -444,7 +444,8 @@ impl Local {
         let ebr_guard = &ebr_pin();
         let old_sh = self.hazards.load(Ordering::Relaxed, ebr_guard);
         let old_ref = unsafe { old_sh.deref() };
-        let mut new: EbrOwned<[MaybeUninit<AtomicPtr<()>>]> = EbrOwned::init(old_ref.len() * 2);
+        let mut new: EbrOwned<[MaybeUninit<AtomicPtr<()>>]> =
+            EbrOwned::init(old_ref.len().max(1) * 2);
         let half = old_ref.len();
 
         unsafe {
@@ -482,11 +483,7 @@ impl Local {
     }
 
     #[inline]
-    pub(crate) fn alloc<T: TraceObj>(
-        &self,
-        obj: ManObj<T>,
-        guard: &Guard,
-    ) -> *mut ManObj<T> {
+    pub(crate) fn alloc<T: TraceObj>(&self, obj: ManObj<T>, guard: &Guard) -> *mut ManObj<T> {
         let b = Box::new(obj);
         let ptr = ((&*b) as *const ManObj<T>).cast_mut();
         let b_dyn: Box<dyn MarkObj> = b;

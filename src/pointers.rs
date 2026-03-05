@@ -27,8 +27,8 @@ use std::{
     ops::Deref,
     ptr::{NonNull, null_mut},
     sync::{
-        atomic::{AtomicPtr, AtomicUsize, Ordering},
         Mutex, OnceLock,
+        atomic::{AtomicPtr, AtomicUsize, Ordering},
     },
 };
 
@@ -45,10 +45,7 @@ struct TypeRegistry {
 static TYPE_REGISTRY: OnceLock<Mutex<TypeRegistry>> = OnceLock::new();
 
 /// Fast lookup table for shade functions (256 entries = 2 KB, lock-free reads).
-static SHADE_FN_TABLE: [AtomicPtr<()>; 256] = {
-    const INIT: AtomicPtr<()> = AtomicPtr::new(std::ptr::null_mut());
-    [INIT; 256]
-};
+static SHADE_FN_TABLE: [AtomicPtr<()>; 256] = [const { AtomicPtr::new(std::ptr::null_mut()) }; 256];
 
 fn register_type<T: TraceObj>() -> u8 {
     let tid = TypeId::of::<T>();
@@ -65,6 +62,7 @@ fn register_type<T: TraceObj>() -> u8 {
         return id;
     }
 
+    /// Type-erased shade function.
     unsafe fn shade_erased<U: TraceObj>(mobj_ptr: *mut (), guard: &Guard) {
         let mobj = unsafe { &*(mobj_ptr as *const ManObj<U>) };
         if mobj.is_marked(guard) {
@@ -74,7 +72,10 @@ fn register_type<T: TraceObj>() -> u8 {
     }
 
     let id = reg.fns.len();
-    assert!(id < 256, "type registry overflow: more than 256 distinct managed types");
+    assert!(
+        id < 256,
+        "type registry overflow: more than 256 distinct managed types"
+    );
     let id = id as u8;
     let f: ShadePointeeFn = shade_erased::<T>;
     reg.fns.push(f);
@@ -139,11 +140,11 @@ impl ObjMeta {
     const ROOT_COUNT_MASK: usize = (1usize << 48) - 1;
     const ROOT_COUNT_BITS: usize = Self::ROOT_COUNT_MASK;
 
+    #[cfg(test)]
     #[inline(always)]
     pub fn new(marked: Color, root_count: usize) -> Self {
         debug_assert!(root_count <= Self::ROOT_COUNT_MASK);
-        let bits = ((marked as usize) << Self::COLOR_SHIFT)
-            | (root_count & Self::ROOT_COUNT_MASK);
+        let bits = ((marked as usize) << Self::COLOR_SHIFT) | (root_count & Self::ROOT_COUNT_MASK);
         Self(bits)
     }
 
@@ -188,6 +189,7 @@ impl Default for AtomicObjMeta {
 }
 
 impl AtomicObjMeta {
+    #[cfg(test)]
     #[inline(always)]
     pub fn new(marked: Color, root_count: usize) -> Self {
         Self::from(ObjMeta::new(marked, root_count))
@@ -1248,9 +1250,7 @@ impl<T> Drop for AtomicSharedOption<T> {
         // Safety: `mobj_addr` points to a valid `ManObj<T>` which is `#[repr(C)]`
         // with `header: AtomicObjMeta` at offset 0.
         let header = unsafe { &*(mobj_addr as *const AtomicObjMeta) };
-        if header.decrement_root_count(Ordering::Relaxed) == 1
-            && guard.global_phase() != Phase::N
-        {
+        if header.decrement_root_count(Ordering::Relaxed) == 1 && guard.global_phase() != Phase::N {
             // Look up the shade function via the type_id packed in the header.
             let meta = header.load(Ordering::Relaxed);
             let shade_fn = get_shade_fn(meta.type_id());
