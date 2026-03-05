@@ -19,7 +19,7 @@ use crate::{
 use std::{
     any::TypeId,
     borrow::Borrow,
-    collections::HashMap as StdHashMap,
+    collections::HashMap,
     hash::Hash,
     hint::{cold_path, unlikely},
     marker::PhantomData,
@@ -33,12 +33,28 @@ use std::{
 };
 
 // ── Type registry for type-erased shade functions ───────────────────────────
+//
+// The type registry exists so that managed pointer types (`AtomicSharedOption`,
+// `AtomicShared`, `Shared`, `Local`) can be defined *without* a `T: TraceObj`
+// bound on the struct itself.  The `TraceObj` bound is only required on the
+// methods that actually interact with the GC (allocation, tracing, barriers).
+//
+// This matters because `TraceObj` implies `Send + Sync + 'static`.  If the
+// struct carried that bound, every containing type would transitively inherit
+// it, forcing `TraceObj` (and its supertraits) onto hundreds of struct blocks
+// throughout downstream crates — a cascading, tedious, and destructive change.
+//
+// The trade-off is a small runtime lookup table (256 entries, 2 KB) that maps
+// a compact 8-bit type id, packed into each object's header, to the
+// type-erased shade function for that type.  This is consulted only during
+// `Drop` of a rooted `AtomicSharedOption` whose root count drops to zero
+// while the collector is active — a rare path that is already cold.
 
 /// Type-erased shade function: given a ManObj pointer, shade its outgoing edges.
 type ShadePointeeFn = unsafe fn(mobj_ptr: *mut (), guard: &Guard);
 
 struct TypeRegistry {
-    by_type: StdHashMap<TypeId, u8>,
+    by_type: HashMap<TypeId, u8>,
     fns: Vec<ShadePointeeFn>,
 }
 
@@ -52,7 +68,7 @@ fn register_type<T: TraceObj>() -> u8 {
 
     let registry = TYPE_REGISTRY.get_or_init(|| {
         Mutex::new(TypeRegistry {
-            by_type: StdHashMap::new(),
+            by_type: HashMap::new(),
             fns: Vec::new(),
         })
     });
@@ -239,7 +255,7 @@ impl From<ObjMeta> for AtomicObjMeta {
 }
 
 #[repr(C)]
-pub(crate) struct ManObj<T: TraceObj> {
+pub(crate) struct ManObj<T> {
     pub(crate) header: AtomicObjMeta,
     item: T,
 }
@@ -291,7 +307,7 @@ pub(crate) enum PtrMeta {
     Unrooted(Color),
 }
 
-pub struct ManPtr<T: TraceObj> {
+pub struct ManPtr<T> {
     // Note: Intentionally not used `*mut ManObj<T>` here, to prevent
     // mistakenly dereferencing this pointer. It must be untagged properly
     // before dereferencing (e.g., `as_ptr`).
@@ -299,25 +315,25 @@ pub struct ManPtr<T: TraceObj> {
     _marker: PhantomData<*mut ManObj<T>>,
 }
 
-impl<T: TraceObj> Clone for ManPtr<T> {
+impl<T> Clone for ManPtr<T> {
     #[inline(always)]
     fn clone(&self) -> Self {
         *self
     }
 }
 
-impl<T: TraceObj> Copy for ManPtr<T> {}
+impl<T> Copy for ManPtr<T> {}
 
-impl<T: TraceObj> PartialEq for ManPtr<T> {
+impl<T> PartialEq for ManPtr<T> {
     #[inline(always)]
     fn eq(&self, other: &Self) -> bool {
         self.data == other.data
     }
 }
 
-impl<T: TraceObj> Eq for ManPtr<T> {}
+impl<T> Eq for ManPtr<T> {}
 
-impl<T: TraceObj> From<*mut ()> for ManPtr<T> {
+impl<T> From<*mut ()> for ManPtr<T> {
     #[inline(always)]
     fn from(value: *mut ()) -> Self {
         Self {
@@ -327,7 +343,7 @@ impl<T: TraceObj> From<*mut ()> for ManPtr<T> {
     }
 }
 
-impl<T: TraceObj> From<NonNull<ManObj<T>>> for ManPtr<T> {
+impl<T> From<NonNull<ManObj<T>>> for ManPtr<T> {
     #[inline(always)]
     fn from(value: NonNull<ManObj<T>>) -> Self {
         Self {
@@ -340,7 +356,6 @@ impl<T: TraceObj> From<NonNull<ManObj<T>>> for ManPtr<T> {
 impl<'g, G, T> From<Option<&Local<'g, G, T>>> for ManPtr<T>
 where
     G: Protector,
-    T: TraceObj,
 {
     fn from(value: Option<&Local<'g, G, T>>) -> Self {
         value.map(|l| l.as_man_ptr()).unwrap_or(Self::null_base())
@@ -350,41 +365,17 @@ where
 impl<'g, G, T> From<(Option<&Local<'g, G, T>>, usize)> for ManPtr<T>
 where
     G: Protector,
-    T: TraceObj,
 {
     fn from(value: (Option<&Local<'g, G, T>>, usize)) -> Self {
         Self::from(value.0).with_tag(value.1)
     }
 }
 
-impl<T: TraceObj> ManPtr<T> {
+impl<T> ManPtr<T> {
     const META_WIDTH: u32 = 2;
     const META_BITS: usize = ((1 << Self::META_WIDTH) - 1) << (usize::BITS - Self::META_WIDTH);
     const LOW_BITS: usize = (1 << align_of::<ManObj<T>>().trailing_zeros()) - 1;
     const ADDR_BITS: usize = usize::MAX & !Self::META_BITS & !Self::LOW_BITS;
-
-    #[inline(always)]
-    pub(crate) fn alloc_rooted(item: T, color: Color, root_count: usize, guard: &Guard) -> Self {
-        debug_assert!(root_count > 0);
-        let obj = ManObj::new(item, color, root_count);
-        let addr = guard.alloc(obj);
-        let ptr = Self {
-            data: addr.cast(),
-            _marker: PhantomData,
-        };
-        ptr.with_meta(PtrMeta::Rooted)
-    }
-
-    #[inline(always)]
-    pub(crate) fn alloc_unrooted(item: T, color: Color, guard: &Guard) -> Self {
-        let obj = ManObj::new(item, color, 0);
-        let addr = guard.alloc(obj);
-        let ptr = Self {
-            data: addr.cast(),
-            _marker: PhantomData,
-        };
-        ptr.with_meta(PtrMeta::Unrooted(color))
-    }
 
     #[inline(always)]
     pub(crate) const fn null_base() -> Self {
@@ -468,6 +459,9 @@ impl<T: TraceObj> ManPtr<T> {
         self.as_ptr().is_null()
     }
 
+    /// # Safety
+    ///
+    /// The pointer must be non-null and point to a valid `ManObj<T>`.
     #[inline(always)]
     pub(crate) unsafe fn deref<'l>(self) -> &'l ManObj<T> {
         unsafe { &*self.as_ptr() }
@@ -476,6 +470,31 @@ impl<T: TraceObj> ManPtr<T> {
     #[inline(always)]
     pub(crate) unsafe fn as_ref<'l>(self) -> Option<&'l ManObj<T>> {
         unsafe { self.as_ptr().as_ref() }
+    }
+}
+
+impl<T: TraceObj> ManPtr<T> {
+    #[inline(always)]
+    pub(crate) fn alloc_rooted(item: T, color: Color, root_count: usize, guard: &Guard) -> Self {
+        debug_assert!(root_count > 0);
+        let obj = ManObj::new(item, color, root_count);
+        let addr = guard.alloc(obj);
+        let ptr = Self {
+            data: addr.cast(),
+            _marker: PhantomData,
+        };
+        ptr.with_meta(PtrMeta::Rooted)
+    }
+
+    #[inline(always)]
+    pub(crate) fn alloc_unrooted(item: T, color: Color, guard: &Guard) -> Self {
+        let obj = ManObj::new(item, color, 0);
+        let addr = guard.alloc(obj);
+        let ptr = Self {
+            data: addr.cast(),
+            _marker: PhantomData,
+        };
+        ptr.with_meta(PtrMeta::Unrooted(color))
     }
 
     /// Returns `true` if it scheduled a task.
@@ -705,8 +724,8 @@ const_assert!(ManPtr::<()>::null_rooted().data.is_null());
 // managed `T` goes through methods that require `T: TraceObj` (which implies
 // `T: Send + Sync + 'static`), so there is no way to create an
 // AtomicSharedOption<T> pointing to a non-Send/Sync T.
-unsafe impl<T> Sync for AtomicSharedOption<T> {}
-unsafe impl<T> Send for AtomicSharedOption<T> {}
+unsafe impl<T: Sync + Send> Sync for AtomicSharedOption<T> {}
+unsafe impl<T: Sync + Send> Send for AtomicSharedOption<T> {}
 
 impl<T> Default for AtomicSharedOption<T> {
     #[inline(always)]
@@ -733,6 +752,22 @@ impl<T> AtomicSharedOption<T> {
             _marker: PhantomData,
         }
     }
+
+    tag_fn! {
+        /// Creates a null atomic pointer with the given tag bits set.
+        #[inline(always)]
+        const fn none_with_tag(tag: usize) -> Self {
+            Self::from_raw(ManPtr::null_rooted_with_tag(tag))
+        }
+    }
+
+    #[inline(always)]
+    pub(crate) const fn from_raw(ptr: ManPtr<T>) -> Self {
+        Self {
+            link: AtomicPtr::new(ptr.data),
+            _marker: PhantomData,
+        }
+    }
 }
 
 impl<T: TraceObj> AtomicSharedOption<T> {
@@ -756,22 +791,6 @@ impl<T: TraceObj> AtomicSharedOption<T> {
             // Safety: `ptr` is freshly allocated; unrooting during initialization.
             unsafe { ptr.deref().item.unroot_outgoings(guard) };
             Self::from_raw(ptr.with_tag(tag))
-        }
-    }
-
-    tag_fn! {
-        /// Creates a null atomic pointer with the given tag bits set.
-        #[inline(always)]
-        const fn none_with_tag(tag: usize) -> Self {
-            Self::from_raw(ManPtr::null_rooted_with_tag(tag))
-        }
-    }
-
-    #[inline(always)]
-    pub(crate) const fn from_raw(ptr: ManPtr<T>) -> Self {
-        Self {
-            link: AtomicPtr::new(ptr.data),
-            _marker: PhantomData,
         }
     }
 
@@ -1225,36 +1244,30 @@ impl<T: TraceObj> AtomicSharedOption<T> {
 impl<T> Drop for AtomicSharedOption<T> {
     #[inline(always)]
     fn drop(&mut self) {
-        let raw = self.link.load(Ordering::Relaxed);
-        let addr = raw as usize;
+        let ptr = ManPtr::<T>::from(self.link.load(Ordering::Relaxed));
 
-        // Check meta: top bit set → Unrooted → no drop action needed.
-        if addr >> (usize::BITS - 1) != 0 {
+        // Unrooted → no drop action needed.
+        if ptr.meta() != PtrMeta::Rooted {
             return;
         }
 
-        // Strip meta bits (top 2) and minimum tag bits (bottom 3, guaranteed by
-        // ManObj alignment >= 8 due to AtomicObjMeta being 8-byte aligned) to get
-        // the actual ManObj address.
-        const META_BITS: usize = 0b11 << (usize::BITS - 2);
-        const MIN_LOW_BITS: usize = 0b111; // align_of::<AtomicObjMeta>() - 1
-        let mobj_addr = addr & !META_BITS & !MIN_LOW_BITS;
-        if mobj_addr == 0 {
-            return; // Null pointer
+        if ptr.is_null() {
+            return;
         }
 
         // If it is rooted, we need to pin the thread before decrementing,
         // to safely execute deletion barrier if necessary.
         let guard = pin();
 
-        // Safety: `mobj_addr` points to a valid `ManObj<T>` which is `#[repr(C)]`
-        // with `header: AtomicObjMeta` at offset 0.
-        let header = unsafe { &*(mobj_addr as *const AtomicObjMeta) };
+        // Safety: `ptr` is non-null and rooted. `ManObj` is `#[repr(C)]`
+        // with `header: AtomicObjMeta` at offset 0, so `as_ptr()` gives us
+        // a valid header pointer.
+        let header = unsafe { &*(ptr.as_ptr() as *const AtomicObjMeta) };
         if header.decrement_root_count(Ordering::Relaxed) == 1 && guard.global_phase() != Phase::N {
             // Look up the shade function via the type_id packed in the header.
             let meta = header.load(Ordering::Relaxed);
             let shade_fn = get_shade_fn(meta.type_id());
-            unsafe { shade_fn(mobj_addr as *mut (), &guard) };
+            unsafe { shade_fn(ptr.as_ptr() as *mut (), &guard) };
         }
     }
 }
@@ -1309,19 +1322,19 @@ impl<T: TraceObj> TracePtr for AtomicSharedOption<T> {
 
 // TODO: Add a complete set of conversion functions (both `From` traits and type's methods).
 
-impl<T: TraceObj> From<AtomicShared<T>> for AtomicSharedOption<T> {
+impl<T> From<AtomicShared<T>> for AtomicSharedOption<T> {
     fn from(value: AtomicShared<T>) -> Self {
         value.inner
     }
 }
 
-impl<T: TraceObj> From<Shared<T>> for AtomicSharedOption<T> {
+impl<T> From<Shared<T>> for AtomicSharedOption<T> {
     fn from(value: Shared<T>) -> Self {
         value.inner.inner
     }
 }
 
-impl<T: TraceObj> From<Option<Shared<T>>> for AtomicSharedOption<T> {
+impl<T> From<Option<Shared<T>>> for AtomicSharedOption<T> {
     fn from(value: Option<Shared<T>>) -> Self {
         if let Some(shared) = value {
             Self::from(shared)
@@ -1355,7 +1368,6 @@ impl<T: TraceObj> From<Option<&Shared<T>>> for AtomicSharedOption<T> {
 impl<'g, G, T> From<Local<'g, G, T>> for AtomicSharedOption<T>
 where
     G: Protector,
-    T: TraceObj,
 {
     fn from(value: Local<'g, G, T>) -> Self {
         Self::from(value.as_atomic_shared())
@@ -1365,7 +1377,6 @@ where
 impl<'g, G, T> From<Option<Local<'g, G, T>>> for AtomicSharedOption<T>
 where
     G: Protector,
-    T: TraceObj,
 {
     fn from(value: Option<Local<'g, G, T>>) -> Self {
         if let Some(local) = value {
@@ -1379,7 +1390,6 @@ where
 impl<'g, G, T> From<Option<&Local<'g, G, T>>> for AtomicSharedOption<T>
 where
     G: Protector,
-    T: TraceObj,
 {
     fn from(value: Option<&Local<'g, G, T>>) -> Self {
         if let Some(local) = value {
@@ -1406,12 +1416,21 @@ where
 ///     head: AtomicShared<Node>,  // always points to a sentinel node
 /// }
 /// ```
-pub struct AtomicShared<T: TraceObj> {
+pub struct AtomicShared<T> {
     inner: AtomicSharedOption<T>,
 }
 
-unsafe impl<T: TraceObj> Sync for AtomicShared<T> {}
-unsafe impl<T: TraceObj> Send for AtomicShared<T> {}
+unsafe impl<T: Sync + Send> Sync for AtomicShared<T> {}
+unsafe impl<T: Sync + Send> Send for AtomicShared<T> {}
+
+impl<T> AtomicShared<T> {
+    #[inline(always)]
+    pub(crate) const fn from_raw(ptr: ManPtr<T>) -> Self {
+        Self {
+            inner: AtomicSharedOption::from_raw(ptr),
+        }
+    }
+}
 
 impl<T: TraceObj> AtomicShared<T> {
     /// Allocates a managed object and returns a non-nullable atomic pointer.
@@ -1429,13 +1448,6 @@ impl<T: TraceObj> AtomicShared<T> {
             Self {
                 inner: AtomicSharedOption::some_with_tag(item, tag, guard),
             }
-        }
-    }
-
-    #[inline(always)]
-    pub(crate) const fn from_raw(ptr: ManPtr<T>) -> Self {
-        Self {
-            inner: AtomicSharedOption::from_raw(ptr),
         }
     }
 
@@ -1664,7 +1676,7 @@ impl<T: TraceObj> TracePtr for AtomicShared<T> {
     }
 }
 
-impl<T: TraceObj> From<Shared<T>> for AtomicShared<T> {
+impl<T> From<Shared<T>> for AtomicShared<T> {
     fn from(value: Shared<T>) -> Self {
         value.inner
     }
@@ -1673,7 +1685,6 @@ impl<T: TraceObj> From<Shared<T>> for AtomicShared<T> {
 impl<'g, G, T> From<Local<'g, G, T>> for AtomicShared<T>
 where
     G: Protector,
-    T: TraceObj,
 {
     fn from(value: Local<'g, G, T>) -> Self {
         value.as_atomic_shared()
@@ -1705,7 +1716,7 @@ where
 ///     right: Option<Shared<Node>>,
 /// }
 /// ```
-pub struct Shared<T: TraceObj> {
+pub struct Shared<T> {
     // Note: We just use `AtomicShared` to implement `Shared`, even though `Shared` is immutable
     // from the user's perspective. The reason is that `Shared` is also a target of
     // tracing and marking by collectors, so we must still use atomically mutable link.
@@ -1727,8 +1738,32 @@ assert_eq_size!(Shared<()>, usize);
 // The main reason is that, although the address itself is immutable, the collector may atomically
 // mutate the metadata bits during tracing, e.g., flipping `None` to `Some(garbage value)`.
 
-unsafe impl<T: TraceObj> Sync for Shared<T> {}
-unsafe impl<T: TraceObj> Send for Shared<T> {}
+unsafe impl<T: Sync + Send> Sync for Shared<T> {}
+unsafe impl<T: Sync + Send> Send for Shared<T> {}
+
+impl<T> Shared<T> {
+    #[inline(always)]
+    pub(crate) fn as_man_ptr(&self) -> ManPtr<T> {
+        ManPtr::from(self.inner.inner.link.load(Ordering::Relaxed))
+    }
+
+    /// Returns `true` if the two `Shared`s point to the same allocation.
+    #[inline(always)]
+    pub fn ptr_eq(this: &Self, other: &Self) -> bool {
+        this.as_man_ptr().without_meta() == other.as_man_ptr().without_meta()
+    }
+
+    /// Returns `true` if both options point to the same allocation (or are
+    /// both `None`).
+    #[inline(always)]
+    pub fn opt_ptr_eq(this: Option<&Self>, other: Option<&Self>) -> bool {
+        match (this, other) {
+            (None, None) => true,
+            (Some(l1), Some(l2)) => Self::ptr_eq(l1, l2),
+            _ => false,
+        }
+    }
+}
 
 impl<T: TraceObj> Shared<T> {
     /// Allocates a new managed object and returns an immutable root reference.
@@ -1751,11 +1786,6 @@ impl<T: TraceObj> Shared<T> {
         })
     }
 
-    #[inline(always)]
-    pub(crate) fn as_man_ptr(&self) -> ManPtr<T> {
-        ManPtr::from(self.inner.inner.link.load(Ordering::Relaxed))
-    }
-
     /// Creates a guard-scoped [`Local`] view of this `Shared`.
     ///
     /// Useful for passing to methods that expect a `Local`, such as
@@ -1766,26 +1796,9 @@ impl<T: TraceObj> Shared<T> {
         // a valid memory location by design.
         unsafe { Local::from_raw(self.as_man_ptr(), guard) }
     }
-
-    /// Returns `true` if the two `Shared`s point to the same allocation.
-    #[inline(always)]
-    pub fn ptr_eq(this: &Self, other: &Self) -> bool {
-        this.as_man_ptr().without_meta() == other.as_man_ptr().without_meta()
-    }
-
-    /// Returns `true` if both options point to the same allocation (or are
-    /// both `None`).
-    #[inline(always)]
-    pub fn opt_ptr_eq(this: Option<&Self>, other: Option<&Self>) -> bool {
-        match (this, other) {
-            (None, None) => true,
-            (Some(l1), Some(l2)) => Self::ptr_eq(l1, l2),
-            _ => false,
-        }
-    }
 }
 
-impl<T: TraceObj> Clone for Shared<T> {
+impl<T> Clone for Shared<T> {
     fn clone(&self) -> Self {
         // Note: If we have a valid reference to `Shared<T>`, then incrementing the root count
         // will not have to be protected by a phase-critical section (i.e., `Guard`).
@@ -1806,7 +1819,7 @@ impl<T: TraceObj> Clone for Shared<T> {
     }
 }
 
-impl<T: TraceObj> Deref for Shared<T> {
+impl<T> Deref for Shared<T> {
     type Target = T;
 
     fn deref(&self) -> &Self::Target {
@@ -1819,39 +1832,39 @@ impl<T: TraceObj> Deref for Shared<T> {
     }
 }
 
-impl<T: TraceObj> AsRef<T> for Shared<T> {
+impl<T> AsRef<T> for Shared<T> {
     fn as_ref(&self) -> &T {
         self.deref()
     }
 }
 
-impl<T: TraceObj> Borrow<T> for Shared<T> {
+impl<T> Borrow<T> for Shared<T> {
     fn borrow(&self) -> &T {
         self.deref()
     }
 }
 
-impl<T: TraceObj + PartialEq> PartialEq for Shared<T> {
+impl<T: PartialEq> PartialEq for Shared<T> {
     fn eq(&self, other: &Self) -> bool {
         self.deref() == other.deref()
     }
 }
 
-impl<T: TraceObj + Eq> Eq for Shared<T> {}
+impl<T: Eq> Eq for Shared<T> {}
 
-impl<T: TraceObj + PartialOrd> PartialOrd for Shared<T> {
+impl<T: PartialOrd> PartialOrd for Shared<T> {
     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
         self.deref().partial_cmp(other.deref())
     }
 }
 
-impl<T: TraceObj + Ord> Ord for Shared<T> {
+impl<T: Ord> Ord for Shared<T> {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
         self.deref().cmp(other.deref())
     }
 }
 
-impl<T: TraceObj + Hash> Hash for Shared<T> {
+impl<T: Hash> Hash for Shared<T> {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
         self.deref().hash(state);
     }
@@ -1923,7 +1936,7 @@ impl Protector for Guard {
 /// drop(guard);
 /// println!("{}", hp_ref.value);  // still valid via hazard pointer
 /// ```
-pub struct Local<'g, G: Protector, T: TraceObj> {
+pub struct Local<'g, G: Protector, T> {
     ptr: NonNull<ManObj<T>>,
     sh: G::Shield,
     _marker: PhantomData<(&'g (), ManPtr<T>)>,
@@ -1934,7 +1947,7 @@ pub struct Local<'g, G: Protector, T: TraceObj> {
 assert_eq_size!(Local<'static, Guard, ()>, usize);
 assert_eq_size!(Option<Local<'static, Guard, ()>>, usize);
 
-unsafe impl<'g, G: Protector, T: TraceObj> Sync for Local<'g, G, T> {}
+unsafe impl<'g, G: Protector, T: Sync + Send> Sync for Local<'g, G, T> {}
 
 impl<'g, T: TraceObj> Local<'g, Guard, T> {
     /// Allocates a new managed object and returns a guard-scoped local
@@ -1961,34 +1974,7 @@ impl<'g, T: TraceObj> Local<'g, Guard, T> {
     }
 }
 
-impl<'g, G: Protector, T: TraceObj> Local<'g, G, T> {
-    /// # Safety
-    ///
-    /// `ptr` must point to a valid memory location.
-    #[inline(always)]
-    pub(crate) unsafe fn from_raw(ptr: ManPtr<T>, prot: &G) -> Self {
-        debug_assert!(!ptr.is_null());
-        Self {
-            ptr: unsafe { NonNull::new_unchecked(ptr.as_ptr()) },
-            sh: prot.protect(ptr),
-            _marker: PhantomData,
-        }
-    }
-
-    /// Re-protects this reference under a different protector.
-    ///
-    /// Commonly used to convert a `Local<Guard, T>` into a `Local<Handle, T>`,
-    /// upgrading from guard-scoped to hazard-pointer protection so the
-    /// reference survives after the guard is dropped.
-    #[inline(always)]
-    pub fn protect<'h, H: Protector>(&self, prot: &'h H) -> Local<'h, H, T> {
-        Local {
-            ptr: self.ptr,
-            sh: prot.protect(self.as_man_ptr()),
-            _marker: PhantomData,
-        }
-    }
-
+impl<'g, G: Protector, T> Local<'g, G, T> {
     #[inline(always)]
     pub(crate) fn as_man_ptr(&self) -> ManPtr<T> {
         debug_assert!(ManPtr::<T>::from(self.ptr) == ManPtr::<T>::from(self.ptr).without_meta());
@@ -2044,7 +2030,36 @@ impl<'g, G: Protector, T: TraceObj> Local<'g, G, T> {
     }
 }
 
-impl<'g, G: Protector, T: TraceObj> Deref for Local<'g, G, T> {
+impl<'g, G: Protector, T: TraceObj> Local<'g, G, T> {
+    /// # Safety
+    ///
+    /// `ptr` must point to a valid memory location.
+    #[inline(always)]
+    pub(crate) unsafe fn from_raw(ptr: ManPtr<T>, prot: &G) -> Self {
+        debug_assert!(!ptr.is_null());
+        Self {
+            ptr: unsafe { NonNull::new_unchecked(ptr.as_ptr()) },
+            sh: prot.protect(ptr),
+            _marker: PhantomData,
+        }
+    }
+
+    /// Re-protects this reference under a different protector.
+    ///
+    /// Commonly used to convert a `Local<Guard, T>` into a `Local<Handle, T>`,
+    /// upgrading from guard-scoped to hazard-pointer protection so the
+    /// reference survives after the guard is dropped.
+    #[inline(always)]
+    pub fn protect<'h, H: Protector>(&self, prot: &'h H) -> Local<'h, H, T> {
+        Local {
+            ptr: self.ptr,
+            sh: prot.protect(self.as_man_ptr()),
+            _marker: PhantomData,
+        }
+    }
+}
+
+impl<'g, G: Protector, T> Deref for Local<'g, G, T> {
     type Target = T;
 
     fn deref(&self) -> &Self::Target {
@@ -2057,13 +2072,13 @@ impl<'g, G: Protector, T: TraceObj> Deref for Local<'g, G, T> {
     }
 }
 
-impl<'g, G: Protector, T: TraceObj> AsRef<T> for Local<'g, G, T> {
+impl<'g, G: Protector, T> AsRef<T> for Local<'g, G, T> {
     fn as_ref(&self) -> &T {
         self.deref()
     }
 }
 
-impl<'g, G: Protector, T: TraceObj> Borrow<T> for Local<'g, G, T> {
+impl<'g, G: Protector, T> Borrow<T> for Local<'g, G, T> {
     fn borrow(&self) -> &T {
         self.deref()
     }
@@ -2072,7 +2087,7 @@ impl<'g, G: Protector, T: TraceObj> Borrow<T> for Local<'g, G, T> {
 impl<'g, G, T> PartialEq for Local<'g, G, T>
 where
     G: Protector,
-    T: TraceObj + PartialEq,
+    T: PartialEq,
 {
     fn eq(&self, other: &Self) -> bool {
         **self == **other
@@ -2082,14 +2097,14 @@ where
 impl<'g, G, T> Eq for Local<'g, G, T>
 where
     G: Protector,
-    T: TraceObj + Eq,
+    T: Eq,
 {
 }
 
 impl<'g, G, T> std::fmt::Debug for Local<'g, G, T>
 where
     G: Protector,
-    T: TraceObj + std::fmt::Debug,
+    T: std::fmt::Debug,
 {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         std::fmt::Debug::fmt(&**self, f)
@@ -2099,7 +2114,7 @@ where
 impl<'g, G, T> PartialOrd for Local<'g, G, T>
 where
     G: Protector,
-    T: TraceObj + PartialOrd,
+    T: PartialOrd,
 {
     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
         (**self).partial_cmp(&**other)
@@ -2109,14 +2124,14 @@ where
 impl<'g, G, T> Ord for Local<'g, G, T>
 where
     G: Protector,
-    T: TraceObj + Ord,
+    T: Ord,
 {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
         (**self).cmp(&**other)
     }
 }
 
-impl<'g, G: Protector, T: TraceObj> Clone for Local<'g, G, T>
+impl<'g, G: Protector, T> Clone for Local<'g, G, T>
 where
     G::Shield: Clone,
 {
@@ -2132,7 +2147,7 @@ where
 
 // `Local<'g, Guard, T>`, which is protected by a coarse-grained phase-critical section,
 // can be cloned (copied) without additional costs because `Guard::Shield` is just `()`.
-impl<'g, G: Protector, T: TraceObj> Copy for Local<'g, G, T> where G::Shield: Copy {}
+impl<'g, G: Protector, T> Copy for Local<'g, G, T> where G::Shield: Copy {}
 
 #[cfg(test)]
 mod tests {
