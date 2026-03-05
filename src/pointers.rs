@@ -44,11 +44,30 @@ use std::{
 // it, forcing `TraceObj` (and its supertraits) onto hundreds of struct blocks
 // throughout downstream crates — a cascading, tedious, and destructive change.
 //
-// The trade-off is a small runtime lookup table (256 entries, 2 KB) that maps
-// a compact 8-bit type id, packed into each object's header, to the
-// type-erased shade function for that type.  This is consulted only during
-// `Drop` of a rooted `AtomicSharedOption` whose root count drops to zero
-// while the collector is active — a rare path that is already cold.
+// The trade-off is a small runtime lookup table that maps a compact type id,
+// packed into each object's header, to the type-erased shade function for
+// that type.  This is consulted only during `Drop` of a rooted
+// `AtomicSharedOption` whose root count drops to zero while the collector is
+// active — a rare path that is already cold.
+//
+// The default capacity is 2^TYPE_ID_BITS = 256 distinct managed types.  This
+// is generous for the intended use case: this GC manages only *concurrently
+// shared* objects, not every allocation in an application.  Most programs have
+// a small, fixed set of such types (hash-table nodes, queue entries, tree
+// nodes, wrapper structs around them, etc.).  If 256 is ever insufficient,
+// increase `TYPE_ID_BITS` — the root-count field shrinks accordingly, but a
+// compile-time assertion ensures it never drops below 32 bits.
+
+/// Number of bits reserved for the type id in the object header.
+/// Determines the maximum number of distinct managed types (2^TYPE_ID_BITS).
+/// Increasing this value shrinks the root-count field by the same number of bits.
+pub(crate) const TYPE_ID_BITS: u32 = 8;
+
+/// Maximum number of distinct managed types: 2^TYPE_ID_BITS.
+const MAX_TYPE_ID: usize = 1 << TYPE_ID_BITS;
+
+// Ensure the root-count field (63 - 1 color bit - TYPE_ID_BITS) has at least 32 bits.
+const_assert!(63 - TYPE_ID_BITS >= 32);
 
 /// Type-erased shade function: given a ManObj pointer, shade its outgoing edges.
 type ShadePointeeFn = unsafe fn(mobj_ptr: *mut (), guard: &Guard);
@@ -60,8 +79,9 @@ struct TypeRegistry {
 
 static TYPE_REGISTRY: OnceLock<Mutex<TypeRegistry>> = OnceLock::new();
 
-/// Fast lookup table for shade functions (256 entries = 2 KB, lock-free reads).
-static SHADE_FN_TABLE: [AtomicPtr<()>; 256] = [const { AtomicPtr::new(std::ptr::null_mut()) }; 256];
+/// Fast lookup table for shade functions (lock-free reads).
+static SHADE_FN_TABLE: [AtomicPtr<()>; MAX_TYPE_ID] =
+    [const { AtomicPtr::new(std::ptr::null_mut()) }; MAX_TYPE_ID];
 
 fn register_type<T: TraceObj>() -> u8 {
     let tid = TypeId::of::<T>();
@@ -89,8 +109,9 @@ fn register_type<T: TraceObj>() -> u8 {
 
     let id = reg.fns.len();
     assert!(
-        id < 256,
-        "type registry overflow: more than 256 distinct managed types"
+        id < MAX_TYPE_ID,
+        "type registry overflow: more than 2^TYPE_ID_BITS distinct managed types \
+        (consider increasing TYPE_ID_BITS)"
     );
     let id = id as u8;
     let f: ShadePointeeFn = shade_erased::<T>;
@@ -147,14 +168,18 @@ impl From<usize> for ObjMeta {
 
 impl ObjMeta {
     // Bit layout (64-bit):
+    //   Bit 63:              color (1 bit)
+    //   Bits RC..RC+TID-1:   type_id (TYPE_ID_BITS bits)
+    //   Bits 0..RC-1:        root_count (remaining bits)
+    // ... which is by default (64-bit):
     //   Bit 63:     color
     //   Bits 48-55: type_id (8 bits, 256 types)
     //   Bits 0-47:  root_count (48 bits)
     const COLOR_SHIFT: u32 = 63;
-    const TYPE_ID_SHIFT: u32 = 48;
-    const TYPE_ID_MASK: usize = 0xFF << Self::TYPE_ID_SHIFT;
-    const ROOT_COUNT_MASK: usize = (1usize << 48) - 1;
-    const ROOT_COUNT_BITS: usize = Self::ROOT_COUNT_MASK;
+    const TYPE_ID_SHIFT: u32 = Self::COLOR_SHIFT - TYPE_ID_BITS;
+    const TYPE_ID_MASK: usize = ((1usize << TYPE_ID_BITS) - 1) << Self::TYPE_ID_SHIFT;
+    const ROOT_COUNT_BITS: u32 = Self::TYPE_ID_SHIFT;
+    const ROOT_COUNT_MASK: usize = (1usize << Self::ROOT_COUNT_BITS) - 1;
 
     #[cfg(test)]
     #[inline(always)]
@@ -219,7 +244,7 @@ impl AtomicObjMeta {
     #[inline(always)]
     pub fn increment_root_count(&self, order: Ordering) -> usize {
         let prev = ObjMeta::from(self.0.fetch_add(1, order)).root_count();
-        debug_assert!(prev < ObjMeta::ROOT_COUNT_BITS);
+        debug_assert!(prev < ObjMeta::ROOT_COUNT_MASK);
         prev
     }
 
