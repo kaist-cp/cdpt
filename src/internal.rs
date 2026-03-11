@@ -74,6 +74,9 @@ pub struct Global {
     /// MSB clear = fixed mode, lower bits = bytes.
     /// MSB set   = proportional mode, lower bits = divisor.
     pub(crate) headroom: AtomicUsize,
+
+    #[cfg(feature = "profiling")]
+    pub(crate) rc_updates: AtomicUsize,
 }
 
 /// Controls the minimum heap headroom that must be exceeded before the
@@ -190,6 +193,8 @@ impl Global {
             collection_enabled: CachePadded::new(AtomicBool::new(true)),
             collection_requested: CachePadded::new(AtomicBool::new(false)),
             headroom: AtomicUsize::new(HeapHeadroom::FixedMiB(1).pack()),
+            #[cfg(feature = "profiling")]
+            rc_updates: AtomicUsize::new(0),
         }
     }
 
@@ -265,6 +270,16 @@ impl Global {
         self.collection_requested.store(true, Ordering::SeqCst);
     }
 
+    #[cfg(feature = "profiling")]
+    pub fn rc_updates(&self) -> usize {
+        self.rc_updates.load(Ordering::Relaxed)
+    }
+
+    #[cfg(feature = "profiling")]
+    pub fn reset_rc_updates(&self) {
+        self.rc_updates.store(0, Ordering::Relaxed);
+    }
+
     /// Returns the total bytes allocated on the managed heap since program
     /// start. See [struct-level docs](Global#heap-size-estimation) for
     /// accuracy caveats.
@@ -306,6 +321,9 @@ impl Global {
 pub(crate) struct Local {
     /// The number of guards keeping this participant pinned.
     guard_count: Cell<usize>,
+
+    #[cfg(feature = "profiling")]
+    unpin_count: Cell<usize>,
 
     /// The epoch that this local thread observed most recently.
     last_observed: Cell<Epoch>,
@@ -389,6 +407,8 @@ impl Default for Local {
 
         Self {
             guard_count: Cell::new(0),
+            #[cfg(feature = "profiling")]
+            unpin_count: Cell::new(0),
             last_observed: Cell::new(Epoch::starting()),
             alloc_count: Cell::new(0),
             sched_count: Cell::new(0),
@@ -468,6 +488,18 @@ impl Local {
         if guard_count == 1 {
             // This is the last guard. This thread will be unpinned.
             self.epoch.store(Epoch::starting(), Ordering::Release);
+
+            #[cfg(feature = "profiling")]
+            {
+                self.unpin_count.set(self.unpin_count.get() + 1);
+                if self.unpin_count.get() % 128 == 0 {
+                    let count = crate::pointers::RC_UPDATE_COUNTER.get();
+                    if count > 0 {
+                        global().rc_updates.fetch_add(count, Ordering::Relaxed);
+                        crate::pointers::RC_UPDATE_COUNTER.set(0);
+                    }
+                }
+            }
         }
     }
 

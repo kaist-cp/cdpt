@@ -29,6 +29,11 @@ use std::{
     sync::atomic::{AtomicPtr, AtomicU32, AtomicUsize, Ordering},
 };
 
+#[cfg(feature = "profiling")]
+thread_local! {
+    pub static RC_UPDATE_COUNTER: std::cell::Cell<usize> = std::cell::Cell::new(0);
+}
+
 // ── Type registry for type-erased shade functions ───────────────────────────
 //
 // The type registry exists so that managed pointer types (`AtomicSharedOption`,
@@ -276,6 +281,8 @@ impl AtomicObjMeta {
 
     #[inline(always)]
     pub fn increment_root_count(&self, order: Ordering) -> usize {
+        #[cfg(feature = "profiling")]
+        RC_UPDATE_COUNTER.set(RC_UPDATE_COUNTER.get() + 1);
         let prev = ObjMeta::from(self.0.fetch_add(1, order)).root_count();
         debug_assert!(prev < ObjMeta::ROOT_COUNT_MASK);
         prev
@@ -283,6 +290,8 @@ impl AtomicObjMeta {
 
     #[inline(always)]
     pub fn decrement_root_count(&self, order: Ordering) -> usize {
+        #[cfg(feature = "profiling")]
+        RC_UPDATE_COUNTER.set(RC_UPDATE_COUNTER.get() + 1);
         let prev = ObjMeta::from(self.0.fetch_sub(1, order)).root_count();
         debug_assert!(prev > 0);
         prev

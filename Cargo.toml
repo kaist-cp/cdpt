@@ -27,6 +27,7 @@ bitflags = "2.5"
 [features]
 logging = []
 tag = []
+profiling = []
 
 [[example]]
 name = "lists"
