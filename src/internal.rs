@@ -21,7 +21,7 @@ use std::rc::Rc;
 use std::sync::atomic::{self, AtomicBool, AtomicPtr, AtomicUsize, Ordering, fence};
 use std::thread::spawn;
 
-const OBJ_BATCHES_SHARD: usize = 8;
+pub(crate) const OBJ_BATCHES_SHARD: usize = 8;
 pub(crate) const OBJ_BATCH_SIZE: usize = 64;
 const HAZARDS_INIT_COUNT: usize = 8;
 const ALLOC_HELPING_PERIOD: usize = 64;
@@ -74,6 +74,9 @@ pub struct Global {
     /// MSB clear = fixed mode, lower bits = bytes.
     /// MSB set   = proportional mode, lower bits = divisor.
     pub(crate) headroom: AtomicUsize,
+
+    /// Number of threads used for parallel sweep (1..=OBJ_BATCHES_SHARD).
+    pub(crate) sweep_threads: AtomicUsize,
 
     #[cfg(feature = "profiling")]
     pub(crate) rc_updates: AtomicUsize,
@@ -193,6 +196,7 @@ impl Global {
             collection_enabled: CachePadded::new(AtomicBool::new(true)),
             collection_requested: CachePadded::new(AtomicBool::new(false)),
             headroom: AtomicUsize::new(HeapHeadroom::FixedMiB(1).pack()),
+            sweep_threads: AtomicUsize::new(OBJ_BATCHES_SHARD),
             #[cfg(feature = "profiling")]
             rc_updates: AtomicUsize::new(0),
         }
@@ -295,7 +299,7 @@ impl Global {
     }
 
     /// Returns the estimated current managed-heap size in bytes
-    /// (allocated − reclaimed, saturating at zero).
+    /// (allocated - reclaimed, saturating at zero).
     pub fn estimate_heap_usage(&self) -> usize {
         let allocated = self.estimate_total_alloc();
         let reclaimed = self.estimate_total_reclm();
@@ -314,6 +318,23 @@ impl Global {
     /// Returns the current heap-headroom strategy.
     pub fn heap_headroom(&self) -> HeapHeadroom {
         HeapHeadroom::unpack(self.headroom.load(Ordering::Relaxed))
+    }
+
+    /// Sets the number of threads used for the parallel sweep phase.
+    ///
+    /// The value is clamped to `1..=8` (the number of internal shards).
+    /// Higher values speed up reclamation but consume more CPU during
+    /// collection. Setting this to `1` disables parallel sweep entirely.
+    ///
+    /// Default: `8`.
+    pub fn set_sweep_threads(&self, count: usize) {
+        let clamped = count.clamp(1, OBJ_BATCHES_SHARD);
+        self.sweep_threads.store(clamped, Ordering::Relaxed);
+    }
+
+    /// Returns the current number of sweep threads.
+    pub fn sweep_threads(&self) -> usize {
+        self.sweep_threads.load(Ordering::Relaxed)
     }
 }
 
