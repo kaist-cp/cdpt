@@ -201,7 +201,7 @@ impl Global {
     /// Freshly loads the global epoch value. It does not execute any fences.
     #[inline]
     pub(crate) fn load_epoch(&self) -> Epoch {
-        self.epoch.load(Ordering::Relaxed)
+        self.epoch.load(Ordering::Acquire)
     }
 
     #[inline]
@@ -458,7 +458,7 @@ impl Local {
         let mut curr_epoch = global().load_epoch();
         loop {
             // Now we must store `new_epoch` into `self.epoch` and execute a light fence.
-            self.epoch.store(curr_epoch.pinned(), Ordering::Relaxed);
+            self.epoch.store(curr_epoch.pinned(), Ordering::Release);
             fence(Ordering::SeqCst);
 
             let new_epoch = global().load_epoch();

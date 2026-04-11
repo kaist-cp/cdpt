@@ -425,7 +425,7 @@ fn wait_all_mutators_unpin(new_ts: usize) {
         let backoff = Backoff::new();
         let mut local_epoch;
         loop {
-            local_epoch = local.epoch.load(Ordering::Relaxed);
+            local_epoch = local.epoch.load(Ordering::Acquire);
             if !local_epoch.is_pinned() || new_ts <= local_epoch.timestamp() {
                 break;
             }

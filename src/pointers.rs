@@ -1152,7 +1152,7 @@ impl<T: TraceObj> AtomicSharedOption<T> {
                     return Ok(old);
                 };
                 if old_ref.header.decrement_root_count(Ordering::Relaxed) == 1
-                    && guard.global_phase() != Phase::N
+                    && guard.global_phase_with_fence() != Phase::N
                 {
                     // Root-count deletion barrier.
                     old.shade_pointee(guard);
@@ -1196,7 +1196,7 @@ impl<T: TraceObj> AtomicSharedOption<T> {
                 Ok(_) => {
                     if old.as_ptr() != new.as_ptr()
                         && old_color == guard.white_color()
-                        && guard.global_phase() != Phase::N
+                        && guard.global_phase_with_fence() != Phase::N
                     {
                         // Yuasa-style deletion barrier.
                         old.shade_pointee(guard);
@@ -1242,7 +1242,7 @@ impl<T: TraceObj> AtomicSharedOption<T> {
         if let Ok(_) = &result {
             if old.as_ptr() != new.as_ptr()
                 && old_color == guard.white_color()
-                && guard.global_phase() != Phase::N
+                && guard.global_phase_with_fence() != Phase::N
             {
                 old.shade_pointee(guard);
             }
@@ -1332,7 +1332,9 @@ impl<T> Drop for AtomicSharedOption<T> {
         // with `header: AtomicObjMeta` at offset 0, so `as_ptr()` gives us
         // a valid header pointer.
         let header = unsafe { &*(ptr.as_ptr() as *const AtomicObjMeta) };
-        if header.decrement_root_count(Ordering::Relaxed) == 1 && guard.global_phase() != Phase::N {
+        if header.decrement_root_count(Ordering::Relaxed) == 1
+            && guard.global_phase_with_fence() != Phase::N
+        {
             // Look up the shade function via the type_id packed in the header.
             let meta = header.load(Ordering::Relaxed);
             let shade_fn = get_shade_fn(meta.type_id());
@@ -1354,7 +1356,7 @@ impl<T: TraceObj> TracePtr for AtomicSharedOption<T> {
             // If its link has the allocation color (i.e., black) without marking the child,
             // it is possible that the collector misses the child object.
             let count = obj.header.decrement_root_count(Ordering::Relaxed);
-            if count == 1 && guard.global_phase() != Phase::N {
+            if count == 1 && guard.global_phase_with_fence() != Phase::N {
                 ptr.shade_pointee(guard);
             }
         }

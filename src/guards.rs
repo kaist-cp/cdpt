@@ -159,7 +159,7 @@ impl Guard {
         unsafe { self.local().pinned_alloc_color() }
     }
 
-    pub(crate) fn global_phase(&self) -> Phase {
+    pub(crate) fn global_phase_with_fence(&self) -> Phase {
         fence(Ordering::SeqCst);
         global().load_epoch().phase()
     }
