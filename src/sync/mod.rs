@@ -1,3 +1,4 @@
+pub mod hash_set;
 mod queue;
 mod reusable_slots;
 

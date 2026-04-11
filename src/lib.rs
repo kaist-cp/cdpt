@@ -52,7 +52,6 @@
 //! safely use the promoted references.
 
 #![feature(cold_path)]
-#![feature(likely_unlikely)]
 #![feature(vec_push_within_capacity)]
 
 #[macro_use]
@@ -63,7 +62,7 @@ mod epoch;
 mod guards;
 mod internal;
 mod pointers;
-mod sync;
+pub mod sync;
 mod task;
 mod tls;
 

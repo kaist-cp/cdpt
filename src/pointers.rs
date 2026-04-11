@@ -10,6 +10,7 @@
 //!
 //! See the [crate-level docs](crate) for a quick-start guide and comparison table.
 
+use crate::sync::hash_set::FixedHashSet;
 use crate::{
     epoch::{Color, Phase},
     guards::{Guard, Handle},
@@ -19,17 +20,13 @@ use crate::{
 use std::{
     any::TypeId,
     borrow::Borrow,
-    collections::HashMap,
-    hash::Hash,
-    hint::{cold_path, unlikely},
+    hash::{Hash, Hasher},
+    hint::cold_path,
     marker::PhantomData,
     mem::forget,
     ops::Deref,
     ptr::{NonNull, null_mut},
-    sync::{
-        Mutex, OnceLock,
-        atomic::{AtomicPtr, AtomicUsize, Ordering},
-    },
+    sync::atomic::{AtomicPtr, AtomicU32, AtomicUsize, Ordering},
 };
 
 // ── Type registry for type-erased shade functions ───────────────────────────
@@ -72,54 +69,90 @@ const_assert!(63 - TYPE_ID_BITS >= 32);
 /// Type-erased shade function: given a ManObj pointer, shade its outgoing edges.
 type ShadePointeeFn = unsafe fn(mobj_ptr: *mut (), guard: &Guard);
 
-struct TypeRegistry {
-    by_type: HashMap<TypeId, u8>,
-    fns: Vec<ShadePointeeFn>,
+/// Entry stored in the type registry's hash set.
+///
+/// `Hash` and `Eq` are derived from `type_id` only, so the set deduplicates by
+/// type.  The `id` field is assigned after insertion via FAA on `NEXT_TYPE_ID`.
+struct TypeReg {
+    type_id: TypeId,
+    id: AtomicU32, // `ID_UNSET` until the inserting thread assigns it.
 }
 
-static TYPE_REGISTRY: OnceLock<Mutex<TypeRegistry>> = OnceLock::new();
+impl Hash for TypeReg {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.type_id.hash(state);
+    }
+}
+
+impl PartialEq for TypeReg {
+    fn eq(&self, other: &Self) -> bool {
+        self.type_id == other.type_id
+    }
+}
+
+impl Eq for TypeReg {}
+
+const ID_UNSET: u32 = u32::MAX;
+
+/// Lock-free set of registered types.
+static TYPE_SET: FixedHashSet<TypeReg, MAX_TYPE_ID> = FixedHashSet::new();
+
+/// Monotonic counter for assigning type ids.
+static NEXT_TYPE_ID: AtomicUsize = AtomicUsize::new(0);
 
 /// Fast lookup table for shade functions (lock-free reads).
 static SHADE_FN_TABLE: [AtomicPtr<()>; MAX_TYPE_ID] =
     [const { AtomicPtr::new(std::ptr::null_mut()) }; MAX_TYPE_ID];
 
 fn register_type<T: TraceObj>() -> u8 {
-    let tid = TypeId::of::<T>();
+    let reg = TypeReg {
+        type_id: TypeId::of::<T>(),
+        id: AtomicU32::new(ID_UNSET),
+    };
 
-    let registry = TYPE_REGISTRY.get_or_init(|| {
-        Mutex::new(TypeRegistry {
-            by_type: HashMap::new(),
-            fns: Vec::new(),
-        })
-    });
-    let mut reg = registry.lock().unwrap();
+    let (entry, inserted) = TYPE_SET.get_or_insert(reg);
 
-    if let Some(&id) = reg.by_type.get(&tid) {
-        return id;
-    }
+    if inserted {
+        // Cold: first time this type is used — assign an id via FAA.
+        cold_path();
+        let new_id = NEXT_TYPE_ID.fetch_add(1, Ordering::Relaxed);
+        assert!(
+            new_id < MAX_TYPE_ID,
+            "type registry overflow: more than 2^TYPE_ID_BITS distinct managed types \
+            (consider increasing TYPE_ID_BITS)"
+        );
 
-    /// Type-erased shade function.
-    unsafe fn shade_erased<U: TraceObj>(mobj_ptr: *mut (), guard: &Guard) {
-        let mobj = unsafe { &*(mobj_ptr as *const ManObj<U>) };
-        if mobj.is_marked(guard) {
-            return;
+        let f: ShadePointeeFn = shade_erased::<T>;
+        SHADE_FN_TABLE[new_id].store(f as *mut (), Ordering::Release);
+        entry.id.store(new_id as u32, Ordering::Release);
+
+        new_id as u8
+    } else {
+        // Hot: type already registered — read the id.
+        let id = entry.id.load(Ordering::Acquire);
+        if id == ID_UNSET {
+            // Cold: another thread is concurrently registering the same type
+            // and hasn't published the id yet.  Spin until it does.
+            cold_path();
+            loop {
+                let id = entry.id.load(Ordering::Acquire);
+                if id != ID_UNSET {
+                    return id as u8;
+                }
+                std::hint::spin_loop();
+            }
         }
-        guard.schedule_mark(mobj);
+        id as u8
     }
+}
 
-    let id = reg.fns.len();
-    assert!(
-        id < MAX_TYPE_ID,
-        "type registry overflow: more than 2^TYPE_ID_BITS distinct managed types \
-        (consider increasing TYPE_ID_BITS)"
-    );
-    let id = id as u8;
-    let f: ShadePointeeFn = shade_erased::<T>;
-    reg.fns.push(f);
-    reg.by_type.insert(tid, id);
-
-    SHADE_FN_TABLE[id as usize].store(f as *mut (), Ordering::Release);
-    id
+/// Type-erased shade function.
+unsafe fn shade_erased<U: TraceObj>(mobj_ptr: *mut (), guard: &Guard) {
+    let mobj = unsafe { &*(mobj_ptr as *const ManObj<U>) };
+    if mobj.is_marked(guard) {
+        return;
+    }
+    guard.schedule_mark(mobj);
 }
 
 #[inline(always)]
@@ -915,7 +948,8 @@ impl<T: TraceObj> AtomicSharedOption<T> {
         let mut old = ManPtr::<T>::from(self.link.load(Ordering::Relaxed));
 
         // First loop to handle the `Rooted` case.
-        if unlikely(old.meta() == PtrMeta::Rooted) {
+        if old.meta() == PtrMeta::Rooted {
+            cold_path();
             // If the source is rooted, we increment the root count before trying update.
             let new_shared = Shared::try_inc_raw(new, guard);
             let new_rooted = new.with_meta(PtrMeta::Rooted);
@@ -1002,7 +1036,8 @@ impl<T: TraceObj> AtomicSharedOption<T> {
             }
 
             // First block to handle the `Rooted` case.
-            if unlikely(old.meta() == PtrMeta::Rooted) {
+            if old.meta() == PtrMeta::Rooted {
+                cold_path();
                 // If the source is rooted, we increment the root count before trying update.
                 let new_shared = Shared::try_inc_raw(ManPtr::from(new_tag.0), guard);
                 let new_rooted = ManPtr::from(new_tag).with_meta(PtrMeta::Rooted);
