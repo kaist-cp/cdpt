@@ -3,9 +3,6 @@ name = "cdpt"
 version = "0.1.0"
 edition = "2024"
 
-[workspace]
-members = ["cdpt-derive"]
-
 [dependencies]
 arrayvec = "0.7.6"
 cdpt-derive = { path = "cdpt-derive" }
