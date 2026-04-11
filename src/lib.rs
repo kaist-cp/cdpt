@@ -51,7 +51,6 @@
 //! the guard. The collector will work concurrently while your code continues to
 //! safely use the promoted references.
 
-#![feature(cold_path)]
 #![feature(vec_push_within_capacity)]
 
 #[macro_use]

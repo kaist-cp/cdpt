@@ -78,6 +78,12 @@ impl<T, const N: usize> FixedHashSet<T, N> {
     }
 }
 
+impl<T, const N: usize> Default for FixedHashSet<T, N> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl<T: Hash + Eq, const N: usize> FixedHashSet<T, N> {
     /// Inserts `key` into the set if it is not already present.
     ///

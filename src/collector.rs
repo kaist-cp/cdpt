@@ -174,6 +174,7 @@ fn record_collection_stats(start: Instant, recl_at_start: usize) {
 
     // Calculate the desired heap limit (Membalancer).
     let heap_usage = alloc_at_end - recl_at_end;
+    #[allow(clippy::manual_checked_ops)]
     let extra = if new_reclm_rate == 0 {
         global().locals.active_count() * 1024 * 1024 // 1MB per thread
     } else {

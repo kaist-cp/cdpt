@@ -159,7 +159,7 @@ impl ObjBatch {
     }
 
     pub fn push_within_capacity(&mut self, item: Box<dyn MarkObj>) -> Result<(), Box<dyn MarkObj>> {
-        self.0.push_within_capacity(item)
+        self.0.push_within_capacity(item).map(|_| ())
     }
 
     pub fn is_empty(&self) -> bool {
