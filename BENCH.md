@@ -150,3 +150,12 @@ builds normally.
 - **[EFRB10]** Faith Ellen, Panagiota Fatourou, Eric Ruppert, and Franck
   van Breugel. 2010. *Non-Blocking Binary Search Trees.* PODC '10.
   https://doi.org/10.1145/1835698.1835736
+
+## Acknowledgement
+
+The methodology and implementations of data structures are adapted from
+SMR Benchmark (https://github.com/kaist-cp/smr-benchmark), licensed
+under the MIT License.
+
+Original copyright (c) 2020 KAIST Concurrency & Parallelism Laboratory.
+The full license text is included in `THIRD_PARTY_LICENSES.md`.
