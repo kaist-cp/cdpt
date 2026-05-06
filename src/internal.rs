@@ -69,6 +69,58 @@ pub struct Global {
 
     /// Flag to request an immediate collection cycle, bypassing the heuristic.
     pub(crate) collection_requested: CachePadded<AtomicBool>,
+
+    /// Packed heap-headroom setting (single atomic for tear-free reads).
+    /// MSB clear = fixed mode, lower bits = bytes.
+    /// MSB set   = proportional mode, lower bits = divisor.
+    pub(crate) headroom: AtomicUsize,
+}
+
+/// Controls the minimum heap headroom that must be exceeded before the
+/// collector triggers the next cycle.
+///
+/// After each collection the collector computes a minimum extra headroom and
+/// will not start a new cycle until `heap_usage` grows beyond
+/// `post_collection_usage + headroom`.  This enum selects how that minimum is
+/// determined.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HeapHeadroom {
+    /// Fixed minimum headroom in mebibytes.
+    ///
+    /// A larger value reduces collection frequency (lower CPU) but allows peak
+    /// memory to grow.  A smaller value triggers collection sooner (lower peak
+    /// memory) at the cost of more CPU.
+    ///
+    /// The value is clamped to `1..=1024` MiB.
+    FixedMiB(usize),
+
+    /// Proportional minimum headroom: `heap_usage / divisor`.
+    ///
+    /// A **higher** divisor means less headroom, so the collector fires sooner
+    /// and peak memory is lower.  A **lower** divisor gives more headroom.
+    ///
+    /// The value is clamped to `1..=1024`.
+    Proportional(usize),
+}
+
+/// MSB used to distinguish proportional (set) from fixed (clear).
+const HEADROOM_PROPORTIONAL_BIT: usize = 1 << (usize::BITS - 1);
+
+impl HeapHeadroom {
+    fn pack(self) -> usize {
+        match self {
+            Self::FixedMiB(mib) => mib.clamp(1, 1024) * 1024 * 1024,
+            Self::Proportional(div) => div.clamp(1, 1024) | HEADROOM_PROPORTIONAL_BIT,
+        }
+    }
+
+    fn unpack(bits: usize) -> Self {
+        if bits & HEADROOM_PROPORTIONAL_BIT != 0 {
+            Self::Proportional(bits & !HEADROOM_PROPORTIONAL_BIT)
+        } else {
+            Self::FixedMiB(bits / (1024 * 1024))
+        }
+    }
 }
 
 /// FIXME: This may be very inaccurate for some types that internally allocate unmanaged memory.
@@ -137,6 +189,7 @@ impl Global {
             collector_init: CachePadded::new(AtomicBool::new(false)),
             collection_enabled: CachePadded::new(AtomicBool::new(true)),
             collection_requested: CachePadded::new(AtomicBool::new(false)),
+            headroom: AtomicUsize::new(HeapHeadroom::FixedMiB(1).pack()),
         }
     }
 
@@ -232,6 +285,20 @@ impl Global {
         let allocated = self.estimate_total_alloc();
         let reclaimed = self.estimate_total_reclm();
         allocated.saturating_sub(reclaimed)
+    }
+
+    /// Sets the heap-headroom strategy.
+    ///
+    /// See [`HeapHeadroom`] for details on each variant.
+    ///
+    /// Default: `HeapHeadroom::FixedMiB(1)`.
+    pub fn set_heap_headroom(&self, headroom: HeapHeadroom) {
+        self.headroom.store(headroom.pack(), Ordering::Relaxed);
+    }
+
+    /// Returns the current heap-headroom strategy.
+    pub fn heap_headroom(&self) -> HeapHeadroom {
+        HeapHeadroom::unpack(self.headroom.load(Ordering::Relaxed))
     }
 }
 
