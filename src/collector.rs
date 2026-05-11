@@ -2,6 +2,7 @@ use crossbeam::{epoch::pin as ebr_pin, utils::Backoff};
 use std::{
     iter::repeat_with,
     mem::take,
+    ops::Range,
     sync::{
         LazyLock, RwLock,
         atomic::{AtomicUsize, Ordering, fence},
@@ -20,6 +21,7 @@ use crate::{
 };
 
 use log::Logger;
+use rustc_hash::FxHashSet;
 
 #[derive(Clone)]
 struct HeartbeatStats {
@@ -252,24 +254,39 @@ fn scan_allocated_objs(handle: &Handle) {
     }
 
     // Scan HPs first. And they will be marked during the RC scan.
-    let hazards = global().collect_hps(ebr_guard);
+    // Re-key the set as `usize` so it implements `Sync` and can be shared
+    // with worker threads (raw pointers are `!Sync`; we only need the bit
+    // pattern for equality comparison here).
+    let hazards: FxHashSet<usize> = global()
+        .collect_hps(ebr_guard)
+        .into_iter()
+        .map(|p| p as usize)
+        .collect();
 
     let white_color = guard.white_color();
+    let num_threads = global().sweep_threads();
+
     // Scan all freshly allocated objects (in `fresh_objs`)
     // and mark protected ones (moving to `marked_objs`).
-    for q_idx in handle.local().generate_shard_permut() {
-        let fresh_q = &global().fresh_objs[white_color as usize][q_idx];
-        while let Some(batch) = fresh_q.try_pop(ebr_guard) {
-            for obj in batch.iter() {
-                if obj.root_count() > 0 || hazards.contains(&obj.address()) {
-                    obj.mark(&guard);
+    parallel_shard_work(num_threads, |range| {
+        let guard = crate::pin();
+        let ebr_guard = &ebr_pin();
+        let rng = &mut fastrand::Rng::new();
+
+        for q_idx in range {
+            let fresh_q = &global().fresh_objs[white_color as usize][q_idx];
+            while let Some(batch) = fresh_q.try_pop(ebr_guard) {
+                for obj in batch.iter() {
+                    if obj.root_count() > 0 || hazards.contains(&(obj.address() as usize)) {
+                        obj.mark(&guard);
+                    }
                 }
+                let marked_q_idx = rng.usize(0..OBJ_BATCHES_SHARD);
+                let marked_q = &global().marked_objs[white_color as usize][marked_q_idx];
+                marked_q.push(batch, ebr_guard);
             }
-            let marked_q_idx = handle.local().select_obj_shard();
-            let marked_q = &global().marked_objs[white_color as usize][marked_q_idx];
-            marked_q.push(batch, ebr_guard);
         }
-    }
+    });
 }
 
 fn completion_tracing(handle: &Handle, logger: &Logger) -> bool {
@@ -388,16 +405,54 @@ fn sweep(prev_white: Color, _handle: &Handle, _logger: &Logger) {
     let next_white = prev_white.flip() as usize;
     let num_threads = global().sweep_threads();
 
+    parallel_shard_work(num_threads, |range| {
+        let ebr_guard = &ebr_pin();
+        let mut survived_batch = ObjBatch::default();
+        let mut reclaimed_bytes = 0usize;
+        let rng = &mut fastrand::Rng::new();
+
+        for q_idx in range {
+            let marked_q = &global().marked_objs[prev_white as usize][q_idx];
+            while let Some(batch) = marked_q.try_pop(ebr_guard) {
+                for obj in batch.into_iter() {
+                    if prev_white == obj.color() {
+                        reclaimed_bytes += size_of_val(&*obj);
+                        drop(obj);
+                        continue;
+                    }
+                    if let Err(e) = survived_batch.push_within_capacity(obj) {
+                        let full = take(&mut survived_batch);
+                        let shard = rng.usize(0..OBJ_BATCHES_SHARD);
+                        global().fresh_objs[next_white][shard].push(full, ebr_guard);
+                        assert!(survived_batch.push_within_capacity(e).is_ok());
+                    }
+                }
+            }
+        }
+
+        if !survived_batch.is_empty() {
+            let shard = rng.usize(0..OBJ_BATCHES_SHARD);
+            global().fresh_objs[next_white][shard].push(survived_batch, ebr_guard);
+        }
+
+        global()
+            .stats
+            .total_reclaimed
+            .fetch_add(reclaimed_bytes, Ordering::Release);
+    });
+}
+
+/// Spawns `num_threads` worker threads, each invoking `work` on a contiguous
+/// slice of the `0..OBJ_BATCHES_SHARD` shard range. The last thread picks up
+/// any remainder when `OBJ_BATCHES_SHARD` is not divisible by `num_threads`.
+fn parallel_shard_work<F>(num_threads: usize, work: F)
+where
+    F: Fn(Range<usize>) + Sync,
+{
     thread::scope(|s| {
         for thread_idx in 0..num_threads {
+            let work = &work;
             s.spawn(move || {
-                let ebr_guard = &ebr_pin();
-                let mut survived_batch = ObjBatch::default();
-                let mut reclaimed_bytes = 0usize;
-                let rng = &mut fastrand::Rng::new();
-
-                // Distribute shards across threads. Each thread handles a
-                // contiguous range; the last thread picks up any remainder.
                 let base = OBJ_BATCHES_SHARD / num_threads;
                 let start = thread_idx * base;
                 let end = if thread_idx == num_threads - 1 {
@@ -405,35 +460,7 @@ fn sweep(prev_white: Color, _handle: &Handle, _logger: &Logger) {
                 } else {
                     start + base
                 };
-
-                for q_idx in start..end {
-                    let marked_q = &global().marked_objs[prev_white as usize][q_idx];
-                    while let Some(batch) = marked_q.try_pop(ebr_guard) {
-                        for obj in batch.into_iter() {
-                            if prev_white == obj.color() {
-                                reclaimed_bytes += size_of_val(&*obj);
-                                drop(obj);
-                                continue;
-                            }
-                            if let Err(e) = survived_batch.push_within_capacity(obj) {
-                                let full = take(&mut survived_batch);
-                                let shard = rng.usize(0..OBJ_BATCHES_SHARD);
-                                global().fresh_objs[next_white][shard].push(full, ebr_guard);
-                                assert!(survived_batch.push_within_capacity(e).is_ok());
-                            }
-                        }
-                    }
-                }
-
-                if !survived_batch.is_empty() {
-                    let shard = rng.usize(0..OBJ_BATCHES_SHARD);
-                    global().fresh_objs[next_white][shard].push(survived_batch, ebr_guard);
-                }
-
-                global()
-                    .stats
-                    .total_reclaimed
-                    .fetch_add(reclaimed_bytes, Ordering::Release);
+                work(start..end);
             });
         }
     });
