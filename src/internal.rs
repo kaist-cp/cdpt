@@ -5,7 +5,7 @@ use crate::pointers::{ManObj, ManPtr, MarkObj, TraceObj};
 use crate::sync::{Entry, Queue, ReusableSlots};
 use crate::task::Task;
 use crate::{global, pin};
-use crossbeam::deque::{Injector, Stealer, Worker};
+use crossbeam::deque::{Stealer, Worker};
 use crossbeam::epoch::{
     Atomic as EbrAtomic, Guard as EbrGuard, Owned as EbrOwned, pin as ebr_pin, unprotected,
 };
@@ -26,7 +26,6 @@ pub(crate) const OBJ_BATCH_SIZE: usize = 64;
 const HAZARDS_INIT_COUNT: usize = 8;
 const ALLOC_HELPING_PERIOD: usize = 64;
 const SCHED_HELPING_PERIOD: usize = 32;
-const LOCAL_MARK_TASKS_CAP: usize = 4096;
 
 /// Global state of the garbage collector, providing configuration and
 /// profiling.
@@ -57,9 +56,6 @@ pub struct Global {
     /// The first index represents the allocation color when the object is allocated.
     pub(crate) fresh_objs: [[Queue<ObjBatch>; OBJ_BATCHES_SHARD]; 2],
     pub(crate) marked_objs: [[Queue<ObjBatch>; OBJ_BATCHES_SHARD]; 2],
-
-    /// The global marking tasks.
-    pub(crate) mark_tasks: Injector<Task>,
 
     /// The global flag indicating whether the collector is online.
     collector_init: CachePadded<AtomicBool>,
@@ -191,7 +187,6 @@ impl Global {
             stats: GlobalStats::default(),
             fresh_objs: from_fn(|_| from_fn(|_| Queue::new())),
             marked_objs: from_fn(|_| from_fn(|_| Queue::new())),
-            mark_tasks: Injector::new(),
             collector_init: CachePadded::new(AtomicBool::new(false)),
             collection_enabled: CachePadded::new(AtomicBool::new(true)),
             collection_requested: CachePadded::new(AtomicBool::new(false)),
@@ -719,11 +714,7 @@ impl Local {
             self.record_mt_modification();
             &*self.mark_tasks.get()
         };
-        if mark_task.len() >= LOCAL_MARK_TASKS_CAP {
-            global().mark_tasks.push(task);
-        } else {
-            mark_task.push(task);
-        }
+        mark_task.push(task);
 
         let sched_count = self.sched_count.get() + 1;
         self.sched_count.set(sched_count);
@@ -760,16 +751,6 @@ impl Local {
                 if let Some(task) = tasks.pop() {
                     return Some(task);
                 }
-            }
-
-            // If we couldn't pop from the local stack, let's try with the global one.
-            if !global().mark_tasks.is_empty() {
-                // Optimistically assume that we are going to successfully pop the task.
-                self.record_mt_modification();
-                return global()
-                    .mark_tasks
-                    .steal_batch_with_limit_and_pop(tasks, LOCAL_MARK_TASKS_CAP / 2)
-                    .success();
             }
         }
         None

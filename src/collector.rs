@@ -1,4 +1,4 @@
-use crossbeam::{epoch::pin as ebr_pin, utils::Backoff};
+use crossbeam::{deque::Steal, epoch::pin as ebr_pin, utils::Backoff};
 use std::{
     iter::repeat_with,
     mem::take,
@@ -319,11 +319,10 @@ fn try_confirm_completion() -> bool {
     }
 
     // Check whether there's a non-empty mark queue.
-    if !global().mark_tasks.is_empty()
-        || global()
-            .locals
-            .iter_all()
-            .any(|local| !local.mark_tasks_stealer.is_empty())
+    if global()
+        .locals
+        .iter_all()
+        .any(|local| !local.mark_tasks_stealer.is_empty())
     {
         return false;
     }
@@ -357,17 +356,14 @@ fn drain_mark_tasks(handle: &Handle) -> bool {
 
 fn find_task(handle: &Handle) -> Option<Task> {
     let local_w = unsafe { &*handle.local().mark_tasks.get() };
-    let global_inj = &global().mark_tasks;
 
     local_w.pop().or_else(|| {
         repeat_with(|| {
-            global_inj.steal_batch_and_pop(local_w).or_else(|| {
-                global()
-                    .locals
-                    .iter_all()
-                    .map(|local| local.mark_tasks_stealer.steal())
-                    .collect()
-            })
+            global()
+                .locals
+                .iter_all()
+                .map(|local| local.mark_tasks_stealer.steal())
+                .collect::<Steal<Task>>()
         })
         .find(|s| !s.is_retry())
         .and_then(|s| s.success())
