@@ -59,6 +59,7 @@ const ALLOC_PER_MS_SMOOTH_FACTOR: f64 = 0.5;
 const RECLM_PER_MS_SMOOTH_FACTOR: f64 = 0.5;
 const COLL_TIME_MS_SMOOTH_FACTOR: f64 = 0.5;
 const EXTRA_TUNING_FACTOR: usize = 10;
+const LOCAL_MARK_TASKS_BATCH_LIMIT: usize = 2048;
 
 /// A function body for the primary collector thread.
 pub(crate) fn collector_loop() {
@@ -362,7 +363,11 @@ fn find_task(handle: &Handle) -> Option<Task> {
             global()
                 .locals
                 .iter_all()
-                .map(|local| local.mark_tasks_stealer.steal())
+                .map(|local| {
+                    local
+                        .mark_tasks_stealer
+                        .steal_batch_with_limit_and_pop(local_w, LOCAL_MARK_TASKS_BATCH_LIMIT)
+                })
                 .collect::<Steal<Task>>()
         })
         .find(|s| !s.is_retry())
