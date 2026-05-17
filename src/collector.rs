@@ -126,30 +126,6 @@ fn heartbeat() -> HeartbeatStats {
     stats.alloc_per_ms = new_alloc_per_ms;
     stats.alloc_per_ms_smooth = new_alloc_per_ms_smooth;
 
-    // TODO: Small profiling code. Remove later...
-    // fn readable_bytes(num: usize) -> String {
-    //     const UNITS: [&str; 4] = ["B", "KiB", "MiB", "GiB"];
-    //     for (i, unit) in UNITS.iter().enumerate() {
-    //         if num / 2usize.pow(i as u32 * 10) < 1000 {
-    //             return format!("{:.3} {}", num as f64 / 2f64.powf(i as f64 * 10.0), unit);
-    //         }
-    //     }
-    //     format!(
-    //         "{:.3} {}",
-    //         num as f64 / 2f64.powf((UNITS.len() - 1) as f64 * 10.0),
-    //         UNITS.last().unwrap()
-    //     )
-    // }
-    // println!(
-    //     "heap_usage: {}, total_alloc: {}, alloc_per_ms: {}, alloc_per_ms (smooth): {} / reclm_per_ms (smooth): {} / heap_limit: {}",
-    //     readable_bytes(new_total_alloc - new_total_reclm),
-    //     readable_bytes(new_total_alloc),
-    //     readable_bytes(new_alloc_per_ms),
-    //     readable_bytes(new_alloc_per_ms_smooth),
-    //     readable_bytes(CSTATS.reclm_per_ms_smooth.load(Ordering::Relaxed)),
-    //     readable_bytes(CSTATS.desired_heap_limit.load(Ordering::Relaxed))
-    // );
-
     stats.clone()
 }
 
