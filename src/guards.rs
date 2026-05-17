@@ -13,7 +13,7 @@ use crossbeam::epoch::pin as ebr_pin;
 use std::{
     cell::{Cell, LazyCell},
     rc::Rc,
-    sync::atomic::{Ordering, fence},
+    sync::atomic::{Ordering, compiler_fence, fence},
 };
 
 const HELP_NORMAL_MAX_TRIAL: usize = 2;
@@ -159,19 +159,32 @@ impl Guard {
         unsafe { self.local().pinned_alloc_color() }
     }
 
+    /// Loads the current global epoch with a preceding fence. This function
+    /// must be called after a successful atomic RMW operation, which on
+    /// x86/x86-64 is lock-prefixed and therefore already provides full
+    /// ordering.
+    ///
+    /// On non-x86 architectures, this issues a `SeqCst` fence. On x86/x86-64,
+    /// it issues only a compiler fence, which suffices to prevent local
+    /// reordering by the compiler.
+    ///
+    /// This optimization is motivated by
+    /// [crossbeam_epoch's approach](https://github.com/crossbeam-rs/crossbeam/blob/master/crossbeam-epoch/src/internal.rs#L413-L448).
+    /// One difference worth noting: the original comment there assumes that
+    /// only RMW operations with `SeqCst` ordering produce a full fence, but
+    /// we believe the ordering does not matter on x86/x86-64. Even a CAS
+    /// with `(Relaxed, Relaxed)` ordering is compiled to a `lock cmpxchg`,
+    /// which carries full hardware ordering regardless of the requested
+    /// ordering ([godbolt](https://godbolt.org/z/517o9nKcj)). The only
+    /// remaining risk is local reordering by the compiler, and that is
+    /// addressed by the compiler fence, as crossbeam_epoch already does.
+    #[inline]
     pub(crate) fn global_phase_with_fence(&self) -> Phase {
-        fence(Ordering::SeqCst);
-        global().load_epoch().phase()
-    }
-
-    /// Like [`global_phase`](Self::global_phase) but without a preceding SeqCst
-    /// fence. Safe to call immediately after a successful atomic RMW with at
-    /// least AcqRel success ordering — on x86/x86-64, lock-prefixed
-    /// instructions already provide full ordering, making the fence redundant.
-    #[inline(always)]
-    pub(crate) fn global_phase_no_fence(&self) -> Phase {
-        #[cfg(not(any(target_arch = "x86_64", target_arch = "x86")))]
-        fence(Ordering::SeqCst);
+        if cfg!(any(target_arch = "x86_64", target_arch = "x86")) {
+            compiler_fence(Ordering::SeqCst);
+        } else {
+            fence(Ordering::SeqCst);
+        }
         global().load_epoch().phase()
     }
 

@@ -24,7 +24,7 @@ use std::{
     hint::cold_path,
     marker::PhantomData,
     mem::forget,
-    ops::Deref,
+    ops::{ControlFlow, Deref},
     ptr::{NonNull, null_mut},
     sync::atomic::{AtomicPtr, AtomicU32, AtomicUsize, Ordering},
 };
@@ -73,6 +73,31 @@ const_assert!(63 - TYPE_ID_BITS >= 32);
 
 /// Type-erased shade function: given a ManObj pointer, shade its outgoing edges.
 type ShadePointeeFn = unsafe fn(mobj_ptr: *mut (), guard: &Guard);
+
+/// A payload bundled with the low-bit pointer tag: `(value, tag_bits)`.
+///
+/// Used as the input or output type of `*_with_tag` APIs on [`AtomicShared`] /
+/// [`AtomicSharedOption`] — e.g. the return type of `load_with_tag` /
+/// `swap_with_tag` / `fetch_tag_*`, or the argument type of
+/// `compare_exchange_with_tag`. `tag_bits` is the low-bit tag carried in the
+/// pointer metadata.
+#[cfg(feature = "tag")]
+pub type WithTag<L> = (L, usize);
+
+#[cfg(not(feature = "tag"))]
+pub(crate) type WithTag<L> = (L, usize);
+
+/// Outcome of a fallible CAS-style RMW. `Ok` carries the previous value;
+/// `Err` carries the current actual value. Both branches share the same
+/// payload type, matching [`std::sync::atomic::AtomicPtr::compare_exchange`].
+pub type CasResult<L> = Result<L, L>;
+
+/// Outcome of the cold rooted branch of the strong CAS path: either a
+/// fully-formed result to return ([`ControlFlow::Break`]), or the freshly
+/// observed unrooted pointer to fall through to the unrooted path with
+/// ([`ControlFlow::Continue`]).
+type RootedCasFallback<'g, T> =
+    ControlFlow<CasResult<WithTag<Option<Local<'g, Guard, T>>>>, ManPtr<T>>;
 
 /// Entry stored in the type registry's hash set.
 ///
@@ -169,28 +194,49 @@ fn get_shade_fn(type_id: u8) -> ShadePointeeFn {
 
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Toggles a method's visibility between `pub` (when `feature = "tag"`) and
+/// Toggles methods' visibility between `pub` (when `feature = "tag"`) and
 /// `pub(crate)` (otherwise). Used for `*_with_tag` / `fetch_tag_*` APIs.
+///
+/// Accepts one or more `fn` / `const fn` items; each is emitted twice, once
+/// behind `#[cfg(feature = "tag")]` as `pub` and once behind the negation as
+/// `pub(crate)`.
 macro_rules! tag_fn {
-    ($(#[$meta:meta])* fn $name:ident $($rest:tt)*) => {
-        $(#[$meta])*
-        #[cfg(feature = "tag")]
-        pub fn $name $($rest)*
+    () => {};
 
-        $(#[$meta])*
+    // Internal: the signature is fully accumulated; the next token is the body.
+    // Emit both visibility variants and recurse on the remaining items.
+    (@emit
+        [$($meta:tt)*] [$($kw:tt)*] $name:ident [$($sig:tt)*]
+        $body:block $($rest:tt)*
+    ) => {
+        $($meta)*
+        #[cfg(feature = "tag")]
+        pub $($kw)* fn $name $($sig)* $body
+
+        $($meta)*
         #[cfg(not(feature = "tag"))]
         #[allow(dead_code)]
-        pub(crate) fn $name $($rest)*
+        pub(crate) $($kw)* fn $name $($sig)* $body
+
+        tag_fn! { $($rest)* }
     };
-    ($(#[$meta:meta])* const fn $name:ident $($rest:tt)*) => {
-        $(#[$meta])*
-        #[cfg(feature = "tag")]
-        pub const fn $name $($rest)*
 
-        $(#[$meta])*
-        #[cfg(not(feature = "tag"))]
-        #[allow(dead_code)]
-        pub(crate) const fn $name $($rest)*
+    // Internal: not yet at the body; accumulate one signature token and continue.
+    (@emit
+        [$($meta:tt)*] [$($kw:tt)*] $name:ident [$($sig:tt)*]
+        $tok:tt $($rest:tt)*
+    ) => {
+        tag_fn! { @emit [$($meta)*] [$($kw)*] $name [$($sig)* $tok] $($rest)* }
+    };
+
+    // Entry: `const fn`
+    ($(#[$meta:meta])* const fn $name:ident $($rest:tt)*) => {
+        tag_fn! { @emit [$(#[$meta])*] [const] $name [] $($rest)* }
+    };
+
+    // Entry: `fn`
+    ($(#[$meta:meta])* fn $name:ident $($rest:tt)*) => {
+        tag_fn! { @emit [$(#[$meta])*] [] $name [] $($rest)* }
     };
 }
 
@@ -429,11 +475,11 @@ where
     }
 }
 
-impl<'g, G, T> From<(Option<&Local<'g, G, T>>, usize)> for ManPtr<T>
+impl<'g, G, T> From<WithTag<Option<&Local<'g, G, T>>>> for ManPtr<T>
 where
     G: Protector,
 {
-    fn from(value: (Option<&Local<'g, G, T>>, usize)) -> Self {
+    fn from(value: WithTag<Option<&Local<'g, G, T>>>) -> Self {
         Self::from(value.0).with_tag(value.1)
     }
 }
@@ -601,7 +647,7 @@ impl<T: TraceObj> ManPtr<T> {
     pub(crate) unsafe fn as_local_with_tag<'g>(
         self,
         guard: &'g Guard,
-    ) -> (Option<Local<'g, Guard, T>>, usize) {
+    ) -> WithTag<Option<Local<'g, Guard, T>>> {
         let tag = self.tag();
         let opt_local = if self.is_null() {
             None
@@ -886,7 +932,7 @@ impl<T: TraceObj> AtomicSharedOption<T> {
             &self,
             order: Ordering,
             guard: &'g Guard,
-        ) -> (Option<Local<'g, Guard, T>>, usize) {
+        ) -> WithTag<Option<Local<'g, Guard, T>>> {
             let ptr = ManPtr::from(self.link.load(order));
             // Safety: If the pointer is not null, it points to a valid memory location.
             // The validity should be guaranteed by the correctness of this garbage collector.
@@ -931,7 +977,7 @@ impl<T: TraceObj> AtomicSharedOption<T> {
             &self,
             order: Ordering,
             guard: &'g Guard,
-        ) -> (Option<Local<'g, Guard, T>>, usize) {
+        ) -> WithTag<Option<Local<'g, Guard, T>>> {
             self.swap_with_tag(None::<&Local<'g, Guard, T>>, 0, order, guard)
         }
     }
@@ -954,7 +1000,7 @@ impl<T: TraceObj> AtomicSharedOption<T> {
             tag: usize,
             order: Ordering,
             guard: &'g Guard,
-        ) -> (Option<Local<'g, Guard, T>>, usize) {
+        ) -> WithTag<Option<Local<'g, Guard, T>>> {
             let ptr = self.internal_swap(ManPtr::from(new).with_tag(tag), order, guard);
             // Safety: If the pointer is not null, it points to a valid memory location.
             // The validity should be guaranteed by the correctness of this garbage collector.
@@ -973,8 +1019,13 @@ impl<T: TraceObj> AtomicSharedOption<T> {
             let new_rooted = new.with_meta(PtrMeta::Rooted);
 
             while old.meta() == PtrMeta::Rooted {
-                match self.internal_cmpxchg_rooted(old, new_rooted, order, Ordering::Relaxed, guard)
-                {
+                match self.internal_cmpxchg_rooted::<false>(
+                    old,
+                    new_rooted,
+                    order,
+                    Ordering::Relaxed,
+                    guard,
+                ) {
                     Ok(current) => {
                         // The `new` pointer is successfully inserted.
                         // Skip decrementing the root count for the inserted one.
@@ -1007,7 +1058,6 @@ impl<T: TraceObj> AtomicSharedOption<T> {
     ///
     /// Both `current` and `new` may be `None` (null). GC write barriers
     /// (insertion + deletion) are applied automatically.
-    #[allow(clippy::type_complexity)]
     pub fn compare_exchange<'l1, 'l2, 'g, G1, G2>(
         &self,
         current: Option<&Local<'l1, G1, T>>,
@@ -1015,7 +1065,7 @@ impl<T: TraceObj> AtomicSharedOption<T> {
         success: Ordering,
         failure: Ordering,
         guard: &'g Guard,
-    ) -> Result<Option<Local<'g, Guard, T>>, Option<Local<'g, Guard, T>>>
+    ) -> CasResult<Option<Local<'g, Guard, T>>>
     where
         G1: Protector,
         G2: Protector,
@@ -1031,15 +1081,14 @@ impl<T: TraceObj> AtomicSharedOption<T> {
         ///
         /// On success, returns `Ok` with the **previous** (pointer, tag) pair.
         /// On failure, returns `Err` with the **current actual** (pointer, tag) pair.
-        #[allow(clippy::type_complexity)]
         fn compare_exchange_with_tag<'l1, 'l2, 'g, G1, G2>(
             &self,
-            current_tag: (Option<&Local<'l1, G1, T>>, usize),
-            new_tag: (Option<&Local<'l2, G2, T>>, usize),
+            current_tag: WithTag<Option<&Local<'l1, G1, T>>>,
+            new_tag: WithTag<Option<&Local<'l2, G2, T>>>,
             success: Ordering,
             failure: Ordering,
             guard: &'g Guard,
-        ) -> Result<(Option<Local<'g, Guard, T>>, usize), (Option<Local<'g, Guard, T>>, usize)>
+        ) -> CasResult<WithTag<Option<Local<'g, Guard, T>>>>
         where
             G1: Protector,
             G2: Protector,
@@ -1055,27 +1104,11 @@ impl<T: TraceObj> AtomicSharedOption<T> {
 
             // First block to handle the `Rooted` case.
             if old.meta() == PtrMeta::Rooted {
-                cold_path();
-                // If the source is rooted, we increment the root count before trying update.
-                let new_shared = Shared::try_inc_raw(ManPtr::from(new_tag.0), guard);
-                let new_rooted = ManPtr::from(new_tag).with_meta(PtrMeta::Rooted);
-
-                match self.internal_cmpxchg_rooted(old, new_rooted, success, failure, guard) {
-                    Ok(current) => {
-                        // The `new` pointer is successfully inserted.
-                        // Skip decrementing the root count for the inserted one.
-                        forget(new_shared);
-                        return Ok(unsafe { current.as_local_with_tag(guard) });
-                    }
-                    Err(current) => match current.meta() {
-                        PtrMeta::Rooted => return Err(unsafe { current.as_local_with_tag(guard) }),
-                        PtrMeta::Unrooted(_) => old = current,
-                    },
-                }
-
-                // We just want to re-check the trivial failure case.
-                if old.without_meta() != ManPtr::from(current_tag) {
-                    return Err(unsafe { old.as_local_with_tag(guard) });
+                match self
+                    .internal_cmpxchg_strong_rooted(old, current_tag, new_tag, success, failure, guard)
+                {
+                    ControlFlow::Break(result) => return result,
+                    ControlFlow::Continue(new_old) => old = new_old,
                 }
             }
 
@@ -1087,25 +1120,73 @@ impl<T: TraceObj> AtomicSharedOption<T> {
         }
     }
 
-    /// Cold path for the rooted CAS case (~0.009% of calls).
+    /// Cold path for the rooted case of the strong CAS.
+    ///
+    /// Returns [`ControlFlow::Break`] when the strong CAS should return
+    /// immediately (either success, or definitive failure against a rooted
+    /// current). Returns [`ControlFlow::Continue`] with the freshly observed
+    /// (now unrooted) `old` so the caller falls through to the unrooted path.
     #[cold]
     #[inline(never)]
-    #[allow(clippy::type_complexity)]
-    fn cmpxchg_weak_rooted_cold<'l2, 'g, G2>(
+    fn internal_cmpxchg_strong_rooted<'l1, 'l2, 'g, G1, G2>(
         &self,
         old: ManPtr<T>,
-        new_tag: (Option<&Local<'l2, G2, T>>, usize),
+        current_tag: WithTag<Option<&Local<'l1, G1, T>>>,
+        new_tag: WithTag<Option<&Local<'l2, G2, T>>>,
         success: Ordering,
         failure: Ordering,
         guard: &'g Guard,
-    ) -> Result<(Option<Local<'g, Guard, T>>, usize), (Option<Local<'g, Guard, T>>, usize)>
+    ) -> RootedCasFallback<'g, T>
+    where
+        G1: Protector,
+        G2: Protector,
+    {
+        // If the source is rooted, we increment the root count before trying update.
+        let new_shared = Shared::try_inc_raw(ManPtr::from(new_tag.0), guard);
+        let new_rooted = ManPtr::from(new_tag).with_meta(PtrMeta::Rooted);
+
+        let old = match self
+            .internal_cmpxchg_rooted::<false>(old, new_rooted, success, failure, guard)
+        {
+            Ok(current) => {
+                // The `new` pointer is successfully inserted.
+                // Skip decrementing the root count for the inserted one.
+                forget(new_shared);
+                return ControlFlow::Break(Ok(unsafe { current.as_local_with_tag(guard) }));
+            }
+            Err(current) => match current.meta() {
+                PtrMeta::Rooted => {
+                    return ControlFlow::Break(Err(unsafe { current.as_local_with_tag(guard) }));
+                }
+                PtrMeta::Unrooted(_) => current,
+            },
+        };
+
+        // We just want to re-check the trivial failure case.
+        if old.without_meta() != ManPtr::from(current_tag) {
+            return ControlFlow::Break(Err(unsafe { old.as_local_with_tag(guard) }));
+        }
+        ControlFlow::Continue(old)
+    }
+
+    /// Cold path for the rooted CAS case.
+    #[cold]
+    #[inline(never)]
+    fn internal_cmpxchg_weak_rooted<'l2, 'g, G2>(
+        &self,
+        old: ManPtr<T>,
+        new_tag: WithTag<Option<&Local<'l2, G2, T>>>,
+        success: Ordering,
+        failure: Ordering,
+        guard: &'g Guard,
+    ) -> CasResult<WithTag<Option<Local<'g, Guard, T>>>>
     where
         G2: Protector,
     {
         let new_shared = Shared::try_inc_raw(ManPtr::from(new_tag.0), guard);
         let new_rooted = ManPtr::from(new_tag).with_meta(PtrMeta::Rooted);
 
-        match self.internal_cmpxchg_rooted(old, new_rooted, success, failure, guard) {
+        match self.internal_cmpxchg_rooted::<true>(old, new_rooted, success, failure, guard) {
             Ok(current) => {
                 forget(new_shared);
                 Ok(unsafe { current.as_local_with_tag(guard) })
@@ -1114,27 +1195,55 @@ impl<T: TraceObj> AtomicSharedOption<T> {
         }
     }
 
+    /// Weak variant of [`compare_exchange`](Self::compare_exchange).
+    ///
+    /// Unlike the strong variant, this not only uses the platform's weak
+    /// compare-and-swap operation internally (which can spuriously fail on
+    /// LL/SC architectures) but also does NOT retry when the CAS fails due to
+    /// a concurrent GC metadata change. Callers that already sit inside their
+    /// own retry loop should prefer this to avoid redundant retries.
+    ///
+    /// On success, returns `Ok` with the **previous** value. On failure,
+    /// returns `Err` with the **current actual** value. The failure may be
+    /// spurious.
+    pub fn compare_exchange_weak<'l1, 'l2, 'g, G1, G2>(
+        &self,
+        current: Option<&Local<'l1, G1, T>>,
+        new: Option<&Local<'l2, G2, T>>,
+        success: Ordering,
+        failure: Ordering,
+        guard: &'g Guard,
+    ) -> CasResult<Option<Local<'g, Guard, T>>>
+    where
+        G1: Protector,
+        G2: Protector,
+    {
+        self.compare_exchange_weak_with_tag((current, 0), (new, 0), success, failure, guard)
+            .map(|pt| pt.0)
+            .map_err(|pt| pt.0)
+    }
+
     tag_fn! {
         /// Weak variant of [`compare_exchange_with_tag`](Self::compare_exchange_with_tag).
         ///
-        /// Unlike the strong variant, this does NOT retry when the CAS fails due
-        /// to a concurrent GC color-metadata change. Callers that already sit
-        /// inside their own retry loop should prefer this to avoid redundant
-        /// retries.
+        /// Unlike the strong variant, this not only uses the platform's weak
+        /// compare-and-swap operation internally (which can spuriously fail on
+        /// LL/SC architectures) but also does NOT retry when the CAS fails due
+        /// to a concurrent GC metadata change. Callers that already sit inside
+        /// their own retry loop should prefer this to avoid redundant retries.
         ///
         /// On success, returns `Ok` with the **previous** (pointer, tag) pair.
         /// On failure, returns `Err` with the **current actual** (pointer, tag)
-        /// pair. The failure may be spurious (only GC metadata changed).
-        #[allow(clippy::type_complexity)]
+        /// pair. The failure may be spurious.
         #[inline(always)]
         fn compare_exchange_weak_with_tag<'l1, 'l2, 'g, G1, G2>(
             &self,
-            current_tag: (Option<&Local<'l1, G1, T>>, usize),
-            new_tag: (Option<&Local<'l2, G2, T>>, usize),
+            current_tag: WithTag<Option<&Local<'l1, G1, T>>>,
+            new_tag: WithTag<Option<&Local<'l2, G2, T>>>,
             success: Ordering,
             failure: Ordering,
             guard: &'g Guard,
-        ) -> Result<(Option<Local<'g, Guard, T>>, usize), (Option<Local<'g, Guard, T>>, usize)>
+        ) -> CasResult<WithTag<Option<Local<'g, Guard, T>>>>
         where
             G1: Protector,
             G2: Protector,
@@ -1146,40 +1255,31 @@ impl<T: TraceObj> AtomicSharedOption<T> {
             }
 
             if old.meta() == PtrMeta::Rooted {
-                return self.cmpxchg_weak_rooted_cold(old, new_tag, success, failure, guard);
+                return self.internal_cmpxchg_weak_rooted(old, new_tag, success, failure, guard);
             }
 
-            // Hot path: unrooted weak CAS (99.99%+ of calls).
-            // Safety: meta != Rooted was just checked above.
-            let old_color = unsafe { old.unrooted_color_unchecked() };
-            let new = ManPtr::from(new_tag);
-            let ptrs_differ = old.as_ptr() != new.as_ptr();
-
-            // Dijkstra insertion barrier (fires ~0.8% of calls, only during GC tracing).
-            if ptrs_differ && old_color == guard.black_color() {
-                cold_path();
-                Self::dijkstra_insertion_barrier(new, guard);
-            }
-            let new = new.with_meta(PtrMeta::Unrooted(old_color));
-
-            match self.link.compare_exchange(old.data, new.data, success, failure) {
-                Ok(_) => {
-                    // Yuasa deletion barrier (fires ~0.3% of calls, only during GC tracing).
-                    if ptrs_differ
-                        && old_color == guard.white_color()
-                        && guard.global_phase_no_fence() != Phase::N
-                    {
-                        cold_path();
-                        Self::yuasa_deletion_barrier(old, guard);
-                    }
-                    Ok(unsafe { old.as_local_with_tag(guard) })
-                }
-                Err(current) => Err(unsafe { ManPtr::from(current).as_local_with_tag(guard) }),
-            }
+            self.internal_cmpxchg_unrooted_once::<true>(
+                old,
+                ManPtr::from(new_tag),
+                success,
+                failure,
+                guard,
+            )
+            .map(|c| unsafe { c.as_local_with_tag(guard) })
+            .map_err(|c| unsafe { c.as_local_with_tag(guard) })
         }
     }
 
-    fn internal_cmpxchg_rooted(
+    /// An internal implementation of rooted CAS. `WEAK` selects between
+    /// [`AtomicPtr::compare_exchange`] and [`AtomicPtr::compare_exchange_weak`]
+    /// for the inner CAS.
+    ///
+    /// Unlike the unrooted helper, the strong-rooted caller cannot tolerate
+    /// spurious failures here: a spurious `Err(current)` with `current.meta()`
+    /// still `Rooted` would be misclassified as a definitive failure rather
+    /// than a fall-through to the unrooted path. So strong-CAS callers must
+    /// instantiate `WEAK = false`.
+    fn internal_cmpxchg_rooted<const WEAK: bool>(
         &self,
         old: ManPtr<T>,
         new_rooted: ManPtr<T>,
@@ -1190,10 +1290,14 @@ impl<T: TraceObj> AtomicSharedOption<T> {
         debug_assert!(old.meta() == PtrMeta::Rooted);
         debug_assert!(new_rooted.meta() == PtrMeta::Rooted);
 
-        match self
-            .link
-            .compare_exchange(old.data, new_rooted.data, success, failure)
-        {
+        let cas = if WEAK {
+            self.link
+                .compare_exchange_weak(old.data, new_rooted.data, success, failure)
+        } else {
+            self.link
+                .compare_exchange(old.data, new_rooted.data, success, failure)
+        };
+        match cas {
             Ok(_) => {
                 // Decrement the root count of the overwritten one,
                 // and execute a deletion barrier if necessary.
@@ -1212,9 +1316,19 @@ impl<T: TraceObj> AtomicSharedOption<T> {
         }
     }
 
-    fn internal_cmpxchg_unrooted(
+    /// One attempt of the unrooted CAS path of `internal_cmpxchg_unrooted`,
+    /// without the color-only-change retry loop.
+    ///
+    /// `WEAK` selects between [`AtomicPtr::compare_exchange`] and
+    /// [`AtomicPtr::compare_exchange_weak`] for the inner CAS. The strong-CAS
+    /// caller wraps this in a retry loop that naturally hides any LL/SC-style
+    /// spurious failures (they leave `current == old.data`, which satisfies
+    /// the color-only-retry guard). The weak CAS surfaces spurious failures to
+    /// its caller as part of its contract.
+    #[inline(always)]
+    fn internal_cmpxchg_unrooted_once<const WEAK: bool>(
         &self,
-        mut old: ManPtr<T>,
+        old: ManPtr<T>,
         new: ManPtr<T>,
         success: Ordering,
         failure: Ordering,
@@ -1225,51 +1339,69 @@ impl<T: TraceObj> AtomicSharedOption<T> {
         // produces a bare pointer (meta bits = 0 = Rooted encoding). This is fine
         // because we overwrite the meta to `Unrooted(old_color)` below.
 
-        loop {
-            let PtrMeta::Unrooted(old_color) = old.meta() else {
-                unreachable!("An unrooted pointer is never re-rooted.");
-            };
-            if old.as_ptr() != new.as_ptr() && old_color == guard.black_color() {
-                // Dijkstra-style insertion barrier.
-                new.shade_pointee(guard);
-            }
-            let new = new.with_meta(PtrMeta::Unrooted(old_color));
+        // Safety: caller ensures `old.meta() != Rooted`, so it is `Unrooted(_)`.
+        let old_color = unsafe { old.unrooted_color_unchecked() };
+        let ptrs_differ = old.as_ptr() != new.as_ptr();
 
-            let result = self
-                .link
+        // Dijkstra insertion barrier (rarely fires, only during GC tracing).
+        if ptrs_differ && old_color == guard.black_color() {
+            Self::dijkstra_insertion_barrier(new, guard);
+        }
+        let new = new.with_meta(PtrMeta::Unrooted(old_color));
+
+        let cas = if WEAK {
+            self.link
+                .compare_exchange_weak(old.data, new.data, success, failure)
+        } else {
+            self.link
                 .compare_exchange(old.data, new.data, success, failure)
-                .map(ManPtr::from)
-                .map_err(ManPtr::from);
-
-            match result {
-                Ok(_) => {
-                    if old.as_ptr() != new.as_ptr()
-                        && old_color == guard.white_color()
-                        && guard.global_phase_with_fence() != Phase::N
-                    {
-                        // Yuasa-style deletion barrier.
-                        old.shade_pointee(guard);
-                    }
+        };
+        match cas {
+            Ok(_) => {
+                // Yuasa deletion barrier (rarely fires, only during GC tracing).
+                if ptrs_differ
+                    && old_color == guard.white_color()
+                    && guard.global_phase_with_fence() != Phase::N
+                {
+                    Self::yuasa_deletion_barrier(old, guard);
                 }
+                Ok(old)
+            }
+            Err(current) => Err(ManPtr::from(current)),
+        }
+    }
+
+    fn internal_cmpxchg_unrooted(
+        &self,
+        mut old: ManPtr<T>,
+        new: ManPtr<T>,
+        success: Ordering,
+        failure: Ordering,
+        guard: &Guard,
+    ) -> Result<ManPtr<T>, ManPtr<T>> {
+        loop {
+            match self.internal_cmpxchg_unrooted_once::<false>(old, new, success, failure, guard) {
+                Ok(o) => return Ok(o),
                 Err(current) => {
                     if current.without_meta() == old.without_meta() {
                         // if the only metadata (i.e., color) is changed, let's retry.
                         old = current;
                         continue;
                     }
+                    return Err(current);
                 }
             }
-
-            return result;
         }
     }
 
+    /// Dijkstra-style insertion barrier.
     #[cold]
     #[inline(never)]
     fn dijkstra_insertion_barrier(new: ManPtr<T>, guard: &Guard) {
         new.shade_pointee(guard);
     }
 
+    /// Yuasa-style deletion barrier.
     #[cold]
     #[inline(never)]
     fn yuasa_deletion_barrier(old: ManPtr<T>, guard: &Guard) {
@@ -1288,7 +1420,7 @@ impl<T: TraceObj> AtomicSharedOption<T> {
             tag: usize,
             order: Ordering,
             guard: &'g Guard,
-        ) -> (Option<Local<'g, Guard, T>>, usize) {
+        ) -> WithTag<Option<Local<'g, Guard, T>>> {
             // Safety: If the pointer is not null, it points to a valid memory location.
             // The validity should be guaranteed by the correctness of this garbage collector.
             unsafe {
@@ -1296,9 +1428,7 @@ impl<T: TraceObj> AtomicSharedOption<T> {
                     .as_local_with_tag(guard)
             }
         }
-    }
 
-    tag_fn! {
         /// Atomically ORs the tag bits, returning the previous (pointer, tag) pair.
         #[inline(always)]
         fn fetch_tag_or<'g>(
@@ -1306,7 +1436,7 @@ impl<T: TraceObj> AtomicSharedOption<T> {
             tag: usize,
             order: Ordering,
             guard: &'g Guard,
-        ) -> (Option<Local<'g, Guard, T>>, usize) {
+        ) -> WithTag<Option<Local<'g, Guard, T>>> {
             // Safety: If the pointer is not null, it points to a valid memory location.
             // The validity should be guaranteed by the correctness of this garbage collector.
             unsafe {
@@ -1314,9 +1444,7 @@ impl<T: TraceObj> AtomicSharedOption<T> {
                     .as_local_with_tag(guard)
             }
         }
-    }
 
-    tag_fn! {
         /// Atomically XORs the tag bits, returning the previous (pointer, tag) pair.
         #[inline(always)]
         fn fetch_tag_xor<'g>(
@@ -1324,7 +1452,7 @@ impl<T: TraceObj> AtomicSharedOption<T> {
             tag: usize,
             order: Ordering,
             guard: &'g Guard,
-        ) -> (Option<Local<'g, Guard, T>>, usize) {
+        ) -> WithTag<Option<Local<'g, Guard, T>>> {
             // Safety: If the pointer is not null, it points to a valid memory location.
             // The validity should be guaranteed by the correctness of this garbage collector.
             unsafe {
@@ -1565,7 +1693,7 @@ impl<T: TraceObj> AtomicShared<T> {
             &self,
             order: Ordering,
             guard: &'g Guard,
-        ) -> (Local<'g, Guard, T>, usize) {
+        ) -> WithTag<Local<'g, Guard, T>> {
             let r = self.inner.load_with_tag(order, guard);
             debug_assert!(r.0.is_some());
             // Safety: There must be no possible path to write a `None` to the inner atomic.
@@ -1605,7 +1733,7 @@ impl<T: TraceObj> AtomicShared<T> {
             &self,
             order: Ordering,
             guard: &'g Guard,
-        ) -> (Local<'g, Guard, T>, usize) {
+        ) -> WithTag<Local<'g, Guard, T>> {
             let r = self.inner.take_with_tag(order, guard);
             debug_assert!(r.0.is_some());
             // Safety: There must be no possible path to write a `None` to the inner atomic.
@@ -1634,7 +1762,7 @@ impl<T: TraceObj> AtomicShared<T> {
             tag: usize,
             order: Ordering,
             guard: &'g Guard,
-        ) -> (Local<'g, Guard, T>, usize) {
+        ) -> WithTag<Local<'g, Guard, T>> {
             let r = self.inner.swap_with_tag(Some(new), tag, order, guard);
             debug_assert!(r.0.is_some());
             // Safety: There must be no possible path to write a `None` to the inner atomic.
@@ -1656,7 +1784,7 @@ impl<T: TraceObj> AtomicShared<T> {
         success: Ordering,
         failure: Ordering,
         guard: &'g Guard,
-    ) -> Result<Local<'g, Guard, T>, Local<'g, Guard, T>>
+    ) -> CasResult<Local<'g, Guard, T>>
     where
         G1: Protector,
         G2: Protector,
@@ -1680,20 +1808,97 @@ impl<T: TraceObj> AtomicShared<T> {
         ///
         /// On success, returns `Ok` with the **previous** (pointer, tag) pair.
         /// On failure, returns `Err` with the **current actual** (pointer, tag) pair.
-        #[allow(clippy::type_complexity)]
         fn compare_exchange_with_tag<'l1, 'l2, 'g, G1, G2>(
             &self,
-            current_tag: (&Local<'l1, G1, T>, usize),
-            new_tag: (&Local<'l2, G2, T>, usize),
+            current_tag: WithTag<&Local<'l1, G1, T>>,
+            new_tag: WithTag<&Local<'l2, G2, T>>,
             success: Ordering,
             failure: Ordering,
             guard: &'g Guard,
-        ) -> Result<(Local<'g, Guard, T>, usize), (Local<'g, Guard, T>, usize)>
+        ) -> CasResult<WithTag<Local<'g, Guard, T>>>
         where
             G1: Protector,
             G2: Protector,
         {
             let r = self.inner.compare_exchange_with_tag(
+                (Some(current_tag.0), current_tag.1),
+                (Some(new_tag.0), new_tag.1),
+                success,
+                failure,
+                guard,
+            );
+            match r {
+                Ok((l, _)) | Err((l, _)) => debug_assert!(l.is_some()),
+            }
+            // Safety: There must be no possible path to write a `None` to the inner atomic.
+            unsafe {
+                r.map(|(l, t)| (l.unwrap_unchecked(), t))
+                    .map_err(|(l, t)| (l.unwrap_unchecked(), t))
+            }
+        }
+    }
+
+    /// Weak variant of [`compare_exchange`](Self::compare_exchange).
+    ///
+    /// Unlike the strong variant, this not only uses the platform's weak
+    /// compare-and-swap operation internally (which can spuriously fail on
+    /// LL/SC architectures) but also does NOT retry when the CAS fails due to
+    /// a concurrent GC metadata change. Callers that already sit inside their
+    /// own retry loop should prefer this to avoid redundant retries.
+    ///
+    /// On success, returns `Ok` with the **previous** value. On failure,
+    /// returns `Err` with the **current actual** value. The failure may be
+    /// spurious.
+    pub fn compare_exchange_weak<'l1, 'l2, 'g, G1, G2>(
+        &self,
+        current: &Local<'l1, G1, T>,
+        new: &Local<'l2, G2, T>,
+        success: Ordering,
+        failure: Ordering,
+        guard: &'g Guard,
+    ) -> CasResult<Local<'g, Guard, T>>
+    where
+        G1: Protector,
+        G2: Protector,
+    {
+        let r = self
+            .inner
+            .compare_exchange_weak(Some(current), Some(new), success, failure, guard);
+        match r {
+            Ok(l) | Err(l) => debug_assert!(l.is_some()),
+        }
+        // Safety: There must be no possible path to write a `None` to the inner atomic.
+        unsafe {
+            r.map(|l| l.unwrap_unchecked())
+                .map_err(|l| l.unwrap_unchecked())
+        }
+    }
+
+    tag_fn! {
+        /// Weak variant of [`compare_exchange_with_tag`](Self::compare_exchange_with_tag).
+        ///
+        /// Unlike the strong variant, this not only uses the platform's weak
+        /// compare-and-swap operation internally (which can spuriously fail on
+        /// LL/SC architectures) but also does NOT retry when the CAS fails due
+        /// to a concurrent GC metadata change. Callers that already sit inside
+        /// their own retry loop should prefer this to avoid redundant retries.
+        ///
+        /// On success, returns `Ok` with the **previous** (pointer, tag) pair.
+        /// On failure, returns `Err` with the **current actual** (pointer, tag)
+        /// pair. The failure may be spurious.
+        fn compare_exchange_weak_with_tag<'l1, 'l2, 'g, G1, G2>(
+            &self,
+            current_tag: WithTag<&Local<'l1, G1, T>>,
+            new_tag: WithTag<&Local<'l2, G2, T>>,
+            success: Ordering,
+            failure: Ordering,
+            guard: &'g Guard,
+        ) -> CasResult<WithTag<Local<'g, Guard, T>>>
+        where
+            G1: Protector,
+            G2: Protector,
+        {
+            let r = self.inner.compare_exchange_weak_with_tag(
                 (Some(current_tag.0), current_tag.1),
                 (Some(new_tag.0), new_tag.1),
                 success,
@@ -1719,15 +1924,13 @@ impl<T: TraceObj> AtomicShared<T> {
             tag: usize,
             order: Ordering,
             guard: &'g Guard,
-        ) -> (Local<'g, Guard, T>, usize) {
+        ) -> WithTag<Local<'g, Guard, T>> {
             let r = self.inner.fetch_tag_and(tag, order, guard);
             debug_assert!(r.0.is_some());
             // Safety: There must be no possible path to write a `None` to the inner atomic.
             unsafe { (r.0.unwrap_unchecked(), r.1) }
         }
-    }
 
-    tag_fn! {
         /// Atomically ORs the tag bits, returning the previous (pointer, tag) pair.
         #[inline(always)]
         fn fetch_tag_or<'g>(
@@ -1735,15 +1938,13 @@ impl<T: TraceObj> AtomicShared<T> {
             tag: usize,
             order: Ordering,
             guard: &'g Guard,
-        ) -> (Local<'g, Guard, T>, usize) {
+        ) -> WithTag<Local<'g, Guard, T>> {
             let r = self.inner.fetch_tag_or(tag, order, guard);
             debug_assert!(r.0.is_some());
             // Safety: There must be no possible path to write a `None` to the inner atomic.
             unsafe { (r.0.unwrap_unchecked(), r.1) }
         }
-    }
 
-    tag_fn! {
         /// Atomically XORs the tag bits, returning the previous (pointer, tag) pair.
         #[inline(always)]
         fn fetch_tag_xor<'g>(
@@ -1751,7 +1952,7 @@ impl<T: TraceObj> AtomicShared<T> {
             tag: usize,
             order: Ordering,
             guard: &'g Guard,
-        ) -> (Local<'g, Guard, T>, usize) {
+        ) -> WithTag<Local<'g, Guard, T>> {
             let r = self.inner.fetch_tag_xor(tag, order, guard);
             debug_assert!(r.0.is_some());
             // Safety: There must be no possible path to write a `None` to the inner atomic.
