@@ -241,7 +241,7 @@ fn scan_allocated_objs(handle: &Handle) {
         .collect();
 
     let white_color = guard.white_color();
-    let num_threads = global().sweep_threads();
+    let num_threads = global().collector_threads();
 
     // Scan all freshly allocated objects (in `fresh_objs`)
     // and mark protected ones (moving to `marked_objs`).
@@ -380,7 +380,7 @@ fn next_normal(handle: &Handle, logger: &Logger) {
 
 fn sweep(prev_white: Color, _handle: &Handle, _logger: &Logger) {
     let next_white = prev_white.flip() as usize;
-    let num_threads = global().sweep_threads();
+    let num_threads = global().collector_threads();
 
     parallel_shard_work(num_threads, |range| {
         let ebr_guard = &ebr_pin();

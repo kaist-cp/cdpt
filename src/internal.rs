@@ -71,8 +71,8 @@ pub struct Global {
     /// MSB set   = proportional mode, lower bits = divisor.
     pub(crate) headroom: AtomicUsize,
 
-    /// Number of threads used for parallel sweep (1..=OBJ_BATCHES_SHARD).
-    pub(crate) sweep_threads: AtomicUsize,
+    /// Number of threads used for parallel collection (1..=OBJ_BATCHES_SHARD).
+    pub(crate) collector_threads: AtomicUsize,
 
     #[cfg(feature = "profiling")]
     pub(crate) rc_updates: AtomicUsize,
@@ -191,7 +191,7 @@ impl Global {
             collection_enabled: CachePadded::new(AtomicBool::new(true)),
             collection_requested: CachePadded::new(AtomicBool::new(false)),
             headroom: AtomicUsize::new(HeapHeadroom::FixedMiB(1).pack()),
-            sweep_threads: AtomicUsize::new(OBJ_BATCHES_SHARD),
+            collector_threads: AtomicUsize::new(default_collector_threads()),
             #[cfg(feature = "profiling")]
             rc_updates: AtomicUsize::new(0),
         }
@@ -315,22 +315,33 @@ impl Global {
         HeapHeadroom::unpack(self.headroom.load(Ordering::Relaxed))
     }
 
-    /// Sets the number of threads used for the parallel sweep phase.
+    /// Sets the number of threads used for parallel collection.
     ///
-    /// The value is clamped to `1..=8` (the number of internal shards).
-    /// Higher values speed up reclamation but consume more CPU during
-    /// collection. Setting this to `1` disables parallel sweep entirely.
+    /// The value is clamped to `1..=8`. Higher values speed up
+    /// collection but consume more CPU. Setting this to `1` disables
+    /// parallel collection entirely.
     ///
-    /// Default: `8`.
-    pub fn set_sweep_threads(&self, count: usize) {
+    /// Default: one-eighth of available parallelism, clamped to `1..=8`
+    /// (e.g. `1` on an 8-core machine, `8` on a 64-core machine).
+    pub fn set_collector_threads(&self, count: usize) {
         let clamped = count.clamp(1, OBJ_BATCHES_SHARD);
-        self.sweep_threads.store(clamped, Ordering::Relaxed);
+        self.collector_threads.store(clamped, Ordering::Relaxed);
     }
 
-    /// Returns the current number of sweep threads.
-    pub fn sweep_threads(&self) -> usize {
-        self.sweep_threads.load(Ordering::Relaxed)
+    /// Returns the current number of collector threads.
+    pub fn collector_threads(&self) -> usize {
+        self.collector_threads.load(Ordering::Relaxed)
     }
+}
+
+/// Picks the default collector thread count: one-eighth of the available
+/// parallelism, clamped to `1..=OBJ_BATCHES_SHARD`. Falls back to `1` when
+/// the platform cannot report parallelism.
+fn default_collector_threads() -> usize {
+    let parallelism = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1);
+    (parallelism / 8).clamp(1, OBJ_BATCHES_SHARD)
 }
 
 /// Participant for garbage collection.
