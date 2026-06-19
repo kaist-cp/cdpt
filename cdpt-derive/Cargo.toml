@@ -2,6 +2,10 @@
 name = "cdpt-derive"
 version = "0.1.0"
 edition = "2024"
+license = "MIT OR Apache-2.0"
+description = "Derive macro for the TraceObj trait of the cdpt garbage collector."
+repository = "https://github.com/kaist-cp/cdpt"
+documentation = "https://docs.rs/cdpt"
 
 [lib]
 proc-macro = true
