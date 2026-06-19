@@ -20,7 +20,6 @@ use crate::{
     tls::handle,
 };
 
-use log::Logger;
 use rustc_hash::FxHashSet;
 
 #[derive(Clone)]
@@ -64,7 +63,6 @@ const LOCAL_MARK_TASKS_BATCH_LIMIT: usize = 2048;
 /// A function body for the primary collector thread.
 pub(crate) fn collector_loop() {
     let handle = handle();
-    let logger = Logger::new();
 
     // Initialize stats data and spawn the heartbeat thread that periodically samples heap stats.
     {
@@ -83,9 +81,9 @@ pub(crate) fn collector_loop() {
         let recl_at_start = global().estimate_total_reclm();
 
         // Do actual collection works.
-        logger.measure("RT", || root_tracing(&handle, &logger));
-        while logger.measure("CT", || !completion_tracing(&handle, &logger)) {}
-        logger.measure("N", || next_normal(&handle, &logger));
+        root_tracing(&handle);
+        while !completion_tracing(&handle) {}
+        next_normal(&handle);
 
         record_collection_stats(start, recl_at_start);
     }
@@ -187,15 +185,15 @@ fn smooth(factor: f64, prev: usize, curr: usize) -> usize {
     }
 }
 
-fn root_tracing(handle: &Handle, logger: &Logger) {
+fn root_tracing(handle: &Handle) {
     debug_assert!(global().load_epoch().phase() == Phase::N);
-    logger.measure("transition", || phase_trans(Phase::RT));
+    phase_trans(Phase::RT);
 
     // Before scanning:
     // * All mutators are unpinned from the normal phase.
     // * Some of them may have already observed this tracing phase, scanning their own local
     //   hazard pointers (phase barrier).
-    logger.measure("scan", || scan_allocated_objs(handle));
+    scan_allocated_objs(handle);
     // After scanning:
     // * Speaking with weak tricolor invariant, both mutators' stacks (HP) and
     //   the global region (RC) are black (rescanning isn't needed).
@@ -207,7 +205,7 @@ fn root_tracing(handle: &Handle, logger: &Logger) {
     // * For RCs, deletion barriers by mutators and scanning by the
     //   collectors guarantee that no live objects are missed.
 
-    logger.measure("drain", || drain_mark_tasks(handle));
+    drain_mark_tasks(handle);
 }
 
 fn scan_allocated_objs(handle: &Handle) {
@@ -266,17 +264,17 @@ fn scan_allocated_objs(handle: &Handle) {
     });
 }
 
-fn completion_tracing(handle: &Handle, logger: &Logger) -> bool {
+fn completion_tracing(handle: &Handle) -> bool {
     debug_assert!({
         let curr = global().epoch.load(Ordering::Acquire).phase();
         curr == Phase::RT || curr == Phase::CT
     });
-    logger.measure("transition", || phase_trans(Phase::CT));
+    phase_trans(Phase::CT);
 
-    if logger.measure("confirm", try_confirm_completion) {
+    if try_confirm_completion() {
         return true;
     }
-    logger.measure("drain", || drain_mark_tasks(handle));
+    drain_mark_tasks(handle);
     false
 }
 
@@ -359,7 +357,7 @@ fn phase_trans(new: Phase) {
     wait_all_mutators_unpin(new_epoch.timestamp());
 }
 
-fn next_normal(handle: &Handle, logger: &Logger) {
+fn next_normal(handle: &Handle) {
     let prev_epoch = global().load_epoch();
     debug_assert!(prev_epoch.phase() == Phase::CT);
     debug_assert!(find_task(handle).is_none());
@@ -372,13 +370,13 @@ fn next_normal(handle: &Handle, logger: &Logger) {
     fence(Ordering::SeqCst);
 
     // Reclaim unmarked objects from the previous cycle.
-    logger.measure("sweep", || sweep(prev_epoch.color(), handle, logger));
+    sweep(prev_epoch.color(), handle);
     // For the case of very fast execution of `sweep`, we need to check and wait
     // the unpinning of all mutators.
-    logger.measure("unpin", || wait_all_mutators_unpin(new_epoch.timestamp()));
+    wait_all_mutators_unpin(new_epoch.timestamp());
 }
 
-fn sweep(prev_white: Color, _handle: &Handle, _logger: &Logger) {
+fn sweep(prev_white: Color, _handle: &Handle) {
     let next_white = prev_white.flip() as usize;
     let num_threads = global().collector_threads();
 
@@ -495,69 +493,4 @@ fn is_collection_necessary() -> bool {
 
     // We need to start collection if we expect OOM before it ends.
     oom_time_ms <= CSTATS.coll_time_ms_smooth.load(Ordering::Relaxed)
-}
-
-#[cfg(feature = "logging")]
-mod log {
-    use std::cell::Cell;
-    use std::time::Instant;
-
-    pub struct Logger {
-        birth: Instant,
-        depth: Cell<usize>,
-        at_new_line: Cell<bool>,
-    }
-
-    impl Logger {
-        pub fn new() -> Self {
-            Self {
-                birth: Instant::now(),
-                depth: Cell::new(0),
-                at_new_line: Cell::new(true),
-            }
-        }
-
-        fn log(&self, text: &str) {
-            eprint!("[{:05}ms] {text}", self.birth.elapsed().as_millis());
-        }
-
-        pub fn measure<R>(&self, name: &str, f: impl FnOnce() -> R) -> R {
-            let depth = self.depth.get();
-            self.depth.set(depth + 1);
-            if !self.at_new_line.get() {
-                eprintln!();
-            }
-            self.log(&format!("{}{}", "  ".repeat(depth), name));
-            self.at_new_line.set(false);
-
-            let start = Instant::now();
-            let result = f();
-            let end = Instant::now();
-
-            let time_str = format!("- {}ms", (end - start).as_millis());
-            if self.at_new_line.get() {
-                self.log(&format!("{}{}\n", "  ".repeat(depth), time_str));
-            } else {
-                eprintln!("{time_str}");
-            }
-            self.at_new_line.set(true);
-            self.depth.set(depth);
-            result
-        }
-    }
-}
-
-#[cfg(not(feature = "logging"))]
-mod log {
-    pub struct Logger;
-
-    impl Logger {
-        pub fn new() -> Self {
-            Logger
-        }
-
-        pub fn measure<R>(&self, _: &str, f: impl FnOnce() -> R) -> R {
-            f()
-        }
-    }
 }

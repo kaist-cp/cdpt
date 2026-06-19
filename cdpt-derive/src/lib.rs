@@ -29,14 +29,16 @@ use syn::{Data, DeriveInput, Fields, GenericArgument, PathArguments, Type, parse
 /// will not be scanned. Use `AtomicShared` or `AtomicSharedOption` for concurrently
 /// mutable edges.
 ///
-/// # Example
+/// # Examples
 ///
-/// ```
+/// ```ignore
+/// use cdpt::*;
+///
 /// #[derive(TraceObj)]
 /// struct Node {
-///     value: usize,                       // skipped (no managed pointers)
-///     next: AtomicSharedOption<Node>,     // traced
-///     children: Vec<Shared<Node>>,        // traced
+///     value: usize,                   // not a managed pointer: ignored
+///     next: AtomicSharedOption<Node>, // traced
+///     children: Vec<Shared<Node>>,    // traced through the `Vec`
 /// }
 /// ```
 #[proc_macro_derive(TraceObj)]

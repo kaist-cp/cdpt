@@ -1,7 +1,7 @@
 //! A lock-free, insert-only hash set with fixed capacity.
 //!
 //! [`FixedHashSet`] is a concurrent hash set backed by a flat array of atomic
-//! pointers.  It supports only insertion and lookup — entries are never removed
+//! pointers. It supports only insertion and lookup; entries are never removed
 //! or reclaimed, which eliminates the need for a memory reclamation scheme.
 //!
 //! # Design
@@ -20,24 +20,6 @@
 //! The capacity `N` is fixed at construction time (as a const generic).  It
 //! **must** be a power of two so that index masking works correctly.  The set
 //! panics on insertion if the table is full.
-//!
-//! # Example
-//!
-//! ```
-//! use cdpt::sync::hash_set::FixedHashSet;
-//!
-//! static SET: FixedHashSet<u64, 16> = FixedHashSet::new();
-//!
-//! // First insertion returns (ref, true).
-//! let (val, inserted) = SET.get_or_insert(42);
-//! assert_eq!(*val, 42);
-//! assert!(inserted);
-//!
-//! // Duplicate returns (ref_to_existing, false).
-//! let (val2, inserted2) = SET.get_or_insert(42);
-//! assert!(!inserted2);
-//! assert!(std::ptr::eq(val, val2)); // same allocation
-//! ```
 
 use std::{
     hash::{DefaultHasher, Hash, Hasher},
@@ -164,16 +146,13 @@ impl<T: Hash + Eq, const N: usize> FixedHashSet<T, N> {
         }
     }
 
-    /// Inserts `key` into the set.
-    ///
-    /// Returns `true` if the key was newly inserted, `false` if it was already
-    /// present.
-    pub fn insert(&self, key: T) -> bool {
+    #[cfg(test)]
+    fn insert(&self, key: T) -> bool {
         self.get_or_insert(key).1
     }
 
-    /// Returns `true` if the set contains the given key.
-    pub fn contains(&self, key: &T) -> bool {
+    #[cfg(test)]
+    fn contains(&self, key: &T) -> bool {
         debug_assert!(N.is_power_of_two(), "N must be a power of two");
         let mask = N - 1;
         let hash = Self::hash_key(key);

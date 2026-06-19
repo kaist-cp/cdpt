@@ -766,20 +766,6 @@ fn atomic_shared_compare_exchange_failure() {
 }
 
 #[test]
-fn atomic_shared_take() {
-    let guard = pin();
-    let a = AtomicShared::new(
-        SimpleNode {
-            value: 77,
-            next: AtomicSharedOption::none(),
-        },
-        &guard,
-    );
-    let taken = a.take(Ordering::SeqCst, &guard);
-    assert_eq!(taken.value, 77);
-}
-
-#[test]
 #[cfg(feature = "tag")]
 fn atomic_shared_load_with_tag() {
     let guard = pin();

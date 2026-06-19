@@ -21,14 +21,28 @@ const HELP_TRACING_MAX_TRIAL: usize = 4;
 
 /// A thread-local handle to the garbage collector.
 ///
-/// Obtain one via [`handle()`](crate::handle). A `Handle` is cheap to clone
-/// (reference-counted) and is used for two purposes:
+/// Obtain one with [`handle()`](crate::handle). A `Handle` is cheap to clone
+/// (it is reference-counted) and serves two purposes:
 ///
-/// 1. **Accessing the managed heap** — call [`pin()`](Handle::pin) to get a
+/// 1. **Accessing the managed heap.** Call [`pin()`](Handle::pin) to get a
 ///    [`Guard`] that lets you allocate, load, and dereference managed pointers.
-/// 2. **Extending pointer lifetimes** — pass a `Handle` to
-///    [`Local::protect`](crate::Local::protect) to keep a reference alive after
-///    its [`Guard`] is dropped, using hazard-pointer protection.
+/// 2. **Extending pointer lifetimes.** Pass it to
+///    [`Local::protect`](crate::Local::protect) to keep a reference alive past
+///    its [`Guard`] with hazard-pointer protection.
+///
+/// # Examples
+///
+/// ```
+/// # use cdpt::*;
+/// # #[derive(TraceObj)]
+/// # struct Node { value: i32 }
+/// let handle = handle();
+/// let guard = handle.pin();
+/// let node = Local::new(Node { value: 1 }, &guard);
+/// let kept = node.protect(&handle); // outlives the guard
+/// drop(guard);
+/// assert_eq!(kept.value, 1);
+/// ```
 #[derive(Clone)]
 pub struct Handle {
     pub(crate) local: Rc<Entry<Local>>,
@@ -46,6 +60,16 @@ impl Handle {
     /// pointers, and freely dereference any [`Local`](crate::Local) obtained
     /// from those loads. Internally, this pins the current thread to the global
     /// epoch (entering a *phase-critical section*).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use cdpt::*;
+    /// let handle = handle();
+    /// let guard = handle.pin();
+    /// // ... access the managed heap through `guard` ...
+    /// drop(guard);
+    /// ```
     #[inline]
     pub fn pin(&self) -> Guard {
         let guard = Guard::new(self.local.clone());
@@ -53,8 +77,20 @@ impl Handle {
         guard
     }
 
-    /// Returns `true` if this handle's thread is currently pinned (i.e., a
-    /// [`Guard`] obtained from this handle is alive).
+    /// Returns `true` if this handle's thread is currently pinned, that is, if a
+    /// [`Guard`] obtained from this handle is alive.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use cdpt::*;
+    /// let handle = handle();
+    /// assert!(!handle.is_pinned());
+    /// let guard = handle.pin();
+    /// assert!(handle.is_pinned());
+    /// drop(guard);
+    /// assert!(!handle.is_pinned());
+    /// ```
     #[inline]
     pub fn is_pinned(&self) -> bool {
         self.local().is_pinned()
@@ -62,51 +98,56 @@ impl Handle {
 
     /// Voluntarily assists the collector with pending work.
     ///
-    /// Useful in long-running threads that rarely allocate — calling this
-    /// periodically helps the GC make progress. Internally pins the thread
-    /// briefly.
+    /// Useful in long-running threads that rarely allocate: calling it
+    /// periodically helps the collector make progress. It pins the thread
+    /// briefly for the duration of the call.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use cdpt::*;
+    /// let handle = handle();
+    /// handle.help_collect();
+    /// ```
     #[inline]
     pub fn help_collect(&self) {
         self.pin().help_collect();
     }
 }
 
-/// Grants access to the managed heap for the current thread.
+/// Grants the current thread access to the managed heap.
 ///
-/// Create one via [`pin()`](crate::pin) or [`Handle::pin`]. While a `Guard` is
-/// alive, you can allocate managed objects, load atomic pointers, and dereference
-/// the resulting [`Local`](crate::Local) references.
-///
-/// # Typical usage
-///
-/// ```ignore
-/// let guard = cdpt::pin();            // start accessing the managed heap
-/// let local = some_atomic.load(Ordering::Acquire, &guard);
-/// println!("{}", *local);             // safe dereference
-/// // guard dropped here → collector can make progress
-/// ```
+/// Obtain one with [`pin()`](crate::pin) or [`Handle::pin`]. While the guard is
+/// alive you can allocate managed objects, load atomic pointers, and
+/// dereference the resulting [`Local`](crate::Local) references. A `Guard` is
+/// **not a lock**: any number of threads may hold their own guards at once. It
+/// only marks the thread as actively using the heap so the collector does not
+/// reclaim anything the thread might still reach, much like the read side of an
+/// RCU critical section.
 ///
 /// # Keep guards short-lived
 ///
-/// A long-lived `Guard` prevents the collector from reclaiming garbage.
-/// Drop the guard as soon as you no longer need to load new pointers.
-/// If you need a reference that outlives the guard, promote it to either:
-/// - [`Local<Handle, T>`](crate::Local) via [`Local::protect`](crate::Local::protect)
-///   (hazard-pointer–protected), or
-/// - [`Shared<T>`](crate::Shared) via [`Local::as_shared`](crate::Local::as_shared)
-///   (root-count–protected).
+/// A long-lived guard prevents the collector from reclaiming garbage, so drop
+/// it as soon as you stop loading new pointers. To keep a reference past the
+/// guard, promote it to a [`Local<Handle, T>`](crate::Local) with
+/// [`Local::protect`](crate::Local::protect) (hazard-pointer protected) or to a
+/// [`Shared<T>`](crate::Shared) with [`Local::as_shared`](crate::Local::as_shared)
+/// (root-count protected). The `Local<Handle, T>` form is generally cheaper to
+/// create.
 ///
-/// `Local<Handle, T>` is generally cheaper to create than `Shared<T>`,
-/// because it is based on thread-local hazard-pointer protection.
+/// # Examples
 ///
-/// # How it works
-///
-/// A `Guard` pins the current thread to the global epoch, entering a
-/// *phase-critical section*. This is **not a lock** — any number of threads
-/// may hold their own `Guard`s concurrently. The section only tells the
-/// collector that this thread is actively accessing the managed heap, so
-/// that phase transitions can be coordinated safely (similar to RCU's
-/// read-side critical section).
+/// ```
+/// # use cdpt::*;
+/// # use std::sync::atomic::Ordering;
+/// # #[derive(TraceObj)]
+/// # struct Node { value: i32 }
+/// let guard = pin();                                // enter a critical section
+/// let cell = AtomicShared::new(Node { value: 1 }, &guard);
+/// let node = cell.load(Ordering::Acquire, &guard);  // load a pointer
+/// assert_eq!(node.value, 1);                         // dereference it
+/// drop(guard);                                       // let the collector proceed
+/// ```
 pub struct Guard {
     local: Rc<Entry<Local>>,
     should_help: Cell<bool>,
@@ -130,6 +171,17 @@ impl Guard {
     /// (see the [struct-level docs](Guard#keep-guards-short-lived)).
     ///
     /// Only effective when this is the sole active guard for the current thread.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use cdpt::*;
+    /// let mut guard = pin();
+    /// for _ in 0..3 {
+    ///     // ... a chunk of work using `&guard` ...
+    ///     guard.repin(); // let the collector make progress between chunks
+    /// }
+    /// ```
     pub fn repin(&mut self) {
         self.help_collect_if_scheduled();
         self.local().repin();
@@ -214,8 +266,17 @@ impl Guard {
     /// Voluntarily assists the collector with pending work.
     ///
     /// Called automatically during intensive allocation, but you can invoke it
-    /// explicitly in long-running operations to help the GC make progress
-    /// (e.g., sweeping dead objects or tracing live ones).
+    /// explicitly in long-running operations to help the collector make
+    /// progress, for example sweeping dead objects or tracing live ones.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use cdpt::*;
+    /// let guard = pin();
+    /// // In a long loop that rarely allocates, lend the collector a hand.
+    /// guard.help_collect();
+    /// ```
     pub fn help_collect(&self) {
         match self.phase() {
             Phase::N => self.help_normal(),

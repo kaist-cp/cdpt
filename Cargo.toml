@@ -28,9 +28,7 @@ tikv-jemallocator = "0.5"
 tikv-jemalloc-ctl = { version = "0.5", features = ["use_std"] }
 
 [features]
-logging = []
 tag = []
-profiling = []
 
 [[example]]
 name = "lists"

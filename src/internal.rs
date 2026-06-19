@@ -27,20 +27,29 @@ const HAZARDS_INIT_COUNT: usize = 8;
 const ALLOC_HELPING_PERIOD: usize = 64;
 const SCHED_HELPING_PERIOD: usize = 32;
 
-/// Global state of the garbage collector, providing configuration and
-/// profiling.
+/// Global configuration and statistics for the garbage collector.
 ///
-/// Obtain the singleton instance via [`global()`](crate::global). Most
-/// users only need [`pin()`](crate::pin) and [`handle()`](crate::handle);
-/// use `Global` when you need to toggle collection or monitor heap usage.
+/// Obtain the singleton with [`global()`](crate::global). Most programs never
+/// need it, since collection runs automatically. Reach for it to pause or force
+/// collection, tune the heap headroom or collector parallelism, or read coarse
+/// heap statistics.
+///
+/// # Examples
+///
+/// ```
+/// use cdpt::*;
+///
+/// let g = global();
+/// g.set_heap_headroom(HeapHeadroom::FixedMiB(4)); // trade memory for CPU
+/// println!("heap usage: {} bytes", g.estimate_heap_usage());
+/// ```
 ///
 /// # Heap size estimation
 ///
-/// The `estimate_*` methods track bytes allocated and reclaimed based on
-/// [`std::mem::size_of`] of each managed object. This means heap allocations
-/// owned *inside* a managed type (e.g., a `String`'s buffer) are **not**
-/// accounted for — the reported sizes reflect only the shallow size of
-/// each object.
+/// The `estimate_*` methods count bytes using [`std::mem::size_of`] of each
+/// managed object, so memory owned *inside* an object (for example a `String`'s
+/// buffer) is not included. The figures reflect only the shallow size of each
+/// managed object.
 pub struct Global {
     /// The intrusive linked list of `Local`s.
     pub(crate) locals: CachePadded<ReusableSlots<Local>>,
@@ -73,18 +82,28 @@ pub struct Global {
 
     /// Number of threads used for parallel collection (1..=OBJ_BATCHES_SHARD).
     pub(crate) collector_threads: AtomicUsize,
-
-    #[cfg(feature = "profiling")]
-    pub(crate) rc_updates: AtomicUsize,
 }
 
-/// Controls the minimum heap headroom that must be exceeded before the
-/// collector triggers the next cycle.
+/// Controls how much headroom the collector leaves before starting the next
+/// cycle.
 ///
-/// After each collection the collector computes a minimum extra headroom and
-/// will not start a new cycle until `heap_usage` grows beyond
-/// `post_collection_usage + headroom`.  This enum selects how that minimum is
-/// determined.
+/// After each collection the collector picks a minimum extra headroom and waits
+/// to start the next cycle until heap usage grows beyond
+/// `post_collection_usage + headroom`. This enum selects how that minimum is
+/// computed: a larger headroom collects less often (less CPU, higher peak
+/// memory), a smaller one collects sooner (more CPU, lower peak memory).
+///
+/// # Examples
+///
+/// ```
+/// use cdpt::*;
+///
+/// // Keep at least 8 MiB of headroom.
+/// global().set_heap_headroom(HeapHeadroom::FixedMiB(8));
+///
+/// // Or scale headroom with the live set: heap_usage / 4.
+/// global().set_heap_headroom(HeapHeadroom::Proportional(4));
+/// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HeapHeadroom {
     /// Fixed minimum headroom in mebibytes.
@@ -192,8 +211,6 @@ impl Global {
             collection_requested: CachePadded::new(AtomicBool::new(false)),
             headroom: AtomicUsize::new(HeapHeadroom::FixedMiB(1).pack()),
             collector_threads: AtomicUsize::new(default_collector_threads()),
-            #[cfg(feature = "profiling")]
-            rc_updates: AtomicUsize::new(0),
         }
     }
 
@@ -256,6 +273,14 @@ impl Global {
     ///
     /// When disabled, the collector thread will not reclaim any objects.
     /// Collection is enabled by default.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use cdpt::*;
+    /// global().enable_collection(false); // pause collection
+    /// global().enable_collection(true);  // resume
+    /// ```
     pub fn enable_collection(&self, set: bool) {
         self.collection_enabled.store(set, Ordering::SeqCst);
     }
@@ -265,23 +290,28 @@ impl Global {
     /// The collector thread will run one cycle as soon as possible, regardless
     /// of current heap pressure. Useful in tests to force garbage collection
     /// of recently dropped objects.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use cdpt::*;
+    /// global().request_collection(); // ask the collector to run a cycle soon
+    /// ```
     pub fn request_collection(&self) {
         self.collection_requested.store(true, Ordering::SeqCst);
-    }
-
-    #[cfg(feature = "profiling")]
-    pub fn rc_updates(&self) -> usize {
-        self.rc_updates.load(Ordering::Relaxed)
-    }
-
-    #[cfg(feature = "profiling")]
-    pub fn reset_rc_updates(&self) {
-        self.rc_updates.store(0, Ordering::Relaxed);
     }
 
     /// Returns the total bytes allocated on the managed heap since program
     /// start. See [struct-level docs](Global#heap-size-estimation) for
     /// accuracy caveats.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use cdpt::*;
+    /// let allocated = global().estimate_total_alloc();
+    /// println!("allocated {allocated} bytes so far");
+    /// ```
     pub fn estimate_total_alloc(&self) -> usize {
         self.stats.total_allocated.load(Ordering::Acquire)
     }
@@ -289,12 +319,28 @@ impl Global {
     /// Returns the total bytes reclaimed by the collector since program
     /// start. See [struct-level docs](Global#heap-size-estimation) for
     /// accuracy caveats.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use cdpt::*;
+    /// let reclaimed = global().estimate_total_reclm();
+    /// println!("reclaimed {reclaimed} bytes so far");
+    /// ```
     pub fn estimate_total_reclm(&self) -> usize {
         self.stats.total_reclaimed.load(Ordering::Acquire)
     }
 
     /// Returns the estimated current managed-heap size in bytes
     /// (allocated - reclaimed, saturating at zero).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use cdpt::*;
+    /// let live = global().estimate_heap_usage();
+    /// println!("approximately {live} bytes live");
+    /// ```
     pub fn estimate_heap_usage(&self) -> usize {
         let allocated = self.estimate_total_alloc();
         let reclaimed = self.estimate_total_reclm();
@@ -306,11 +352,26 @@ impl Global {
     /// See [`HeapHeadroom`] for details on each variant.
     ///
     /// Default: `HeapHeadroom::FixedMiB(1)`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use cdpt::*;
+    /// global().set_heap_headroom(HeapHeadroom::FixedMiB(4));
+    /// ```
     pub fn set_heap_headroom(&self, headroom: HeapHeadroom) {
         self.headroom.store(headroom.pack(), Ordering::Relaxed);
     }
 
     /// Returns the current heap-headroom strategy.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use cdpt::*;
+    /// global().set_heap_headroom(HeapHeadroom::Proportional(8));
+    /// assert_eq!(global().heap_headroom(), HeapHeadroom::Proportional(8));
+    /// ```
     pub fn heap_headroom(&self) -> HeapHeadroom {
         HeapHeadroom::unpack(self.headroom.load(Ordering::Relaxed))
     }
@@ -323,12 +384,27 @@ impl Global {
     ///
     /// Default: one-eighth of available parallelism, clamped to `1..=8`
     /// (e.g. `1` on an 8-core machine, `8` on a 64-core machine).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use cdpt::*;
+    /// global().set_collector_threads(4);
+    /// ```
     pub fn set_collector_threads(&self, count: usize) {
         let clamped = count.clamp(1, OBJ_BATCHES_SHARD);
         self.collector_threads.store(clamped, Ordering::Relaxed);
     }
 
     /// Returns the current number of collector threads.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use cdpt::*;
+    /// global().set_collector_threads(2);
+    /// assert_eq!(global().collector_threads(), 2);
+    /// ```
     pub fn collector_threads(&self) -> usize {
         self.collector_threads.load(Ordering::Relaxed)
     }
@@ -348,9 +424,6 @@ fn default_collector_threads() -> usize {
 pub(crate) struct Local {
     /// The number of guards keeping this participant pinned.
     guard_count: Cell<usize>,
-
-    #[cfg(feature = "profiling")]
-    unpin_count: Cell<usize>,
 
     /// The epoch that this local thread observed most recently.
     last_observed: Cell<Epoch>,
@@ -434,8 +507,6 @@ impl Default for Local {
 
         Self {
             guard_count: Cell::new(0),
-            #[cfg(feature = "profiling")]
-            unpin_count: Cell::new(0),
             last_observed: Cell::new(Epoch::starting()),
             alloc_count: Cell::new(0),
             sched_count: Cell::new(0),
@@ -515,18 +586,6 @@ impl Local {
         if guard_count == 1 {
             // This is the last guard. This thread will be unpinned.
             self.epoch.store(Epoch::starting(), Ordering::Release);
-
-            #[cfg(feature = "profiling")]
-            {
-                self.unpin_count.set(self.unpin_count.get() + 1);
-                if self.unpin_count.get() % 128 == 0 {
-                    let count = crate::pointers::RC_UPDATE_COUNTER.get();
-                    if count > 0 {
-                        global().rc_updates.fetch_add(count, Ordering::Relaxed);
-                        crate::pointers::RC_UPDATE_COUNTER.set(0);
-                    }
-                }
-            }
         }
     }
 

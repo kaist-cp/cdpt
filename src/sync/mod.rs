@@ -1,4 +1,8 @@
-pub mod hash_set;
+//! Concurrent data structures used internally by the collector.
+//!
+//! Nothing here is part of the public API.
+
+pub(crate) mod hash_set;
 mod queue;
 mod reusable_slots;
 

@@ -2,11 +2,11 @@
 //!
 //! This module provides four pointer types, each suited to a different role:
 //!
-//! - [`Local`] — the only dereferenceable pointer; scoped to a [`Guard`] or
-//!   [`Handle`](crate::Handle).
-//! - [`Shared`] — an immutable, `Send + Sync`, root-counted reference (like `Arc<T>`).
-//! - [`AtomicShared`] — a non-nullable atomic pointer for concurrently mutable edges.
-//! - [`AtomicSharedOption`] — like `AtomicShared`, but nullable.
+//! - [`Local`]: an uncounted reference you can dereference, scoped to a
+//!   [`Guard`] or [`Handle`](crate::Handle).
+//! - [`Shared`]: an immutable, `Send + Sync`, root-counted reference (like `Arc<T>`).
+//! - [`AtomicShared`]: a non-nullable atomic pointer for concurrently mutable edges.
+//! - [`AtomicSharedOption`]: like `AtomicShared`, but nullable.
 //!
 //! See the [crate-level docs](crate) for a quick-start guide and comparison table.
 
@@ -28,11 +28,6 @@ use std::{
     ptr::{NonNull, null_mut},
     sync::atomic::{AtomicPtr, AtomicU32, AtomicUsize, Ordering},
 };
-
-#[cfg(feature = "profiling")]
-thread_local! {
-    pub static RC_UPDATE_COUNTER: std::cell::Cell<usize> = std::cell::Cell::new(0);
-}
 
 // ── Type registry for type-erased shade functions ───────────────────────────
 //
@@ -74,22 +69,44 @@ const_assert!(63 - TYPE_ID_BITS >= 32);
 /// Type-erased shade function: given a ManObj pointer, shade its outgoing edges.
 type ShadePointeeFn = unsafe fn(mobj_ptr: *mut (), guard: &Guard);
 
-/// A payload bundled with the low-bit pointer tag: `(value, tag_bits)`.
+/// A value paired with the low-bit tag carried in a pointer: `(value, tag)`.
 ///
-/// Used as the input or output type of `*_with_tag` APIs on [`AtomicShared`] /
-/// [`AtomicSharedOption`] — e.g. the return type of `load_with_tag` /
-/// `swap_with_tag` / `fetch_tag_*`, or the argument type of
-/// `compare_exchange_with_tag`. `tag_bits` is the low-bit tag carried in the
-/// pointer metadata.
+/// This is the input or output type of the tag-aware APIs on [`AtomicShared`]
+/// and [`AtomicSharedOption`], such as the return type of `load_with_tag` and
+/// `fetch_tag_or`, or the argument type of `compare_exchange_with_tag`. The
+/// `tag` occupies the low pointer bits that are free because of alignment, and
+/// is commonly used to mark a node (for example, to flag it as logically
+/// deleted in a lock-free list).
+///
+/// Only available with the `tag` feature.
 #[cfg(feature = "tag")]
 pub type WithTag<L> = (L, usize);
 
 #[cfg(not(feature = "tag"))]
 pub(crate) type WithTag<L> = (L, usize);
 
-/// Outcome of a fallible CAS-style RMW. `Ok` carries the previous value;
-/// `Err` carries the current actual value. Both branches share the same
+/// The result of a compare-and-exchange operation.
+///
+/// `Ok` holds the previous value (which equals the expected `current`), and
+/// `Err` holds the value that was actually found. Both variants carry the same
 /// payload type, matching [`std::sync::atomic::AtomicPtr::compare_exchange`].
+///
+/// # Examples
+///
+/// ```
+/// # use cdpt::*;
+/// # use std::sync::atomic::Ordering;
+/// # #[derive(TraceObj)]
+/// # struct Node { value: i32 }
+/// # let guard = pin();
+/// let cell = AtomicShared::new(Node { value: 1 }, &guard);
+/// let current = cell.load(Ordering::Acquire, &guard);
+/// let new = Local::new(Node { value: 2 }, &guard);
+/// match cell.compare_exchange(&current, &new, Ordering::AcqRel, Ordering::Acquire, &guard) {
+///     Ok(prev) => assert_eq!(prev.value, 1),       // the previous value
+///     Err(actual) => println!("changed: {}", actual.value),
+/// }
+/// ```
 pub type CasResult<L> = Result<L, L>;
 
 /// Outcome of the cold rooted branch of the strong CAS path: either a
@@ -327,8 +344,6 @@ impl AtomicObjMeta {
 
     #[inline(always)]
     pub fn increment_root_count(&self, order: Ordering) -> usize {
-        #[cfg(feature = "profiling")]
-        RC_UPDATE_COUNTER.set(RC_UPDATE_COUNTER.get() + 1);
         let prev = ObjMeta::from(self.0.fetch_add(1, order)).root_count();
         debug_assert!(prev < ObjMeta::ROOT_COUNT_MASK);
         prev
@@ -336,8 +351,6 @@ impl AtomicObjMeta {
 
     #[inline(always)]
     pub fn decrement_root_count(&self, order: Ordering) -> usize {
-        #[cfg(feature = "profiling")]
-        RC_UPDATE_COUNTER.set(RC_UPDATE_COUNTER.get() + 1);
         let prev = ObjMeta::from(self.0.fetch_sub(1, order)).root_count();
         debug_assert!(prev > 0);
         prev
@@ -420,6 +433,12 @@ pub(crate) enum PtrMeta {
     Unrooted(Color),
 }
 
+/// A raw, tagged pointer to a managed object.
+///
+/// `ManPtr` is a low-level handle that appears only in the [`Protector`] trait.
+/// It is opaque: it has no public constructors or methods, and you never create
+/// or dereference one directly. Use the managed pointer types ([`Local`],
+/// [`Shared`], [`AtomicShared`], [`AtomicSharedOption`]) instead.
 pub struct ManPtr<T> {
     // Note: Intentionally not used `*mut ManObj<T>` here, to prevent
     // mistakenly dereferencing this pointer. It must be untagged properly
@@ -658,34 +677,81 @@ impl<T: TraceObj> ManPtr<T> {
     }
 }
 
-/// Per-field tracing interface for GC-managed pointer fields.
+/// The collector's per-field interface, implemented by every managed pointer
+/// type: [`Shared`], [`AtomicShared`], and [`AtomicSharedOption`].
 ///
-/// Implemented by [`Shared`], [`AtomicShared`], [`AtomicSharedOption`].
-/// You typically don't call these methods directly —
-/// they are invoked by the `#[derive(TraceObj)]` macro's generated code.
+/// You rarely call or implement this directly. `#[derive(TraceObj)]` generates
+/// the calls, invoking [`unroot`](Self::unroot) and [`shade`](Self::shade) on
+/// each managed-pointer field of your type. Implement it by hand only when you
+/// write a manual [`TraceObj`](trait@TraceObj), as shown below.
+///
+/// # Examples
+///
+/// ```
+/// use cdpt::*;
+///
+/// struct Pair {
+///     left: Shared<Leaf>,
+///     right: AtomicSharedOption<Leaf>,
+/// }
+/// # #[derive(TraceObj)]
+/// # struct Leaf { v: i32 }
+///
+/// // What `#[derive(TraceObj)]` writes for you: forward to each field.
+/// impl TraceObj for Pair {
+///     unsafe fn unroot_outgoings(&self, guard: &Guard) {
+///         self.left.unroot(guard);
+///         self.right.unroot(guard);
+///     }
+///     unsafe fn shade_outgoings(&self, guard: &Guard) {
+///         self.left.shade(guard);
+///         self.right.shade(guard);
+///     }
+/// }
+/// ```
 pub trait TracePtr {
-    /// Decrements the root count when the parent object is *boxed* (becomes a
-    /// heap edge rather than a root).
+    /// Decrements the root count of the pointee when the parent object is
+    /// *boxed*, that is, when it becomes a heap edge rather than a root.
     fn unroot(&self, guard: &Guard);
 
-    /// Shades the pointee and flips this pointer's color to black during tracing.
+    /// Shades the pointee and flips this pointer to the black color during
+    /// tracing, propagating the mark to reachable objects.
     fn shade(&self, guard: &Guard);
 }
 
-/// Any type stored in the managed heap must implement this trait.
+/// A type that can live on the managed heap.
 ///
-/// Use `#[derive(TraceObj)]` — manual implementations are rarely needed. The
-/// derive macro automatically enumerates all [`Shared`], [`AtomicShared`], and
-/// [`AtomicSharedOption`] fields (including those inside `Option`, `Vec`, `Box`,
-/// tuples, etc.) and generates the required tracing methods.
+/// Every type you allocate with CDPT must implement `TraceObj`. In almost all
+/// cases you derive it. `#[derive(TraceObj)]` enumerates the [`Shared`],
+/// [`AtomicShared`], and [`AtomicSharedOption`] fields of your type (including
+/// those nested in `Option`, `Vec`, `Box`, tuples, and the like) and generates
+/// the tracing methods, so you never call them yourself. Write a manual
+/// implementation only in unusual cases; see [`TracePtr`] for what one looks
+/// like.
 ///
-/// # Safety (for method implementors)
+/// The `'static + Sync + Send` bound is required because managed objects are
+/// shared between your threads and the collector.
 ///
-/// Implementations **must not** scan through interiorly mutable wrappers
-/// (e.g., `Mutex<Shared<T>>`). If a field is behind interior mutability, a
-/// mutator could move the pointer out concurrently, causing the collector to
-/// miss a root. Use [`AtomicShared`] or [`AtomicSharedOption`] for concurrently
-/// mutable edges instead.
+/// # Examples
+///
+/// ```
+/// use cdpt::*;
+///
+/// #[derive(TraceObj)]
+/// struct Node {
+///     value: i32,                     // not a managed pointer: ignored
+///     next: AtomicSharedOption<Node>, // traced
+///     tags: Vec<Shared<Node>>,        // traced through the `Vec`
+/// }
+/// ```
+///
+/// # Safety (for manual implementors)
+///
+/// A hand-written implementation **must not** scan through an interiorly
+/// mutable wrapper (for example `Mutex<Shared<T>>`). If a managed pointer sits
+/// behind interior mutability, a thread could move it out while the collector
+/// reads it, causing a missed root. Use [`AtomicShared`] or
+/// [`AtomicSharedOption`] for concurrently mutable edges instead.
 pub trait TraceObj: 'static + Sync + Send {
     /// Calls [`TracePtr::unroot`] on every outgoing managed pointer field.
     ///
@@ -709,8 +775,12 @@ pub trait TraceObj: 'static + Sync + Send {
     unsafe fn shade_outgoings(&self, guard: &Guard);
 }
 
-/// Implements `TraceObj` with empty implementations.
-#[macro_export]
+// Implements `TraceObj` (empty bodies) for the primitive and foreign `std` leaf
+// types listed below. Internal on purpose: outside this crate the orphan rule
+// allows it only on local types, and for those `#[derive(TraceObj)]` is the
+// right tool, since it also emits the empty `Drop` that forbids finalizers
+// (which CDPT does not support). Exposing this macro would let a managed type
+// keep a custom destructor, bypassing that guard.
 macro_rules! empty_trace_impl {
     ($($T:ty),*) => {
         $(
@@ -807,31 +877,40 @@ impl<T: TraceObj> MarkObj for ManObj<T> {
     }
 }
 
-/// A nullable, atomic, root-count-protected pointer to a managed object.
+/// A nullable atomic pointer to a managed object, the primary *mutable edge*
+/// for building concurrent data structures.
 ///
-/// This is the primary *mutable edge* type for building concurrent data
-/// structures. It behaves like `AtomicPtr` but with integrated GC barriers:
+/// Think of it as an `AtomicPtr<T>` that the garbage collector understands. It
+/// can be loaded, stored, swapped, and compare-exchanged from any thread, and
+/// every update applies the collector's write barriers for you, so the data
+/// structure stays safe while collection runs concurrently. Use [`AtomicShared`]
+/// instead for an edge that can never be null.
 ///
-/// - **Nullable** — can hold `None` (use [`AtomicShared`] for the non-nullable
-///   variant).
-/// - **Atomic** — supports `load`, `store`, `swap`, and `compare_exchange`,
-///   each requiring a [`Guard`] to maintain the tricolor invariant.
-/// - **Root-counted** — when first created (e.g., via [`some`](Self::some)),
-///   the target has root count = 1. Once stored as a heap edge (inside another
-///   managed object), the root count is decremented by `unroot_outgoings`.
+/// While it holds a value the pointer keeps that object alive (it owns a root
+/// count). Storing it as a field of another managed object turns it into an
+/// internal heap edge, after which the object is kept alive by reachability
+/// rather than by the count. Every load takes a [`Guard`] and returns a
+/// guard-scoped [`Local`] that dereferences to `&T`.
 ///
-/// # Example
+/// # Examples
 ///
-/// ```ignore
+/// ```
+/// use cdpt::*;
+/// use std::sync::atomic::Ordering;
+///
 /// #[derive(TraceObj)]
 /// struct Node {
-///     next: AtomicSharedOption<Node>,  // nullable, concurrently mutable
+///     value: i32,
+///     next: AtomicSharedOption<Node>, // nullable, concurrently mutable
 /// }
+///
+/// let guard = pin();
+/// let head = AtomicSharedOption::some(
+///     Node { value: 1, next: AtomicSharedOption::none() },
+///     &guard,
+/// );
+/// assert_eq!(head.load(Ordering::Acquire, &guard).unwrap().value, 1);
 /// ```
-/// The `T` parameter is unconstrained on the struct, allowing types that
-/// contain `AtomicSharedOption<T>` to avoid requiring `T: TraceObj` on their
-/// own struct definitions. The `TraceObj` bound is instead required on all
-/// impl blocks that allocate or dereference managed objects.
 pub struct AtomicSharedOption<T> {
     link: AtomicPtr<()>,
     _marker: PhantomData<*mut T>,
@@ -857,15 +936,24 @@ impl<T> Default for AtomicSharedOption<T> {
 }
 
 impl<T> AtomicSharedOption<T> {
-    /// Creates a null (empty) atomic pointer. This is a `const` function, so
-    /// it can be used in static or field initializers.
+    /// Creates an empty (null) pointer.
     ///
-    /// The returned value is **zero-initialized** (all bytes are `0x00`),
-    /// which means arrays of `AtomicSharedOption` can be safely created with
-    /// `zeroed()` or equivalent zero-fill operations.
+    /// This is a `const fn`, so it can initialize `static` items and struct
+    /// fields, and it needs no [`Guard`] because nothing is allocated. The
+    /// result is zero-initialized (all bytes `0x00`), so arrays of
+    /// `AtomicSharedOption` can be created with a plain zero fill.
     ///
-    /// This method does not require `T: TraceObj` because no managed object
-    /// is allocated — the pointer is simply null.
+    /// # Examples
+    ///
+    /// ```
+    /// # use cdpt::*;
+    /// # use std::sync::atomic::Ordering;
+    /// # #[derive(TraceObj)]
+    /// # struct Node { value: i32, next: AtomicSharedOption<Node> }
+    /// let guard = pin();
+    /// let slot = AtomicSharedOption::<Node>::none();
+    /// assert!(slot.load(Ordering::Acquire, &guard).is_none());
+    /// ```
     #[inline(always)]
     pub const fn none() -> Self {
         // Rooted meta = 0b00, null pointer = 0x0, so this is all-zero.
@@ -893,9 +981,26 @@ impl<T> AtomicSharedOption<T> {
 }
 
 impl<T: TraceObj> AtomicSharedOption<T> {
-    /// Allocates a new managed object and wraps it in a nullable atomic pointer.
+    /// Allocates `item` on the managed heap and returns a pointer to it.
     ///
-    /// The returned pointer holds a root count of 1 on the new object.
+    /// The new pointer holds a root count of 1 on the object, so it stays alive
+    /// until this `AtomicSharedOption` is overwritten, cleared, or stored as a
+    /// heap edge of another managed object.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use cdpt::*;
+    /// # use std::sync::atomic::Ordering;
+    /// # #[derive(TraceObj)]
+    /// # struct Node { value: i32, next: AtomicSharedOption<Node> }
+    /// let guard = pin();
+    /// let slot = AtomicSharedOption::some(
+    ///     Node { value: 7, next: AtomicSharedOption::none() },
+    ///     &guard,
+    /// );
+    /// assert_eq!(slot.load(Ordering::Acquire, &guard).unwrap().value, 7);
+    /// ```
     #[inline(always)]
     pub fn some(item: T, guard: &Guard) -> Self {
         let ptr = ManPtr::alloc_rooted(item, guard.alloc_color(), 1, guard);
@@ -916,10 +1021,27 @@ impl<T: TraceObj> AtomicSharedOption<T> {
         }
     }
 
-    /// Reads the current pointer value.
+    /// Loads the current value, returning `None` if the pointer is null.
     ///
-    /// Returns `None` if null, or a guard-scoped [`Local`] that you can
-    /// dereference to access the managed object.
+    /// The returned [`Local`] is scoped to `guard` and dereferences to `&T`.
+    /// `order` describes the memory ordering of the load, like
+    /// [`AtomicPtr::load`](std::sync::atomic::AtomicPtr::load).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use cdpt::*;
+    /// # use std::sync::atomic::Ordering;
+    /// # #[derive(TraceObj)]
+    /// # struct Node { value: i32, next: AtomicSharedOption<Node> }
+    /// let guard = pin();
+    /// let slot = AtomicSharedOption::some(
+    ///     Node { value: 1, next: AtomicSharedOption::none() },
+    ///     &guard,
+    /// );
+    /// let node = slot.load(Ordering::Acquire, &guard).unwrap();
+    /// assert_eq!(node.value, 1);
+    /// ```
     #[inline(always)]
     pub fn load<'g>(&self, order: Ordering, guard: &'g Guard) -> Option<Local<'g, Guard, T>> {
         self.load_with_tag(order, guard).0
@@ -940,10 +1062,24 @@ impl<T: TraceObj> AtomicSharedOption<T> {
         }
     }
 
-    /// Replaces the pointer with `new` (or null if `None`).
+    /// Stores `new` (or null when `None`), dropping the previous value.
     ///
-    /// The previous target is released automatically (root count decremented,
-    /// write barriers applied).
+    /// The previous target is released for you: its root count is decremented
+    /// and the collector's write barriers are applied as needed.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use cdpt::*;
+    /// # use std::sync::atomic::Ordering;
+    /// # #[derive(TraceObj)]
+    /// # struct Node { value: i32, next: AtomicSharedOption<Node> }
+    /// let guard = pin();
+    /// let slot = AtomicSharedOption::<Node>::none();
+    /// let node = Local::new(Node { value: 5, next: AtomicSharedOption::none() }, &guard);
+    /// slot.store(Some(&node), Ordering::Release, &guard);
+    /// assert_eq!(slot.load(Ordering::Acquire, &guard).unwrap().value, 5);
+    /// ```
     pub fn store<'l, G: Protector>(
         &self,
         new: Option<&Local<'l, G, T>>,
@@ -966,7 +1102,26 @@ impl<T: TraceObj> AtomicSharedOption<T> {
         }
     }
 
-    /// Removes and returns the current value, leaving this pointer null.
+    /// Takes the current value out, leaving the pointer null.
+    ///
+    /// Equivalent to swapping in `None`. Returns the previous value, or `None`
+    /// if the pointer was already null.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use cdpt::*;
+    /// # use std::sync::atomic::Ordering;
+    /// # #[derive(TraceObj)]
+    /// # struct Node { value: i32, next: AtomicSharedOption<Node> }
+    /// let guard = pin();
+    /// let slot = AtomicSharedOption::some(
+    ///     Node { value: 8, next: AtomicSharedOption::none() },
+    ///     &guard,
+    /// );
+    /// assert_eq!(slot.take(Ordering::AcqRel, &guard).unwrap().value, 8);
+    /// assert!(slot.load(Ordering::Acquire, &guard).is_none());
+    /// ```
     pub fn take<'g>(&self, order: Ordering, guard: &'g Guard) -> Option<Local<'g, Guard, T>> {
         self.take_with_tag(order, guard).0
     }
@@ -982,7 +1137,26 @@ impl<T: TraceObj> AtomicSharedOption<T> {
         }
     }
 
-    /// Replaces the pointer with `new` and returns the old value.
+    /// Stores `new` and returns the previous value.
+    ///
+    /// Like [`store`](Self::store), but hands back what was there before.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use cdpt::*;
+    /// # use std::sync::atomic::Ordering;
+    /// # #[derive(TraceObj)]
+    /// # struct Node { value: i32, next: AtomicSharedOption<Node> }
+    /// let guard = pin();
+    /// let slot = AtomicSharedOption::some(
+    ///     Node { value: 1, next: AtomicSharedOption::none() },
+    ///     &guard,
+    /// );
+    /// let new = Local::new(Node { value: 2, next: AtomicSharedOption::none() }, &guard);
+    /// assert_eq!(slot.swap(Some(&new), Ordering::AcqRel, &guard).unwrap().value, 1);
+    /// assert_eq!(slot.load(Ordering::Acquire, &guard).unwrap().value, 2);
+    /// ```
     pub fn swap<'l, 'g, G: Protector>(
         &self,
         new: Option<&Local<'l, G, T>>,
@@ -1056,8 +1230,29 @@ impl<T: TraceObj> AtomicSharedOption<T> {
     /// This follows the same convention as [`std::sync::atomic::AtomicPtr::compare_exchange`]:
     /// both `Ok` and `Err` carry the value that was loaded from the atomic.
     ///
-    /// Both `current` and `new` may be `None` (null). GC write barriers
-    /// (insertion + deletion) are applied automatically.
+    /// Both `current` and `new` may be `None` (null). The collector's insertion
+    /// and deletion write barriers are applied automatically.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use cdpt::*;
+    /// # use std::sync::atomic::Ordering;
+    /// # #[derive(TraceObj)]
+    /// # struct Node { value: i32, next: AtomicSharedOption<Node> }
+    /// let guard = pin();
+    /// let slot = AtomicSharedOption::some(
+    ///     Node { value: 1, next: AtomicSharedOption::none() },
+    ///     &guard,
+    /// );
+    /// let current = slot.load(Ordering::Acquire, &guard);
+    /// let new = Local::new(Node { value: 2, next: AtomicSharedOption::none() }, &guard);
+    /// assert!(slot
+    ///     .compare_exchange(current.as_ref(), Some(&new),
+    ///                       Ordering::AcqRel, Ordering::Acquire, &guard)
+    ///     .is_ok());
+    /// assert_eq!(slot.load(Ordering::Acquire, &guard).unwrap().value, 2);
+    /// ```
     pub fn compare_exchange<'l1, 'l2, 'g, G1, G2>(
         &self,
         current: Option<&Local<'l1, G1, T>>,
@@ -1206,6 +1401,33 @@ impl<T: TraceObj> AtomicSharedOption<T> {
     /// On success, returns `Ok` with the **previous** value. On failure,
     /// returns `Err` with the **current actual** value. The failure may be
     /// spurious.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use cdpt::*;
+    /// # use std::sync::atomic::Ordering;
+    /// # #[derive(TraceObj)]
+    /// # struct Node { value: i32, next: AtomicSharedOption<Node> }
+    /// let guard = pin();
+    /// let slot = AtomicSharedOption::some(
+    ///     Node { value: 1, next: AtomicSharedOption::none() },
+    ///     &guard,
+    /// );
+    /// let new = Local::new(Node { value: 2, next: AtomicSharedOption::none() }, &guard);
+    /// // A weak CAS belongs in a retry loop, since it can fail spuriously.
+    /// loop {
+    ///     let current = slot.load(Ordering::Acquire, &guard);
+    ///     if slot
+    ///         .compare_exchange_weak(current.as_ref(), Some(&new),
+    ///                                Ordering::AcqRel, Ordering::Acquire, &guard)
+    ///         .is_ok()
+    ///     {
+    ///         break;
+    ///     }
+    /// }
+    /// assert_eq!(slot.load(Ordering::Acquire, &guard).unwrap().value, 2);
+    /// ```
     pub fn compare_exchange_weak<'l1, 'l2, 'g, G1, G2>(
         &self,
         current: Option<&Local<'l1, G1, T>>,
@@ -1624,21 +1846,29 @@ where
     }
 }
 
-/// A non-nullable, atomic, root-count-protected pointer to a managed object.
+/// A non-nullable atomic pointer to a managed object.
 ///
-/// Identical to [`AtomicSharedOption`] except it is guaranteed to always point
-/// to a valid object (never null). Use this for edges that must always be
-/// populated, such as the sentinel head of a linked list.
+/// This is the never-null counterpart of [`AtomicSharedOption`]: it always
+/// points to a valid object, so its `load`, `store`, `swap`, and
+/// `compare_exchange` methods return [`Local`] directly instead of
+/// `Option<Local>`. Reach for it when an edge is always populated, such as the
+/// sentinel head of a list or an always-present child slot. The integrated
+/// write barriers and root counting behave exactly like [`AtomicSharedOption`].
 ///
-/// All `load`/`store`/`swap`/`compare_exchange` methods mirror those of
-/// `AtomicSharedOption` but return `Local` directly instead of `Option<Local>`.
+/// # Examples
 ///
-/// # Example
+/// ```
+/// use cdpt::*;
+/// use std::sync::atomic::Ordering;
 ///
-/// ```ignore
-/// struct List {
-///     head: AtomicShared<Node>,  // always points to a sentinel node
+/// #[derive(TraceObj)]
+/// struct Counter {
+///     value: i32,
 /// }
+///
+/// let guard = pin();
+/// let cell = AtomicShared::new(Counter { value: 1 }, &guard);
+/// assert_eq!(cell.load(Ordering::Acquire, &guard).value, 1);
 /// ```
 pub struct AtomicShared<T> {
     inner: AtomicSharedOption<T>,
@@ -1657,7 +1887,22 @@ impl<T> AtomicShared<T> {
 }
 
 impl<T: TraceObj> AtomicShared<T> {
-    /// Allocates a managed object and returns a non-nullable atomic pointer.
+    /// Allocates `item` on the managed heap and returns a pointer to it.
+    ///
+    /// The pointer holds a root count of 1 on the object, keeping it alive
+    /// until the pointer is overwritten or stored as a heap edge.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use cdpt::*;
+    /// # use std::sync::atomic::Ordering;
+    /// # #[derive(TraceObj)]
+    /// # struct Counter { value: i32 }
+    /// let guard = pin();
+    /// let cell = AtomicShared::new(Counter { value: 42 }, &guard);
+    /// assert_eq!(cell.load(Ordering::Acquire, &guard).value, 42);
+    /// ```
     #[inline(always)]
     pub fn new(item: T, guard: &Guard) -> Self {
         Self {
@@ -1675,9 +1920,21 @@ impl<T: TraceObj> AtomicShared<T> {
         }
     }
 
-    /// Reads the current pointer value as a guard-scoped [`Local`].
+    /// Loads the current value as a guard-scoped [`Local`].
     ///
     /// Unlike [`AtomicSharedOption::load`], this never returns `None`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use cdpt::*;
+    /// # use std::sync::atomic::Ordering;
+    /// # #[derive(TraceObj)]
+    /// # struct Counter { value: i32 }
+    /// let guard = pin();
+    /// let cell = AtomicShared::new(Counter { value: 3 }, &guard);
+    /// assert_eq!(cell.load(Ordering::Acquire, &guard).value, 3);
+    /// ```
     #[inline(always)]
     pub fn load<'g>(&self, order: Ordering, guard: &'g Guard) -> Local<'g, Guard, T> {
         let r = self.inner.load(order, guard);
@@ -1701,7 +1958,24 @@ impl<T: TraceObj> AtomicShared<T> {
         }
     }
 
-    /// Replaces the pointer with `new`, applying write barriers as needed.
+    /// Stores `new`, dropping the previous value.
+    ///
+    /// The previous target's root count is decremented and the collector's
+    /// write barriers are applied as needed.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use cdpt::*;
+    /// # use std::sync::atomic::Ordering;
+    /// # #[derive(TraceObj)]
+    /// # struct Counter { value: i32 }
+    /// let guard = pin();
+    /// let cell = AtomicShared::new(Counter { value: 1 }, &guard);
+    /// let new = Local::new(Counter { value: 2 }, &guard);
+    /// cell.store(&new, Ordering::Release, &guard);
+    /// assert_eq!(cell.load(Ordering::Acquire, &guard).value, 2);
+    /// ```
     pub fn store<'l, G: Protector>(&self, new: &Local<'l, G, T>, order: Ordering, guard: &Guard) {
         self.inner.store(Some(new), order, guard);
     }
@@ -1719,29 +1993,21 @@ impl<T: TraceObj> AtomicShared<T> {
         }
     }
 
-    /// Replaces the pointer with `new` and returns the old value.
-    pub fn take<'g>(&self, order: Ordering, guard: &'g Guard) -> Local<'g, Guard, T> {
-        let r = self.inner.take(order, guard);
-        debug_assert!(r.is_some());
-        // Safety: There must be no possible path to write a `None` to the inner atomic.
-        unsafe { r.unwrap_unchecked() }
-    }
-
-    tag_fn! {
-        /// Like [`take`](Self::take), but also returns the tag bits.
-        fn take_with_tag<'g>(
-            &self,
-            order: Ordering,
-            guard: &'g Guard,
-        ) -> WithTag<Local<'g, Guard, T>> {
-            let r = self.inner.take_with_tag(order, guard);
-            debug_assert!(r.0.is_some());
-            // Safety: There must be no possible path to write a `None` to the inner atomic.
-            unsafe { (r.0.unwrap_unchecked(), r.1) }
-        }
-    }
-
-    /// Replaces the pointer with `new` and returns the old value.
+    /// Stores `new` and returns the previous value.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use cdpt::*;
+    /// # use std::sync::atomic::Ordering;
+    /// # #[derive(TraceObj)]
+    /// # struct Counter { value: i32 }
+    /// let guard = pin();
+    /// let cell = AtomicShared::new(Counter { value: 1 }, &guard);
+    /// let new = Local::new(Counter { value: 2 }, &guard);
+    /// assert_eq!(cell.swap(&new, Ordering::AcqRel, &guard).value, 1);
+    /// assert_eq!(cell.load(Ordering::Acquire, &guard).value, 2);
+    /// ```
     pub fn swap<'l, 'g, G: Protector>(
         &self,
         new: &Local<'l, G, T>,
@@ -1777,6 +2043,23 @@ impl<T: TraceObj> AtomicShared<T> {
     /// returns `Err` with the **current actual** value.
     ///
     /// This follows the same convention as [`std::sync::atomic::AtomicPtr::compare_exchange`].
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use cdpt::*;
+    /// # use std::sync::atomic::Ordering;
+    /// # #[derive(TraceObj)]
+    /// # struct Counter { value: i32 }
+    /// let guard = pin();
+    /// let cell = AtomicShared::new(Counter { value: 1 }, &guard);
+    /// let current = cell.load(Ordering::Acquire, &guard);
+    /// let new = Local::new(Counter { value: 2 }, &guard);
+    /// assert!(cell
+    ///     .compare_exchange(&current, &new, Ordering::AcqRel, Ordering::Acquire, &guard)
+    ///     .is_ok());
+    /// assert_eq!(cell.load(Ordering::Acquire, &guard).value, 2);
+    /// ```
     pub fn compare_exchange<'l1, 'l2, 'g, G1, G2>(
         &self,
         current: &Local<'l1, G1, T>,
@@ -1849,6 +2132,28 @@ impl<T: TraceObj> AtomicShared<T> {
     /// On success, returns `Ok` with the **previous** value. On failure,
     /// returns `Err` with the **current actual** value. The failure may be
     /// spurious.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use cdpt::*;
+    /// # use std::sync::atomic::Ordering;
+    /// # #[derive(TraceObj)]
+    /// # struct Counter { value: i32 }
+    /// let guard = pin();
+    /// let cell = AtomicShared::new(Counter { value: 1 }, &guard);
+    /// let new = Local::new(Counter { value: 2 }, &guard);
+    /// loop {
+    ///     let current = cell.load(Ordering::Acquire, &guard);
+    ///     if cell
+    ///         .compare_exchange_weak(&current, &new, Ordering::AcqRel, Ordering::Acquire, &guard)
+    ///         .is_ok()
+    ///     {
+    ///         break;
+    ///     }
+    /// }
+    /// assert_eq!(cell.load(Ordering::Acquire, &guard).value, 2);
+    /// ```
     pub fn compare_exchange_weak<'l1, 'l2, 'g, G1, G2>(
         &self,
         current: &Local<'l1, G1, T>,
@@ -1988,30 +2293,40 @@ where
     }
 }
 
-/// An immutable, root-count-protected reference to a managed object.
+/// An immutable, thread-safe reference that keeps a managed object alive.
 ///
-/// `Shared<T>` is the GC equivalent of `Arc<T>`: it keeps the target alive via
-/// a root count in the object header and can be freely sent between threads or
-/// stored as a field inside other managed objects.
+/// `Shared<T>` is CDPT's equivalent of [`Arc<T>`](std::sync::Arc): it is
+/// `Send + Sync`, cloning is cheap and shares ownership, and it dereferences to
+/// `&T`. Because it owns a root count it keeps its target alive on its own, so,
+/// unlike a guard-scoped [`Local`], it stays valid with no [`Guard`] held and
+/// can be sent to other threads or stored as a field of another managed object.
 ///
-/// - **Immutable** — the target pointer cannot be changed after construction.
-///   Use [`AtomicShared`] or [`AtomicSharedOption`] for mutable atomic edges.
-/// - **Cloneable** — cloning increments the root count.
-/// - **Deref** — dereferences directly to `&T`.
-/// - As a field of a `TraceObj` struct, it represents an internal heap edge
-///   (root count is decremented when the parent is boxed via `unroot_outgoings`).
+/// Unlike `Arc<T>`, a `Shared<T>` is reclaimed by tracing, so reference cycles
+/// between `Shared`s are collected automatically instead of leaking. It is
+/// immutable; for an edge that mutates concurrently use [`AtomicShared`] or
+/// [`AtomicSharedOption`]. As a field of a managed type it forms an immutable
+/// internal heap edge.
 ///
-/// # Example
+/// Creating or cloning a `Shared` updates a root count, which is more expensive
+/// than copying a guard-scoped [`Local`]. Prefer `Local` while traversing a
+/// structure, and promote to `Shared` only when you need a reference that
+/// outlives the guard.
+///
+/// # Examples
 ///
 /// ```
-/// use cdpt::{TraceObj, TracePtr, Shared};
+/// use cdpt::*;
 ///
 /// #[derive(TraceObj)]
 /// struct Node {
-///     value: usize,
-///     left: Option<Shared<Node>>,   // immutable edge to a child
-///     right: Option<Shared<Node>>,
+///     value: i32,
+///     children: Vec<Shared<Node>>, // immutable edges to children
 /// }
+///
+/// let guard = pin();
+/// let node = Shared::new(Node { value: 1, children: vec![] }, &guard);
+/// drop(guard);
+/// assert_eq!(node.value, 1); // still valid after the guard is dropped
 /// ```
 pub struct Shared<T> {
     // Note: We just use `AtomicShared` to implement `Shared`, even though `Shared` is immutable
@@ -2045,13 +2360,43 @@ impl<T> Shared<T> {
     }
 
     /// Returns `true` if the two `Shared`s point to the same allocation.
+    ///
+    /// This compares pointer identity, not the pointed-to values (which is what
+    /// `==` compares). Like [`Arc::ptr_eq`](std::sync::Arc::ptr_eq).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use cdpt::*;
+    /// # #[derive(TraceObj)]
+    /// # struct Node { value: i32 }
+    /// let guard = pin();
+    /// let a = Shared::new(Node { value: 1 }, &guard);
+    /// let b = a.clone();
+    /// let c = Shared::new(Node { value: 1 }, &guard);
+    /// assert!(Shared::ptr_eq(&a, &b));  // same allocation
+    /// assert!(!Shared::ptr_eq(&a, &c)); // equal value, different allocation
+    /// ```
     #[inline(always)]
     pub fn ptr_eq(this: &Self, other: &Self) -> bool {
         this.as_man_ptr().without_meta() == other.as_man_ptr().without_meta()
     }
 
-    /// Returns `true` if both options point to the same allocation (or are
-    /// both `None`).
+    /// Returns `true` if both options point to the same allocation, or are both
+    /// `None`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use cdpt::*;
+    /// # #[derive(TraceObj)]
+    /// # struct Node { value: i32 }
+    /// let guard = pin();
+    /// let a = Shared::new(Node { value: 1 }, &guard);
+    /// assert!(Shared::<Node>::opt_ptr_eq(None, None));
+    /// assert!(Shared::opt_ptr_eq(Some(&a), Some(&a)));
+    /// assert!(!Shared::opt_ptr_eq(Some(&a), None));
+    /// ```
     #[inline(always)]
     pub fn opt_ptr_eq(this: Option<&Self>, other: Option<&Self>) -> bool {
         match (this, other) {
@@ -2063,10 +2408,22 @@ impl<T> Shared<T> {
 }
 
 impl<T: TraceObj> Shared<T> {
-    /// Allocates a new managed object and returns an immutable root reference.
+    /// Allocates `item` on the managed heap and returns a root reference to it.
     ///
-    /// Requires a [`Guard`] for allocation. The returned `Shared` keeps the
-    /// object alive independently of any guard.
+    /// A [`Guard`] is required to allocate, but the returned `Shared` keeps the
+    /// object alive on its own and stays valid after the guard is dropped.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use cdpt::*;
+    /// # #[derive(TraceObj)]
+    /// # struct Node { value: i32 }
+    /// let guard = pin();
+    /// let node = Shared::new(Node { value: 10 }, &guard);
+    /// drop(guard);
+    /// assert_eq!(node.value, 10);
+    /// ```
     #[inline(always)]
     pub fn new(item: T, guard: &Guard) -> Self {
         Self {
@@ -2085,8 +2442,23 @@ impl<T: TraceObj> Shared<T> {
 
     /// Creates a guard-scoped [`Local`] view of this `Shared`.
     ///
-    /// Useful for passing to methods that expect a `Local`, such as
-    /// [`AtomicSharedOption::store`].
+    /// Useful for passing to methods that expect a [`Local`], such as the
+    /// `store` and `compare_exchange` methods on [`AtomicSharedOption`] and
+    /// [`AtomicShared`].
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use cdpt::*;
+    /// # use std::sync::atomic::Ordering;
+    /// # #[derive(TraceObj)]
+    /// # struct Node { value: i32 }
+    /// let guard = pin();
+    /// let node = Shared::new(Node { value: 1 }, &guard);
+    /// let slot = AtomicSharedOption::<Node>::none();
+    /// slot.store(Some(&node.as_local(&guard)), Ordering::Release, &guard);
+    /// assert_eq!(slot.load(Ordering::Acquire, &guard).unwrap().value, 1);
+    /// ```
     #[inline(always)]
     pub fn as_local<'g>(&self, guard: &'g Guard) -> Local<'g, Guard, T> {
         // Safety: `Shared` (and its inner `AtomicShared`) always points to
@@ -2179,6 +2551,12 @@ impl<T: TraceObj> TracePtr for Shared<T> {
     }
 }
 
+/// Abstraction over the two ways a [`Local`] keeps its target reachable: a
+/// [`Guard`] (phase-critical section) or a [`Handle`] (hazard pointer).
+///
+/// It is implemented only by [`Guard`] and [`Handle`] and is not meant to be
+/// implemented downstream; it exists so that [`Local`] can be generic over its
+/// protection mode.
 pub trait Protector {
     type Shield;
 
@@ -2203,35 +2581,51 @@ impl Protector for Guard {
     fn protect<T: TraceObj>(&self, _: ManPtr<T>) -> Self::Shield {}
 }
 
-/// A thread-local reference to a managed object, safe to dereference.
+/// A reference to a managed object that you can dereference.
 ///
-/// `Local` is the only pointer type that can be dereferenced (via `Deref`).
-/// It is obtained by loading from an [`AtomicShared`] or [`AtomicSharedOption`],
-/// or by allocating a new object with [`Local::new`].
+/// `Local` is the uncounted reference you hold while reading or traversing a
+/// data structure; it dereferences to `&T`. You obtain one by loading
+/// an [`AtomicShared`] or [`AtomicSharedOption`], by allocating with
+/// [`Local::new`], or by viewing a [`Shared`] through [`Shared::as_local`].
 ///
 /// # Protection modes
 ///
-/// The generic parameter `G` determines how the reference is kept alive:
+/// The parameter `G` selects how long the reference stays valid:
 ///
-/// - **`Local<'g, Guard, T>`** — protected by a phase-critical section. This
-///   is the common case: the reference is valid for the lifetime of the
-///   [`Guard`] that created it. Cheap (zero-cost protection, `Copy`).
-/// - **`Local<'h, Handle, T>`** — protected by a *hazard pointer*. Lives
-///   independently of any `Guard`, useful for returning references from a
-///   function. Create one via [`protect`](Local::protect).
+/// * **`Local<'g, Guard, T>`** is the common case and the cheapest. It is valid
+///   for the lifetime of the [`Guard`] it came from, costs nothing to create,
+///   and is [`Copy`]. Use it for traversal.
+/// * **`Local<'h, Handle, T>`** stays valid after the guard is dropped, so it
+///   can be returned from a function or held across a [`Guard::repin`]. Create
+///   one with [`protect`](Local::protect).
 ///
-/// # Example
+/// Internally the guard-scoped form is protected by the phase-critical section
+/// and the handle-scoped form by a *hazard pointer*. Even the handle form is
+/// much cheaper than promoting to a root-counted [`Shared`], so prefer it when
+/// you only need the reference on one thread.
 ///
-/// ```ignore
-/// let guard = cdpt::pin();
-/// let local: Local<Guard, Node> = some_atomic.load(Ordering::Acquire, &guard);
-/// println!("{}", local.value);  // deref to &Node
+/// # Examples
 ///
-/// // To keep the reference after the guard is dropped:
-/// let handle = cdpt::handle();
-/// let hp_ref: Local<Handle, Node> = local.protect(&handle);
+/// ```
+/// use cdpt::*;
+/// use std::sync::atomic::Ordering;
+///
+/// #[derive(TraceObj)]
+/// struct Node {
+///     value: i32,
+/// }
+///
+/// let handle = handle();
+/// let guard = handle.pin();
+/// let cell = AtomicShared::new(Node { value: 7 }, &guard);
+///
+/// let local = cell.load(Ordering::Acquire, &guard); // Local<'_, Guard, Node>
+/// assert_eq!(local.value, 7);                        // deref to &Node
+///
+/// // Keep the reference past the guard with a hazard pointer.
+/// let kept = local.protect(&handle);                 // Local<'_, Handle, Node>
 /// drop(guard);
-/// println!("{}", hp_ref.value);  // still valid via hazard pointer
+/// assert_eq!(kept.value, 7);                          // still valid
 /// ```
 pub struct Local<'g, G: Protector, T> {
     ptr: NonNull<ManObj<T>>,
@@ -2247,12 +2641,24 @@ assert_eq_size!(Option<Local<'static, Guard, ()>>, usize);
 unsafe impl<'g, G: Protector, T: Sync + Send> Sync for Local<'g, G, T> {}
 
 impl<'g, T: TraceObj> Local<'g, Guard, T> {
-    /// Allocates a new managed object and returns a guard-scoped local
+    /// Allocates `item` on the managed heap and returns a guard-scoped
     /// reference to it.
     ///
-    /// The object is *unrooted* (no root count) — it is kept alive solely by
-    /// the guard's critical section. To persist it in a data structure, store
-    /// it into an [`AtomicSharedOption`] or convert it to a [`Shared`].
+    /// The new object is *unrooted* (it has no root count) and is kept alive
+    /// only by the guard's critical section. To keep it longer, store it into
+    /// an [`AtomicShared`] or [`AtomicSharedOption`], or promote it with
+    /// [`as_shared`](Self::as_shared) or [`protect`](Self::protect).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use cdpt::*;
+    /// # #[derive(TraceObj)]
+    /// # struct Node { value: i32 }
+    /// let guard = pin();
+    /// let node = Local::new(Node { value: 5 }, &guard);
+    /// assert_eq!(node.value, 5);
+    /// ```
     #[inline(always)]
     pub fn new(item: T, guard: &'g Guard) -> Self {
         // `without_meta`: The object should have a right color, but the pointer should not,
@@ -2278,11 +2684,25 @@ impl<'g, G: Protector, T> Local<'g, G, T> {
         ManPtr::from(self.ptr)
     }
 
-    /// Converts this reference into a sendable [`AtomicShared`] that can be
-    /// stored in data structures or sent to other threads.
+    /// Converts this reference into a sendable [`AtomicShared`].
     ///
-    /// Increments the target's root count so it stays alive independently of
-    /// any guard or hazard pointer.
+    /// Increments the target's root count so the object stays alive
+    /// independently of any guard or hazard pointer, ready to be stored in a
+    /// data structure or sent to another thread.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use cdpt::*;
+    /// # use std::sync::atomic::Ordering;
+    /// # #[derive(TraceObj)]
+    /// # struct Node { value: i32 }
+    /// let guard = pin();
+    /// let node = Local::new(Node { value: 1 }, &guard);
+    /// let cell = node.as_atomic_shared();
+    /// drop(guard);
+    /// assert_eq!(cell.load(Ordering::Acquire, &pin()).value, 1);
+    /// ```
     #[inline(always)]
     pub fn as_atomic_shared(&self) -> AtomicShared<T> {
         let ptr = self.as_man_ptr();
@@ -2296,8 +2716,24 @@ impl<'g, G: Protector, T> Local<'g, G, T> {
         AtomicShared::from_raw(ptr.with_meta(PtrMeta::Rooted))
     }
 
-    /// Converts this reference into a [`Shared`] that can be stored as an
-    /// immutable field in managed objects or kept indefinitely.
+    /// Converts this reference into a [`Shared`], the GC's `Arc`-like root.
+    ///
+    /// Increments the target's root count so it stays alive after the guard is
+    /// dropped. Use it to return a reference from a function, store it as an
+    /// immutable field, or send it to another thread.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use cdpt::*;
+    /// # #[derive(TraceObj)]
+    /// # struct Node { value: i32 }
+    /// let guard = pin();
+    /// let node = Local::new(Node { value: 9 }, &guard);
+    /// let shared = node.as_shared();
+    /// drop(guard);
+    /// assert_eq!(shared.value, 9);
+    /// ```
     #[inline(always)]
     pub fn as_shared(&self) -> Shared<T> {
         Shared {
@@ -2306,14 +2742,44 @@ impl<'g, G: Protector, T> Local<'g, G, T> {
     }
 
     /// Returns `true` if the two `Local`s point to the same allocation.
-    /// This function ignores the underlying protection guards.
+    ///
+    /// Compares pointer identity, ignoring how each reference is protected, not
+    /// the pointed-to values.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use cdpt::*;
+    /// # use std::sync::atomic::Ordering;
+    /// # #[derive(TraceObj)]
+    /// # struct Node { value: i32 }
+    /// let guard = pin();
+    /// let cell = AtomicShared::new(Node { value: 1 }, &guard);
+    /// let a = cell.load(Ordering::Acquire, &guard);
+    /// let b = cell.load(Ordering::Acquire, &guard);
+    /// assert!(Local::ptr_eq(&a, &b)); // both loaded the same object
+    /// ```
     #[inline(always)]
     pub fn ptr_eq<'h, H: Protector>(this: &Self, other: &Local<'h, H, T>) -> bool {
         this.ptr == other.ptr
     }
 
-    /// Returns `true` if both options point to the same allocation (or are
-    /// both `None`).
+    /// Returns `true` if both options point to the same allocation, or are both
+    /// `None`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use cdpt::*;
+    /// # use std::sync::atomic::Ordering;
+    /// # #[derive(TraceObj)]
+    /// # struct Node { value: i32 }
+    /// let guard = pin();
+    /// let cell = AtomicShared::new(Node { value: 1 }, &guard);
+    /// let a = cell.load(Ordering::Acquire, &guard);
+    /// let b = cell.load(Ordering::Acquire, &guard);
+    /// assert!(Local::opt_ptr_eq(Some(&a), Some(&b)));
+    /// ```
     #[inline(always)]
     pub fn opt_ptr_eq<'h, H: Protector>(
         this: Option<&Self>,
@@ -2341,11 +2807,27 @@ impl<'g, G: Protector, T: TraceObj> Local<'g, G, T> {
         }
     }
 
-    /// Re-protects this reference under a different protector.
+    /// Re-protects this reference under a different protector, normally a
+    /// [`Handle`].
     ///
-    /// Commonly used to convert a `Local<Guard, T>` into a `Local<Handle, T>`,
-    /// upgrading from guard-scoped to hazard-pointer protection so the
-    /// reference survives after the guard is dropped.
+    /// The common use is to turn a `Local<'_, Guard, T>` into a
+    /// `Local<'_, Handle, T>`, upgrading from guard-scoped protection to a
+    /// hazard pointer so the reference survives after the guard is dropped.
+    /// This is cheaper than promoting to a root-counted [`Shared`].
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use cdpt::*;
+    /// # #[derive(TraceObj)]
+    /// # struct Node { value: i32 }
+    /// let handle = handle();
+    /// let guard = handle.pin();
+    /// let node = Local::new(Node { value: 4 }, &guard);
+    /// let kept = node.protect(&handle); // Local<'_, Handle, Node>
+    /// drop(guard);
+    /// assert_eq!(kept.value, 4);         // still valid via hazard pointer
+    /// ```
     #[inline(always)]
     pub fn protect<'h, H: Protector>(&self, prot: &'h H) -> Local<'h, H, T> {
         Local {
