@@ -1,5 +1,8 @@
 # CDPT: Concurrent Deferred Partial Tracing
 
+[![crates.io](https://img.shields.io/crates/v/cdpt.svg)](https://crates.io/crates/cdpt)
+[![docs.rs](https://docs.rs/cdpt/badge.svg)](https://docs.rs/cdpt)
+[![CI](https://github.com/kaist-cp/cdpt/actions/workflows/ci.yml/badge.svg)](https://github.com/kaist-cp/cdpt/actions/workflows/ci.yml)
 [![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](#license)
 [![Paper: PLDI 2026](https://img.shields.io/badge/paper-PLDI%202026-brightgreen.svg)](https://doi.org/10.1145/3808310)
 
