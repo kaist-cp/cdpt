@@ -31,6 +31,9 @@ run() {
 run "debug: unit + integration tests" \
     cargo test --tests
 
+run "debug: doctests" \
+    cargo test --doc
+
 run "debug: example tests (stack)" \
     cargo test --example stack
 
@@ -61,6 +64,9 @@ run "release: example tests (natarajan_mittal_tree, tag feature)" \
     cargo test --release --example natarajan_mittal_tree --features tag
 
 # ── 3. Release + AddressSanitizer ────────────────────────────────
+#
+# ASan needs nightly-only `-Z` flags, so this block runs via `cargo +nightly`;
+# everything above uses the repo's default toolchain (stable).
 
 ASAN_FLAGS="-Z sanitizer=address"
 SKIP_ASAN=false
@@ -80,19 +86,19 @@ if [ "$SKIP_ASAN" = false ]; then
     ASAN_ARGS=(--release --target "$ASAN_TARGET" -Z build-std)
 
     run "release+asan: unit + integration tests" \
-        env RUSTFLAGS="$ASAN_FLAGS" cargo test "${ASAN_ARGS[@]}" --tests
+        env RUSTFLAGS="$ASAN_FLAGS" cargo +nightly test "${ASAN_ARGS[@]}" --tests
 
     run "release+asan: example tests (stack)" \
-        env RUSTFLAGS="$ASAN_FLAGS" cargo test "${ASAN_ARGS[@]}" --example stack
+        env RUSTFLAGS="$ASAN_FLAGS" cargo +nightly test "${ASAN_ARGS[@]}" --example stack
 
     run "release+asan: example tests (lists, tag feature)" \
-        env RUSTFLAGS="$ASAN_FLAGS" cargo test "${ASAN_ARGS[@]}" --example lists --features tag
+        env RUSTFLAGS="$ASAN_FLAGS" cargo +nightly test "${ASAN_ARGS[@]}" --example lists --features tag
 
     run "release+asan: example tests (efrb_tree, tag feature)" \
-        env RUSTFLAGS="$ASAN_FLAGS" cargo test "${ASAN_ARGS[@]}" --example efrb_tree --features tag
+        env RUSTFLAGS="$ASAN_FLAGS" cargo +nightly test "${ASAN_ARGS[@]}" --example efrb_tree --features tag
 
     run "release+asan: example tests (natarajan_mittal_tree, tag feature)" \
-        env RUSTFLAGS="$ASAN_FLAGS" cargo test "${ASAN_ARGS[@]}" --example natarajan_mittal_tree --features tag
+        env RUSTFLAGS="$ASAN_FLAGS" cargo +nightly test "${ASAN_ARGS[@]}" --example natarajan_mittal_tree --features tag
 fi
 
 # ── Summary ──────────────────────────────────────────────────────

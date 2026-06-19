@@ -179,8 +179,16 @@ impl ObjBatch {
         Self(Vec::with_capacity(capacity))
     }
 
+    /// Pushes `item` only when there is spare capacity, so a batch never
+    /// reallocates and stays at its fixed size; when the batch is full the
+    /// item is handed back in `Err` (signalling the caller to flush).
     pub fn push_within_capacity(&mut self, item: Box<dyn MarkObj>) -> Result<(), Box<dyn MarkObj>> {
-        self.0.push_within_capacity(item).map(|_| ())
+        if self.0.len() < self.0.capacity() {
+            self.0.push(item);
+            Ok(())
+        } else {
+            Err(item)
+        }
     }
 
     pub fn is_empty(&self) -> bool {

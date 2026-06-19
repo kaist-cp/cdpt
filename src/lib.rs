@@ -194,8 +194,6 @@
 //! - `BENCH.md`: running the benchmark suite.
 //! - `examples/`: complete lock-free data structures.
 
-#![feature(vec_push_within_capacity)]
-
 #[macro_use]
 extern crate static_assertions;
 

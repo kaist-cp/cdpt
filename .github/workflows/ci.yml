@@ -1,0 +1,57 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  lint:
+    name: rustfmt / clippy / check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: rustfmt
+        run: cargo fmt -- --check
+      - name: clippy
+        run: cargo clippy -- -D warnings
+      - name: check
+        run: cargo check --verbose
+
+  test:
+    name: test suite (debug, release, ASan)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # Library + tests run on stable; run_all_tests.sh's AddressSanitizer pass
+      # opts into nightly (`-Z` flags + rust-src) itself, so install both and
+      # keep stable as the default toolchain.
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install nightly + rust-src for the ASan pass
+        run: rustup toolchain install nightly --component rust-src --profile minimal
+      - uses: Swatinem/rust-cache@v2
+      - name: run_all_tests.sh
+        run: bash run_all_tests.sh
+
+  audit:
+    name: cargo audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-audit
+      - name: cargo audit
+        run: cargo audit
