@@ -3,10 +3,17 @@ name = "cdpt"
 version = "0.1.0"
 edition = "2024"
 license = "MIT OR Apache-2.0"
+description = " An automatic, safe, and concurrent garbage collector for Rust"
+repository = "https://github.com/kaist-cp/cdpt"
+documentation = "https://docs.rs/cdpt"
+readme = "README.md"
+keywords = ["garbage-collection", "gc", "concurrency", "lock-free", "memory"]
+categories = ["concurrency", "memory-management"]
+rust-version = "1.95"
 
 [dependencies]
 arrayvec = "0.7.6"
-cdpt-derive = { path = "cdpt-derive" }
+cdpt-derive = { path = "cdpt-derive", version = "0.1.0" }
 cfg-if = "1.0.1"
 crossbeam = "0.8.4"
 fastrand = "2.3.0"
@@ -14,10 +21,6 @@ libc = "0.2.174"
 rustc-hash = "2.1.1"
 windows-sys = "0.60.2"
 static_assertions = "1.1.0"
-
-[build-dependencies]
-bindgen = "0.72.0"
-cc = "1.2.30"
 
 [dev-dependencies]
 bitflags = "2.5"
@@ -29,6 +32,9 @@ tikv-jemalloc-ctl = { version = "0.5", features = ["use_std"] }
 
 [features]
 tag = []
+
+[package.metadata.docs.rs]
+all-features = true
 
 [[example]]
 name = "lists"
