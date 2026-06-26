@@ -201,6 +201,7 @@ mod collector;
 mod epoch;
 mod guards;
 mod internal;
+mod platform;
 mod pointers;
 mod sync;
 mod task;

@@ -29,6 +29,9 @@ use std::{
     sync::atomic::{AtomicPtr, AtomicU32, AtomicUsize, Ordering},
 };
 
+#[cfg(all(feature = "tag", target_pointer_width = "32"))]
+compile_error!("cdpt's `tag` feature is not supported on 32-bit targets");
+
 // ── Type registry for type-erased shade functions ───────────────────────────
 //
 // The type registry exists so that managed pointer types (`AtomicSharedOption`,
@@ -52,8 +55,7 @@ use std::{
 // shared* objects, not every allocation in an application.  Most programs have
 // a small, fixed set of such types (hash-table nodes, queue entries, tree
 // nodes, wrapper structs around them, etc.).  If 256 is ever insufficient,
-// increase `TYPE_ID_BITS` — the root-count field shrinks accordingly, but a
-// compile-time assertion ensures it never drops below 32 bits.
+// increase `TYPE_ID_BITS` — the root-count field shrinks accordingly.
 
 /// Number of bits reserved for the type id in the object header.
 /// Determines the maximum number of distinct managed types (2^TYPE_ID_BITS).
@@ -63,8 +65,11 @@ pub(crate) const TYPE_ID_BITS: u32 = 8;
 /// Maximum number of distinct managed types: 2^TYPE_ID_BITS.
 const MAX_TYPE_ID: usize = 1 << TYPE_ID_BITS;
 
-// Ensure the root-count field (63 - 1 color bit - TYPE_ID_BITS) has at least 32 bits.
-const_assert!(63 - TYPE_ID_BITS >= 32);
+// Leave enough room for color, type id, and a useful root-count field on both
+// 64-bit and 32-bit targets. With TYPE_ID_BITS = 8 this yields 48 root-count
+// bits on 64-bit targets and 23 bits on 32-bit targets.
+const_assert!(usize::BITS > TYPE_ID_BITS + 1);
+const_assert!(usize::BITS - 1 - TYPE_ID_BITS >= 16);
 
 /// Type-erased shade function: given a ManObj pointer, shade its outgoing edges.
 type ShadePointeeFn = unsafe fn(mobj_ptr: *mut (), guard: &Guard);
@@ -268,15 +273,19 @@ impl From<usize> for ObjMeta {
 }
 
 impl ObjMeta {
-    // Bit layout (64-bit):
-    //   Bit 63:              color (1 bit)
+    // Bit layout:
+    //   Top bit:             color (1 bit)
     //   Bits RC..RC+TID-1:   type_id (TYPE_ID_BITS bits)
     //   Bits 0..RC-1:        root_count (remaining bits)
     // ... which is by default (64-bit):
     //   Bit 63:     color
     //   Bits 48-55: type_id (8 bits, 256 types)
     //   Bits 0-47:  root_count (48 bits)
-    const COLOR_SHIFT: u32 = 63;
+    // ... and by default (32-bit):
+    //   Bit 31:     color
+    //   Bits 23-30: type_id (8 bits, 256 types)
+    //   Bits 0-22:  root_count (23 bits)
+    const COLOR_SHIFT: u32 = usize::BITS - 1;
     const TYPE_ID_SHIFT: u32 = Self::COLOR_SHIFT - TYPE_ID_BITS;
     const TYPE_ID_MASK: usize = ((1usize << TYPE_ID_BITS) - 1) << Self::TYPE_ID_SHIFT;
     const ROOT_COUNT_BITS: u32 = Self::TYPE_ID_SHIFT;
@@ -505,8 +514,19 @@ where
 
 impl<T> ManPtr<T> {
     const META_WIDTH: u32 = 2;
-    const META_BITS: usize = ((1 << Self::META_WIDTH) - 1) << (usize::BITS - Self::META_WIDTH);
+    // 64-bit canonical addresses leave the high bits free, so the metadata rides
+    // there and tags use the alignment low bits. 32-bit pointers have no spare
+    // high bits, so the metadata takes the low alignment bits instead and tags
+    // are unavailable (see the `tag` `compile_error!` near the top of the file).
+    #[cfg(target_pointer_width = "64")]
+    const META_SHIFT: u32 = usize::BITS - Self::META_WIDTH;
+    #[cfg(target_pointer_width = "32")]
+    const META_SHIFT: u32 = 0;
+    #[cfg(target_pointer_width = "64")]
     const LOW_BITS: usize = (1 << align_of::<ManObj<T>>().trailing_zeros()) - 1;
+    #[cfg(target_pointer_width = "32")]
+    const LOW_BITS: usize = 0;
+    const META_BITS: usize = ((1 << Self::META_WIDTH) - 1) << Self::META_SHIFT;
     const ADDR_BITS: usize = usize::MAX & !Self::META_BITS & !Self::LOW_BITS;
 
     #[inline(always)]
@@ -524,7 +544,8 @@ impl<T> ManPtr<T> {
 
     #[inline(always)]
     pub(crate) const fn null_rooted_with_tag(tag: usize) -> Self {
-        // Rooted meta = 0b00 in the top two bits, so only the tag bits remain.
+        // Rooted meta = 0b00, so only the tag bits remain. On 32-bit targets,
+        // the low bits are reserved for metadata and tags are disabled.
         Self {
             data: (tag & Self::LOW_BITS) as *const () as *mut (),
             _marker: PhantomData,
@@ -533,24 +554,31 @@ impl<T> ManPtr<T> {
 
     #[inline(always)]
     pub(crate) fn meta(self) -> PtrMeta {
-        let bits = self.data.addr();
-        if bits & (1 << (usize::BITS - 1)) == 0 {
+        // The high meta bit flags unrooted; the low meta bit carries the color.
+        let code = (self.data.addr() & Self::META_BITS) >> Self::META_SHIFT;
+        if code & 0b10 == 0 {
             PtrMeta::Rooted
         } else {
-            PtrMeta::Unrooted(Color::from(bits & (1 << (usize::BITS - 2))))
+            PtrMeta::Unrooted(Color::from(code & 0b1))
         }
     }
 
     #[inline(always)]
     pub(crate) fn with_meta(self, meta: PtrMeta) -> Self {
+        // On 32-bit the metadata occupies the alignment low bits, so the object
+        // must be aligned enough to spare them.
+        #[cfg(target_pointer_width = "32")]
+        const {
+            assert!(align_of::<ManObj<T>>().trailing_zeros() >= Self::META_WIDTH)
+        };
         let new_ptr = self.data.map_addr(|addr| {
             let wo_meta = addr & !Self::META_BITS;
-            let meta = match meta {
+            let code: usize = match meta {
                 PtrMeta::Rooted => 0b00,
                 PtrMeta::Unrooted(Color::C0) => 0b10,
                 PtrMeta::Unrooted(Color::C1) => 0b11,
             };
-            (meta << (usize::BITS - Self::META_WIDTH)) | wo_meta
+            wo_meta | (code << Self::META_SHIFT)
         });
         Self {
             data: new_ptr,
@@ -599,13 +627,13 @@ impl<T> ManPtr<T> {
         unsafe { &*self.as_ptr() }
     }
 
-    /// Extracts the color assuming the pointer is unrooted (bit 63 set).
+    /// Extracts the color assuming the pointer is unrooted.
     ///
     /// # Safety
     /// The caller must ensure `self.meta() != PtrMeta::Rooted`.
     #[inline(always)]
     pub(crate) unsafe fn unrooted_color_unchecked(self) -> Color {
-        Color::from(self.data.addr() & (1 << (usize::BITS - 2)))
+        Color::from((self.data.addr() >> Self::META_SHIFT) & 0b1)
     }
 
     #[inline(always)]
@@ -1724,7 +1752,7 @@ impl<T: TraceObj> TracePtr for AtomicSharedOption<T> {
         let ptr = ManPtr::<T>::from(self.link.load(Ordering::Relaxed));
         debug_assert!(ptr.meta() == PtrMeta::Rooted);
         if let Some(obj) = unsafe { ptr.as_ref() } {
-            cold_path(); // When being allocated, most objects' outgoing edges are `null`. 
+            cold_path(); // When being allocated, most objects' outgoing edges are `null`.
             // Note: We believe that the deletion barrier must be considered here.
             // Imagine a scenario that an object is allocated in a normal phase,
             // and it becomes a child of another object that is allocated in a next tracing phase.
@@ -3022,6 +3050,9 @@ mod tests {
         assert_eq!(ptr.meta(), PtrMeta::Rooted);
     }
 
+    // Tags live in the alignment low bits, which 32-bit targets repurpose for
+    // metadata; `tag()` is always 0 there, so this assertion is 64-bit only.
+    #[cfg(target_pointer_width = "64")]
     #[test]
     fn man_ptr_null_rooted_with_tag() {
         let ptr = ManPtr::<()>::null_rooted_with_tag(1);
@@ -3054,6 +3085,9 @@ mod tests {
         assert_eq!(cleared.meta(), PtrMeta::Rooted);
     }
 
+    // 32-bit targets reserve the alignment low bits for metadata, so tags are
+    // unavailable and this round-trip is 64-bit only.
+    #[cfg(target_pointer_width = "64")]
     #[test]
     fn man_ptr_tag_roundtrip() {
         let ptr = ManPtr::<()>::null_rooted();

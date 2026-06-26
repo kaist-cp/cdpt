@@ -2,13 +2,10 @@ use crossbeam::{deque::Steal, epoch::pin as ebr_pin, utils::Backoff};
 use std::{
     iter::repeat_with,
     mem::take,
-    ops::Range,
     sync::{
         LazyLock, RwLock,
         atomic::{AtomicUsize, Ordering, fence},
     },
-    thread::{self, sleep, spawn},
-    time::{Duration, Instant},
 };
 
 use crate::{
@@ -16,14 +13,14 @@ use crate::{
     epoch::{Color, Phase},
     global,
     internal::{OBJ_BATCHES_SHARD, ObjBatch},
+    platform::{Instant, parallel_shard_work},
     task::Task,
-    tls::handle,
 };
 
 use rustc_hash::FxHashSet;
 
 #[derive(Clone)]
-struct HeartbeatStats {
+pub(crate) struct HeartbeatStats {
     measured_time: Instant,
     heap_usage: usize,
     total_alloc: usize,
@@ -53,50 +50,39 @@ static CSTATS: CollectionStats = CollectionStats {
     desired_heap_limit: AtomicUsize::new(0),
 };
 
-const HEARTBEAT_PERIOD_MS: u64 = 500;
 const ALLOC_PER_MS_SMOOTH_FACTOR: f64 = 0.5;
 const RECLM_PER_MS_SMOOTH_FACTOR: f64 = 0.5;
 const COLL_TIME_MS_SMOOTH_FACTOR: f64 = 0.5;
 const EXTRA_TUNING_FACTOR: usize = 10;
 const LOCAL_MARK_TASKS_BATCH_LIMIT: usize = 2048;
 
-/// A function body for the primary collector thread.
-pub(crate) fn collector_loop() {
-    let handle = handle();
-
-    // Initialize stats data and spawn the heartbeat thread that periodically samples heap stats.
-    {
-        let mut stats = HBSTATS.write().unwrap();
-        stats.total_alloc = global().estimate_total_alloc();
-    }
-    spawn(heartbeat_loop);
-
-    loop {
-        let backoff = Backoff::new();
-        while !is_collection_necessary() {
-            backoff.snooze();
-        }
-
-        let start = Instant::now();
-        let recl_at_start = global().estimate_total_reclm();
-
-        // Do actual collection works.
-        root_tracing(&handle);
-        while !completion_tracing(&handle) {}
-        next_normal(&handle);
-
-        record_collection_stats(start, recl_at_start);
-    }
+/// Seeds the heartbeat stats baseline before the background sampler starts.
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) fn init_heartbeat_stats() {
+    let mut stats = HBSTATS.write().unwrap();
+    stats.total_alloc = global().estimate_total_alloc();
 }
 
-fn heartbeat_loop() {
-    loop {
-        sleep(Duration::from_millis(HEARTBEAT_PERIOD_MS));
-        heartbeat();
+pub(crate) fn collect_once_if_necessary(handle: &Handle) -> bool {
+    if !is_collection_necessary() {
+        return false;
     }
+    collect_once(handle);
+    true
 }
 
-fn heartbeat() -> HeartbeatStats {
+fn collect_once(handle: &Handle) {
+    let start = Instant::now();
+    let recl_at_start = global().estimate_total_reclm();
+
+    root_tracing(handle);
+    while !completion_tracing(handle) {}
+    next_normal(handle);
+
+    record_collection_stats(start, recl_at_start);
+}
+
+pub(crate) fn heartbeat() -> HeartbeatStats {
     let mut stats = HBSTATS.write().unwrap();
     let now = Instant::now();
     let dur = now - stats.measured_time;
@@ -414,30 +400,6 @@ fn sweep(prev_white: Color, _handle: &Handle) {
             .stats
             .total_reclaimed
             .fetch_add(reclaimed_bytes, Ordering::Release);
-    });
-}
-
-/// Spawns `num_threads` worker threads, each invoking `work` on a contiguous
-/// slice of the `0..OBJ_BATCHES_SHARD` shard range. The last thread picks up
-/// any remainder when `OBJ_BATCHES_SHARD` is not divisible by `num_threads`.
-fn parallel_shard_work<F>(num_threads: usize, work: F)
-where
-    F: Fn(Range<usize>) + Sync,
-{
-    thread::scope(|s| {
-        for thread_idx in 0..num_threads {
-            let work = &work;
-            s.spawn(move || {
-                let base = OBJ_BATCHES_SHARD / num_threads;
-                let start = thread_idx * base;
-                let end = if thread_idx == num_threads - 1 {
-                    OBJ_BATCHES_SHARD
-                } else {
-                    start + base
-                };
-                work(start..end);
-            });
-        }
     });
 }
 

@@ -1,4 +1,3 @@
-use crate::collector::collector_loop;
 use crate::epoch::{AtomicEpoch, Color, Epoch, Phase};
 use crate::guards::{Guard, Handle};
 use crate::pointers::{ManObj, ManPtr, MarkObj, TraceObj};
@@ -19,7 +18,6 @@ use std::ops::DerefMut;
 use std::ptr;
 use std::rc::Rc;
 use std::sync::atomic::{self, AtomicBool, AtomicPtr, AtomicUsize, Ordering, fence};
-use std::thread::spawn;
 
 pub(crate) const OBJ_BATCHES_SHARD: usize = 8;
 pub(crate) const OBJ_BATCH_SIZE: usize = 64;
@@ -218,7 +216,7 @@ impl Global {
             collection_enabled: CachePadded::new(AtomicBool::new(true)),
             collection_requested: CachePadded::new(AtomicBool::new(false)),
             headroom: AtomicUsize::new(HeapHeadroom::FixedMiB(1).pack()),
-            collector_threads: AtomicUsize::new(default_collector_threads()),
+            collector_threads: AtomicUsize::new(crate::platform::default_collector_threads()),
         }
     }
 
@@ -242,7 +240,7 @@ impl Global {
             .compare_exchange(false, true, Ordering::Relaxed, Ordering::Relaxed)
             .is_ok()
         {
-            spawn(collector_loop);
+            crate::platform::deploy_collector();
         }
     }
 
@@ -295,9 +293,10 @@ impl Global {
 
     /// Requests an immediate collection cycle, bypassing the normal heuristic.
     ///
-    /// The collector thread will run one cycle as soon as possible, regardless
-    /// of current heap pressure. Useful in tests to force garbage collection
-    /// of recently dropped objects.
+    /// The collector will run one cycle as soon as possible, regardless of
+    /// current heap pressure. On targets without native threads, this attempts
+    /// a synchronous collection when the current handle is not pinned. Useful
+    /// in tests to force garbage collection of recently dropped objects.
     ///
     /// # Examples
     ///
@@ -307,6 +306,7 @@ impl Global {
     /// ```
     pub fn request_collection(&self) {
         self.collection_requested.store(true, Ordering::SeqCst);
+        crate::platform::on_collection_requested();
     }
 
     /// Returns the total bytes allocated on the managed heap since program
@@ -416,16 +416,6 @@ impl Global {
     pub fn collector_threads(&self) -> usize {
         self.collector_threads.load(Ordering::Relaxed)
     }
-}
-
-/// Picks the default collector thread count: one-eighth of the available
-/// parallelism, clamped to `1..=OBJ_BATCHES_SHARD`. Falls back to `1` when
-/// the platform cannot report parallelism.
-fn default_collector_threads() -> usize {
-    let parallelism = std::thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(1);
-    (parallelism / 8).clamp(1, OBJ_BATCHES_SHARD)
 }
 
 /// Participant for garbage collection.

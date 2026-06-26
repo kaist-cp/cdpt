@@ -29,6 +29,21 @@ jobs:
       - name: check
         run: cargo check --verbose
 
+  wasm:
+    name: wasm32 check (no threads / 32-bit)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+      # wasm32-unknown-unknown is a 32-bit, thread-less target, so this one job
+      # guards both platform fallbacks. The `tag` feature is intentionally left
+      # off (it is a `compile_error!` on 32-bit).
+      - name: check (wasm32-unknown-unknown)
+        run: cargo check --target wasm32-unknown-unknown
+
   test:
     name: test suite (debug, release, ASan)
     runs-on: ubuntu-latest
