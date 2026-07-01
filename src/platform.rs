@@ -1,9 +1,18 @@
-//! Platform abstraction for the collector's threaded runtime.
+//! Platform abstraction for the collector's runtime.
 //!
-//! Where the target has spawnable threads, the collector runs on a background
-//! thread, samples heap stats on a heartbeat thread, and parallelizes mark and
-//! sweep across scoped workers. The wasm32 fallback has none of these: a cycle
-//! runs synchronously on the requesting thread, and `Instant` is a no-op clock.
+//! This splits along one axis, the target's thread capability. Where threads
+//! exist, deployment and shard parallelism honor the selected
+//! [`CollectionMode`](crate::CollectionMode):
+//! [`Threaded`](crate::CollectionMode::Threaded) runs the collector on a
+//! background thread, samples heap stats on a heartbeat thread, and
+//! parallelizes mark and sweep across scoped workers;
+//! [`Cooperative`](crate::CollectionMode::Cooperative) spawns nothing and runs
+//! shard work inline. The wasm32 fallback has no threads at all: deployment is
+//! a no-op, shard work always runs inline, and `Instant` is a no-op clock.
+//!
+//! Who *drives* a cycle in cooperative mode is platform-independent: mutators
+//! call `collector::drive_collection_if_necessary` from safepoints and from
+//! `Global::request_collection`.
 
 #[cfg(not(target_arch = "wasm32"))]
 mod imp {
@@ -13,16 +22,21 @@ mod imp {
 
     use crossbeam::utils::Backoff;
 
-    use crate::collector::{collect_once_if_necessary, heartbeat, init_heartbeat_stats};
+    use crate::CollectionMode;
+    use crate::collector::{drive_collection_if_necessary, heartbeat, init_heartbeat_stats};
     use crate::internal::OBJ_BATCHES_SHARD;
 
     pub(crate) use std::time::Instant;
 
     const HEARTBEAT_PERIOD_MS: u64 = 500;
 
-    /// Deploys the background collector thread.
+    /// Deploys the background collector thread when the selected mode calls for
+    /// one. In cooperative mode nothing is spawned; cycles run synchronously on
+    /// the requesting thread instead.
     pub(crate) fn deploy_collector() {
-        spawn(collector_loop);
+        if crate::global().collection_mode() == CollectionMode::Threaded {
+            spawn(collector_loop);
+        }
     }
 
     /// A function body for the primary collector thread.
@@ -35,7 +49,7 @@ mod imp {
 
         loop {
             let backoff = Backoff::new();
-            while !collect_once_if_necessary(&handle) {
+            while !drive_collection_if_necessary(&handle) {
                 backoff.snooze();
             }
         }
@@ -58,13 +72,18 @@ mod imp {
         (parallelism / 8).clamp(1, OBJ_BATCHES_SHARD)
     }
 
-    /// Spawns `num_threads` worker threads, each invoking `work` on a contiguous
-    /// slice of the `0..OBJ_BATCHES_SHARD` shard range. The last thread picks up
-    /// any remainder when `OBJ_BATCHES_SHARD` is not divisible by `num_threads`.
+    /// Runs `work` over the `0..OBJ_BATCHES_SHARD` shard range. Cooperative mode
+    /// and a single-thread request run it inline on the calling thread.
+    /// Otherwise `num_threads` scoped workers each take a contiguous slice, and
+    /// the last picks up any remainder when the range is not divisible.
     pub(crate) fn parallel_shard_work<F>(num_threads: usize, work: F)
     where
         F: Fn(Range<usize>) + Sync,
     {
+        if num_threads <= 1 || crate::global().collection_mode() == CollectionMode::Cooperative {
+            work(0..OBJ_BATCHES_SHARD);
+            return;
+        }
         thread::scope(|s| {
             for thread_idx in 0..num_threads {
                 let work = &work;
@@ -81,16 +100,12 @@ mod imp {
             }
         });
     }
-
-    /// The background loop picks up the request on its own; nothing to do here.
-    pub(crate) fn on_collection_requested() {}
 }
 
 #[cfg(target_arch = "wasm32")]
 mod imp {
     use std::ops::Range;
 
-    use crate::collector::collect_once_if_necessary;
     use crate::internal::OBJ_BATCHES_SHARD;
 
     /// A stand-in monotonic clock. `wasm32-unknown-unknown` has no
@@ -126,15 +141,6 @@ mod imp {
         F: Fn(Range<usize>),
     {
         work(0..OBJ_BATCHES_SHARD);
-    }
-
-    /// Without a background collector, drive one cycle synchronously when the
-    /// caller is not inside a critical section.
-    pub(crate) fn on_collection_requested() {
-        let handle = crate::handle();
-        if !handle.is_pinned() {
-            collect_once_if_necessary(&handle);
-        }
     }
 }
 

@@ -160,6 +160,11 @@
 //!
 //! - [`Global::enable_collection`]: pause or resume collection.
 //! - [`Global::request_collection`]: force a cycle now (useful in tests).
+//! - [`Global::set_collection_mode`] / [`CollectionMode`]: drive the collector
+//!   from a background thread ([`Threaded`](CollectionMode::Threaded), the
+//!   default) or from the mutators themselves at safepoints
+//!   ([`Cooperative`](CollectionMode::Cooperative), keeping the process
+//!   single-threaded).
 //! - [`Global::set_heap_headroom`] / [`HeapHeadroom`]: trade peak memory
 //!   against collector CPU.
 //! - [`Global::set_collector_threads`]: set the collector's parallelism.
@@ -209,7 +214,7 @@ mod tls;
 
 pub use cdpt_derive::TraceObj;
 pub use guards::{Guard, Handle};
-pub use internal::{Global, HeapHeadroom};
+pub use internal::{CollectionMode, Global, HeapHeadroom};
 pub use pointers::{
     AtomicShared, AtomicSharedOption, Local, ManPtr, Protector, Shared, TraceObj, TracePtr,
 };

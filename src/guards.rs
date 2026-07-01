@@ -3,7 +3,7 @@
 use crate::{
     TraceObj,
     epoch::{Color, Epoch, Phase},
-    internal::{Local, OBJ_BATCH_SIZE},
+    internal::{CollectionMode, Local, OBJ_BATCH_SIZE},
     pointers::ManObj,
     sync::Entry,
     task::Task,
@@ -407,6 +407,16 @@ impl Drop for Guard {
     fn drop(&mut self) {
         self.help_collect_if_scheduled();
         self.local().unpin_inner();
+
+        // Leaving the last critical section is a safepoint: in cooperative
+        // mode, where no background thread watches heap pressure, this is
+        // where a mutator picks up the collector's job.
+        if !self.local().is_pinned() && global().collection_mode() == CollectionMode::Cooperative {
+            let handle = Handle {
+                local: self.local.clone(),
+            };
+            crate::collector::drive_collection_if_necessary(&handle);
+        }
     }
 }
 

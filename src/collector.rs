@@ -4,7 +4,7 @@ use std::{
     mem::take,
     sync::{
         LazyLock, RwLock,
-        atomic::{AtomicUsize, Ordering, fence},
+        atomic::{AtomicBool, AtomicUsize, Ordering, fence},
     },
 };
 
@@ -29,6 +29,7 @@ pub(crate) struct HeartbeatStats {
 }
 
 struct CollectionStats {
+    alloc_per_ms_smooth: AtomicUsize,
     reclm_per_ms_smooth: AtomicUsize,
     coll_time_ms_smooth: AtomicUsize,
     desired_heap_limit: AtomicUsize,
@@ -45,6 +46,7 @@ static HBSTATS: LazyLock<RwLock<HeartbeatStats>> = LazyLock::new(|| {
 });
 
 static CSTATS: CollectionStats = CollectionStats {
+    alloc_per_ms_smooth: AtomicUsize::new(0),
     reclm_per_ms_smooth: AtomicUsize::new(0),
     coll_time_ms_smooth: AtomicUsize::new(0),
     desired_heap_limit: AtomicUsize::new(0),
@@ -63,12 +65,46 @@ pub(crate) fn init_heartbeat_stats() {
     stats.total_alloc = global().estimate_total_alloc();
 }
 
-pub(crate) fn collect_once_if_necessary(handle: &Handle) -> bool {
+/// Serializes cycle-driving: whichever caller wins becomes the collector for
+/// one cycle. In threaded mode the background thread is the only caller; in
+/// cooperative mode mutators race here from safepoints and requests, and
+/// losers simply skip — a cycle is already in progress. The flag also keeps a
+/// driving thread from re-entering through the pin/unpin its own cycle does.
+static DRIVING: AtomicBool = AtomicBool::new(false);
+
+struct DrivingGuard;
+
+impl Drop for DrivingGuard {
+    fn drop(&mut self) {
+        DRIVING.store(false, Ordering::Release);
+    }
+}
+
+/// Runs one collection cycle on the calling thread when the heuristic (or an
+/// explicit request) calls for one and no other thread is already driving.
+/// Returns whether a cycle ran.
+pub(crate) fn drive_collection_if_necessary(handle: &Handle) -> bool {
     if !is_collection_necessary() {
         return false;
     }
-    collect_once(handle);
-    true
+    if DRIVING
+        .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+        .is_err()
+    {
+        return false;
+    }
+    let _driving = DrivingGuard;
+
+    // Re-check now that we are the driver: the cycle we raced with may have
+    // already resolved the pressure.
+    let collected = is_collection_necessary();
+    if collected {
+        // This cycle serves any pending explicit request. A request arriving
+        // mid-cycle leaves the flag set for the next check.
+        global().collection_requested.swap(false, Ordering::SeqCst);
+        collect_once(handle);
+    }
+    collected
 }
 
 fn collect_once(handle: &Handle) {
@@ -109,6 +145,9 @@ pub(crate) fn heartbeat() -> HeartbeatStats {
     stats.heap_usage = new_total_alloc - new_total_reclm;
     stats.alloc_per_ms = new_alloc_per_ms;
     stats.alloc_per_ms_smooth = new_alloc_per_ms_smooth;
+    CSTATS
+        .alloc_per_ms_smooth
+        .store(new_alloc_per_ms_smooth, Ordering::Relaxed);
 
     stats.clone()
 }
@@ -418,6 +457,8 @@ fn wait_all_mutators_unpin(new_ts: usize) {
     }
 }
 
+/// Read-only trigger check; the pending-request flag is consumed by
+/// `drive_collection_if_necessary` when a cycle actually starts.
 fn is_collection_necessary() -> bool {
     if !global().collection_enabled.load(Ordering::SeqCst) {
         // The user manually turned the collection off.
@@ -427,13 +468,9 @@ fn is_collection_necessary() -> bool {
 
     // Check if an explicit collection was requested.
     if global().collection_requested.load(Ordering::SeqCst) {
-        global().collection_requested.store(false, Ordering::SeqCst);
         return true;
     }
 
-    let hbstats = HBSTATS.read().unwrap();
-
-    let reclm_per_ms_smooth = CSTATS.reclm_per_ms_smooth.load(Ordering::Relaxed);
     let heap_usage = global().estimate_heap_usage();
     let heap_limit = CSTATS.desired_heap_limit.load(Ordering::Relaxed);
 
@@ -441,7 +478,10 @@ fn is_collection_necessary() -> bool {
         return true;
     }
 
-    let pure_alloc_rate = hbstats.alloc_per_ms_smooth as isize - reclm_per_ms_smooth as isize;
+    let alloc_per_ms_smooth = CSTATS.alloc_per_ms_smooth.load(Ordering::Relaxed);
+    let reclm_per_ms_smooth = CSTATS.reclm_per_ms_smooth.load(Ordering::Relaxed);
+
+    let pure_alloc_rate = alloc_per_ms_smooth as isize - reclm_per_ms_smooth as isize;
     if pure_alloc_rate < 0 {
         return heap_usage >= heap_limit;
     }
