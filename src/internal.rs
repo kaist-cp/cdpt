@@ -1,4 +1,3 @@
-use crate::collector::collector_loop;
 use crate::epoch::{AtomicEpoch, Color, Epoch, Phase};
 use crate::guards::{Guard, Handle};
 use crate::pointers::{ManObj, ManPtr, MarkObj, TraceObj};
@@ -18,8 +17,7 @@ use std::mem::{MaybeUninit, take};
 use std::ops::DerefMut;
 use std::ptr;
 use std::rc::Rc;
-use std::sync::atomic::{self, AtomicBool, AtomicPtr, AtomicUsize, Ordering, fence};
-use std::thread::spawn;
+use std::sync::atomic::{self, AtomicBool, AtomicPtr, AtomicU8, AtomicUsize, Ordering, fence};
 
 pub(crate) const OBJ_BATCHES_SHARD: usize = 8;
 pub(crate) const OBJ_BATCH_SIZE: usize = 64;
@@ -66,9 +64,6 @@ pub struct Global {
     pub(crate) fresh_objs: [[Queue<ObjBatch>; OBJ_BATCHES_SHARD]; 2],
     pub(crate) marked_objs: [[Queue<ObjBatch>; OBJ_BATCHES_SHARD]; 2],
 
-    /// The global flag indicating whether the collector is online.
-    collector_init: CachePadded<AtomicBool>,
-
     /// The global flag indicating whether the collection is enabled.
     pub(crate) collection_enabled: CachePadded<AtomicBool>,
 
@@ -82,6 +77,10 @@ pub struct Global {
 
     /// Number of threads used for parallel collection (1..=OBJ_BATCHES_SHARD).
     pub(crate) collector_threads: AtomicUsize,
+
+    /// Selects who drives collection: bit 0 holds the [`CollectionMode`], and
+    /// [`MODE_LATCH`] is set once the collector is deployed, freezing the mode.
+    collection_mode: AtomicU8,
 }
 
 /// Controls how much headroom the collector leaves before starting the next
@@ -126,6 +125,61 @@ pub enum HeapHeadroom {
 
 /// MSB used to distinguish proportional (set) from fixed (clear).
 const HEADROOM_PROPORTIONAL_BIT: usize = 1 << (usize::BITS - 1);
+
+/// Selects how the collector is driven.
+///
+/// The tracing algorithm and the collection-trigger heuristic are identical in
+/// both modes; only *who runs the collector* differs. See
+/// [`Global::set_collection_mode`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CollectionMode {
+    /// A dedicated background thread drives collection from heap pressure,
+    /// marking and sweeping in parallel across [`Global::collector_threads`]
+    /// workers. Mutators are never interrupted, but the process becomes
+    /// multi-threaded.
+    ///
+    /// The default on targets with thread support.
+    Threaded = 0,
+
+    /// No background thread; mutators drive collection themselves. When a
+    /// thread drops its last [`Guard`](crate::Guard) (a safepoint) and the
+    /// trigger heuristic calls for a cycle — or [`Global::request_collection`]
+    /// is invoked — that thread runs the cycle synchronously, marking and
+    /// sweeping inline. At most one thread drives at a time; other threads
+    /// reaching a safepoint mid-cycle skip. The process stays single-threaded,
+    /// at the cost of collection pauses on the driving thread.
+    ///
+    /// The driving thread waits for every pinned thread to leave its critical
+    /// section, so a thread that blocks while pinned (already an anti-pattern)
+    /// can deadlock a multi-threaded cooperative process. This mode is meant
+    /// for programs that want to stay single-threaded; it is also the only
+    /// mode on `wasm32`, which cannot spawn threads.
+    Cooperative = 1,
+}
+
+impl CollectionMode {
+    fn from_u8(bits: u8) -> Self {
+        if bits & 0b1 == Self::Cooperative as u8 {
+            Self::Cooperative
+        } else {
+            Self::Threaded
+        }
+    }
+}
+
+/// Set in `Global::collection_mode` once the collector is deployed; the mode
+/// bit can no longer change afterwards. A frozen mode is what guarantees a
+/// single collection driver: it rules out a background thread and mutators
+/// driving cycles concurrently. Keeping the mode and the latch in one atomic
+/// makes the deploy-time read race-free — every `set_collection_mode` RMW is
+/// totally ordered against the latching RMW.
+const MODE_LATCH: u8 = 0b10;
+
+/// The default mode: threaded where threads exist, cooperative on `wasm32`.
+#[cfg(not(target_arch = "wasm32"))]
+const DEFAULT_COLLECTION_MODE: CollectionMode = CollectionMode::Threaded;
+#[cfg(target_arch = "wasm32")]
+const DEFAULT_COLLECTION_MODE: CollectionMode = CollectionMode::Cooperative;
 
 impl HeapHeadroom {
     fn pack(self) -> usize {
@@ -214,11 +268,11 @@ impl Global {
             stats: GlobalStats::default(),
             fresh_objs: from_fn(|_| from_fn(|_| Queue::new())),
             marked_objs: from_fn(|_| from_fn(|_| Queue::new())),
-            collector_init: CachePadded::new(AtomicBool::new(false)),
             collection_enabled: CachePadded::new(AtomicBool::new(true)),
             collection_requested: CachePadded::new(AtomicBool::new(false)),
             headroom: AtomicUsize::new(HeapHeadroom::FixedMiB(1).pack()),
-            collector_threads: AtomicUsize::new(default_collector_threads()),
+            collector_threads: AtomicUsize::new(crate::platform::default_collector_threads()),
+            collection_mode: AtomicU8::new(DEFAULT_COLLECTION_MODE as u8),
         }
     }
 
@@ -230,19 +284,15 @@ impl Global {
 
     #[inline]
     fn initialize_if_necessary(&self) {
-        if !self.collector_init.load(Ordering::Relaxed) {
+        if self.collection_mode.load(Ordering::Relaxed) & MODE_LATCH == 0 {
             self.try_deploy_collector();
         }
     }
 
     #[cold]
     fn try_deploy_collector(&self) {
-        if self
-            .collector_init
-            .compare_exchange(false, true, Ordering::Relaxed, Ordering::Relaxed)
-            .is_ok()
-        {
-            spawn(collector_loop);
+        if self.collection_mode.fetch_or(MODE_LATCH, Ordering::Relaxed) & MODE_LATCH == 0 {
+            crate::platform::deploy_collector();
         }
     }
 
@@ -295,9 +345,14 @@ impl Global {
 
     /// Requests an immediate collection cycle, bypassing the normal heuristic.
     ///
-    /// The collector thread will run one cycle as soon as possible, regardless
-    /// of current heap pressure. Useful in tests to force garbage collection
-    /// of recently dropped objects.
+    /// In [`Threaded`](CollectionMode::Threaded) mode the background collector
+    /// picks the request up as soon as possible. In
+    /// [`Cooperative`](CollectionMode::Cooperative) mode (always on `wasm32`)
+    /// this drives the cycle synchronously on the calling thread when it is
+    /// not pinned; when it is pinned, or another thread is already driving a
+    /// cycle, the request stays recorded and is served at the next safepoint.
+    /// Useful in tests to force garbage collection of recently dropped
+    /// objects.
     ///
     /// # Examples
     ///
@@ -307,6 +362,16 @@ impl Global {
     /// ```
     pub fn request_collection(&self) {
         self.collection_requested.store(true, Ordering::SeqCst);
+        if self.collection_mode() == CollectionMode::Cooperative {
+            let handle = crate::handle();
+            // `handle()` may have just deployed the collector and latched the
+            // mode — possibly to `Threaded` if a concurrent
+            // `set_collection_mode` won the pre-latch race. Re-read the frozen
+            // mode so a mutator never drives a cycle in threaded mode.
+            if self.collection_mode() == CollectionMode::Cooperative && !handle.is_pinned() {
+                crate::collector::drive_collection_if_necessary(&handle);
+            }
+        }
     }
 
     /// Returns the total bytes allocated on the managed heap since program
@@ -416,16 +481,53 @@ impl Global {
     pub fn collector_threads(&self) -> usize {
         self.collector_threads.load(Ordering::Relaxed)
     }
-}
 
-/// Picks the default collector thread count: one-eighth of the available
-/// parallelism, clamped to `1..=OBJ_BATCHES_SHARD`. Falls back to `1` when
-/// the platform cannot report parallelism.
-fn default_collector_threads() -> usize {
-    let parallelism = std::thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(1);
-    (parallelism / 8).clamp(1, OBJ_BATCHES_SHARD)
+    /// Selects how collection is driven. See [`CollectionMode`].
+    ///
+    /// The mode is latched by the collector's deployment — the first thread
+    /// registration anywhere in the process ([`handle()`](crate::handle),
+    /// [`pin()`](crate::pin), or a managed allocation) — and cannot change
+    /// afterwards: a frozen mode is what guarantees a single collection
+    /// driver. Call this before touching the managed heap.
+    ///
+    /// Returns `true` when the collector runs (or will run) in the requested
+    /// mode: either the mode was still settable, or it was already latched to
+    /// the requested one. Returns `false` when it is latched to the other
+    /// mode, or when requesting [`Threaded`](CollectionMode::Threaded) on
+    /// `wasm32`, which has no threads and is always
+    /// [`Cooperative`](CollectionMode::Cooperative).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use cdpt::*;
+    /// // Run without a background collector thread; mutators collect at
+    /// // safepoints and on request instead.
+    /// assert!(global().set_collection_mode(CollectionMode::Cooperative));
+    /// ```
+    pub fn set_collection_mode(&self, mode: CollectionMode) -> bool {
+        if cfg!(target_arch = "wasm32") && mode == CollectionMode::Threaded {
+            return false;
+        }
+        self.collection_mode
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |bits| {
+                (bits & MODE_LATCH == 0).then_some(mode as u8)
+            })
+            .map_or_else(|bits| CollectionMode::from_u8(bits) == mode, |_| true)
+    }
+
+    /// Returns the current [`CollectionMode`].
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use cdpt::*;
+    /// global().set_collection_mode(CollectionMode::Cooperative);
+    /// assert_eq!(global().collection_mode(), CollectionMode::Cooperative);
+    /// ```
+    pub fn collection_mode(&self) -> CollectionMode {
+        CollectionMode::from_u8(self.collection_mode.load(Ordering::Relaxed))
+    }
 }
 
 /// Participant for garbage collection.

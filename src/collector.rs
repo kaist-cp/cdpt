@@ -2,13 +2,10 @@ use crossbeam::{deque::Steal, epoch::pin as ebr_pin, utils::Backoff};
 use std::{
     iter::repeat_with,
     mem::take,
-    ops::Range,
     sync::{
         LazyLock, RwLock,
-        atomic::{AtomicUsize, Ordering, fence},
+        atomic::{AtomicBool, AtomicUsize, Ordering, fence},
     },
-    thread::{self, sleep, spawn},
-    time::{Duration, Instant},
 };
 
 use crate::{
@@ -16,14 +13,14 @@ use crate::{
     epoch::{Color, Phase},
     global,
     internal::{OBJ_BATCHES_SHARD, ObjBatch},
+    platform::{Instant, parallel_shard_work},
     task::Task,
-    tls::handle,
 };
 
 use rustc_hash::FxHashSet;
 
 #[derive(Clone)]
-struct HeartbeatStats {
+pub(crate) struct HeartbeatStats {
     measured_time: Instant,
     heap_usage: usize,
     total_alloc: usize,
@@ -32,6 +29,7 @@ struct HeartbeatStats {
 }
 
 struct CollectionStats {
+    alloc_per_ms_smooth: AtomicUsize,
     reclm_per_ms_smooth: AtomicUsize,
     coll_time_ms_smooth: AtomicUsize,
     desired_heap_limit: AtomicUsize,
@@ -48,55 +46,79 @@ static HBSTATS: LazyLock<RwLock<HeartbeatStats>> = LazyLock::new(|| {
 });
 
 static CSTATS: CollectionStats = CollectionStats {
+    alloc_per_ms_smooth: AtomicUsize::new(0),
     reclm_per_ms_smooth: AtomicUsize::new(0),
     coll_time_ms_smooth: AtomicUsize::new(0),
     desired_heap_limit: AtomicUsize::new(0),
 };
 
-const HEARTBEAT_PERIOD_MS: u64 = 500;
 const ALLOC_PER_MS_SMOOTH_FACTOR: f64 = 0.5;
 const RECLM_PER_MS_SMOOTH_FACTOR: f64 = 0.5;
 const COLL_TIME_MS_SMOOTH_FACTOR: f64 = 0.5;
 const EXTRA_TUNING_FACTOR: usize = 10;
 const LOCAL_MARK_TASKS_BATCH_LIMIT: usize = 2048;
 
-/// A function body for the primary collector thread.
-pub(crate) fn collector_loop() {
-    let handle = handle();
+/// Seeds the heartbeat stats baseline before the background sampler starts.
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) fn init_heartbeat_stats() {
+    let mut stats = HBSTATS.write().unwrap();
+    stats.total_alloc = global().estimate_total_alloc();
+}
 
-    // Initialize stats data and spawn the heartbeat thread that periodically samples heap stats.
+/// Serializes cycle-driving: whichever caller wins becomes the collector for
+/// one cycle. In threaded mode the background thread is the only caller; in
+/// cooperative mode mutators race here from safepoints and requests, and
+/// losers simply skip — a cycle is already in progress. The flag also keeps a
+/// driving thread from re-entering through the pin/unpin its own cycle does.
+static DRIVING: AtomicBool = AtomicBool::new(false);
+
+struct DrivingGuard;
+
+impl Drop for DrivingGuard {
+    fn drop(&mut self) {
+        DRIVING.store(false, Ordering::Release);
+    }
+}
+
+/// Runs one collection cycle on the calling thread when the heuristic (or an
+/// explicit request) calls for one and no other thread is already driving.
+/// Returns whether a cycle ran.
+pub(crate) fn drive_collection_if_necessary(handle: &Handle) -> bool {
+    if !is_collection_necessary() {
+        return false;
+    }
+    if DRIVING
+        .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+        .is_err()
     {
-        let mut stats = HBSTATS.write().unwrap();
-        stats.total_alloc = global().estimate_total_alloc();
+        return false;
     }
-    spawn(heartbeat_loop);
+    let _driving = DrivingGuard;
 
-    loop {
-        let backoff = Backoff::new();
-        while !is_collection_necessary() {
-            backoff.snooze();
-        }
-
-        let start = Instant::now();
-        let recl_at_start = global().estimate_total_reclm();
-
-        // Do actual collection works.
-        root_tracing(&handle);
-        while !completion_tracing(&handle) {}
-        next_normal(&handle);
-
-        record_collection_stats(start, recl_at_start);
+    // Re-check now that we are the driver: the cycle we raced with may have
+    // already resolved the pressure.
+    let collected = is_collection_necessary();
+    if collected {
+        // This cycle serves any pending explicit request. A request arriving
+        // mid-cycle leaves the flag set for the next check.
+        global().collection_requested.swap(false, Ordering::SeqCst);
+        collect_once(handle);
     }
+    collected
 }
 
-fn heartbeat_loop() {
-    loop {
-        sleep(Duration::from_millis(HEARTBEAT_PERIOD_MS));
-        heartbeat();
-    }
+fn collect_once(handle: &Handle) {
+    let start = Instant::now();
+    let recl_at_start = global().estimate_total_reclm();
+
+    root_tracing(handle);
+    while !completion_tracing(handle) {}
+    next_normal(handle);
+
+    record_collection_stats(start, recl_at_start);
 }
 
-fn heartbeat() -> HeartbeatStats {
+pub(crate) fn heartbeat() -> HeartbeatStats {
     let mut stats = HBSTATS.write().unwrap();
     let now = Instant::now();
     let dur = now - stats.measured_time;
@@ -123,6 +145,9 @@ fn heartbeat() -> HeartbeatStats {
     stats.heap_usage = new_total_alloc - new_total_reclm;
     stats.alloc_per_ms = new_alloc_per_ms;
     stats.alloc_per_ms_smooth = new_alloc_per_ms_smooth;
+    CSTATS
+        .alloc_per_ms_smooth
+        .store(new_alloc_per_ms_smooth, Ordering::Relaxed);
 
     stats.clone()
 }
@@ -417,30 +442,6 @@ fn sweep(prev_white: Color, _handle: &Handle) {
     });
 }
 
-/// Spawns `num_threads` worker threads, each invoking `work` on a contiguous
-/// slice of the `0..OBJ_BATCHES_SHARD` shard range. The last thread picks up
-/// any remainder when `OBJ_BATCHES_SHARD` is not divisible by `num_threads`.
-fn parallel_shard_work<F>(num_threads: usize, work: F)
-where
-    F: Fn(Range<usize>) + Sync,
-{
-    thread::scope(|s| {
-        for thread_idx in 0..num_threads {
-            let work = &work;
-            s.spawn(move || {
-                let base = OBJ_BATCHES_SHARD / num_threads;
-                let start = thread_idx * base;
-                let end = if thread_idx == num_threads - 1 {
-                    OBJ_BATCHES_SHARD
-                } else {
-                    start + base
-                };
-                work(start..end);
-            });
-        }
-    });
-}
-
 fn wait_all_mutators_unpin(new_ts: usize) {
     // Loop until all mutators unpin from the previous phase.
     for local in global().locals.iter_using() {
@@ -456,6 +457,8 @@ fn wait_all_mutators_unpin(new_ts: usize) {
     }
 }
 
+/// Read-only trigger check; the pending-request flag is consumed by
+/// `drive_collection_if_necessary` when a cycle actually starts.
 fn is_collection_necessary() -> bool {
     if !global().collection_enabled.load(Ordering::SeqCst) {
         // The user manually turned the collection off.
@@ -465,13 +468,9 @@ fn is_collection_necessary() -> bool {
 
     // Check if an explicit collection was requested.
     if global().collection_requested.load(Ordering::SeqCst) {
-        global().collection_requested.store(false, Ordering::SeqCst);
         return true;
     }
 
-    let hbstats = HBSTATS.read().unwrap();
-
-    let reclm_per_ms_smooth = CSTATS.reclm_per_ms_smooth.load(Ordering::Relaxed);
     let heap_usage = global().estimate_heap_usage();
     let heap_limit = CSTATS.desired_heap_limit.load(Ordering::Relaxed);
 
@@ -479,7 +478,10 @@ fn is_collection_necessary() -> bool {
         return true;
     }
 
-    let pure_alloc_rate = hbstats.alloc_per_ms_smooth as isize - reclm_per_ms_smooth as isize;
+    let alloc_per_ms_smooth = CSTATS.alloc_per_ms_smooth.load(Ordering::Relaxed);
+    let reclm_per_ms_smooth = CSTATS.reclm_per_ms_smooth.load(Ordering::Relaxed);
+
+    let pure_alloc_rate = alloc_per_ms_smooth as isize - reclm_per_ms_smooth as isize;
     if pure_alloc_rate < 0 {
         return heap_usage >= heap_limit;
     }

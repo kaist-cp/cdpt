@@ -1,7 +1,9 @@
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::thread;
 
-use cdpt::{AtomicSharedOption, Local, Shared, TraceObj, TracePtr, handle, pin};
+use cdpt::{
+    AtomicSharedOption, CollectionMode, Local, Shared, TraceObj, TracePtr, global, handle, pin,
+};
 
 #[derive(TraceObj)]
 struct Node {
@@ -408,4 +410,17 @@ fn handle_help_collect() {
     drop(guard);
     // Calling help_collect on handle should not panic.
     h.help_collect();
+}
+
+/// The collection mode is latched by the collector's deployment: once a pin
+/// has happened in this process (threaded default here), switching to
+/// cooperative must be refused, so a background collector and mutator drivers
+/// can never coexist. Re-requesting the latched mode still reports success.
+#[test]
+fn collection_mode_latched_after_deploy() {
+    drop(pin());
+    assert_eq!(global().collection_mode(), CollectionMode::Threaded);
+    assert!(!global().set_collection_mode(CollectionMode::Cooperative));
+    assert!(global().set_collection_mode(CollectionMode::Threaded));
+    assert_eq!(global().collection_mode(), CollectionMode::Threaded);
 }
